@@ -3,7 +3,11 @@ name = "onyums"
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = {}
+repository = "https://github.com/basic-automation/onyums"
+readme = "README.md"
+description = "An Onion-service server using axum."
+keywords = ["tor", "http", "request", "server", "SOCKS"]
+categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
 anyhow = "1"

@@ -1,6 +1,28 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions, clippy::module_name_repetitions)]
 
+//! # Onyums
+//! Onyums is a simple axum wrapper for serving tor onion services.
+//!
+//! # Example
+//! ```rust
+//! use axum::{routing::get, Router};
+//! use native_tls::Identity;
+//! use tokio_native_tls::TlsAcceptor;
+//! use onyums::serve;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let app = Router::new().route("/", get(|| async { "Hello, World!" }));
+//!     let c = include_bytes!("../self_signed_certs/cert.pem");
+//!     let k = include_bytes!("../self_signed_certs/key.pem");
+//!     let identity = Identity::from_pem(c, k).unwrap();
+//!     let tls_acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::builder(identity).build().unwrap());
+//!
+//!     serve(app, tls_acceptor, "my_onion").await.unwrap();
+//! }
+//! ```
+
 use std::sync::{LazyLock, Mutex};
 
 use anyhow::{bail, Result};
@@ -17,6 +39,10 @@ use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tower_service::Service;
 
 static ONION_NAME: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+
+pub fn get_onion_name() -> String {
+	ONION_NAME.try_lock().map_or_else(|_| String::new(), |guard| (*guard.clone()).to_string())
+}
 
 /// Serve a web application over an onion service.
 ///

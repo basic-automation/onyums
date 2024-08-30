@@ -1,0 +1,28 @@
+[package]
+name = "onyums"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = {}
+
+[dependencies]
+anyhow = "1"
+hyper = { version = "1", features = ["full"] }
+hyper-util = { version = "0", features = ["full"] }
+tokio-util = { version = "0", features = ["full"] }
+futures = "0"
+arti-client = { version = "0", features = ["full", "static"] }
+tor-cell = { version = "0", features = ["full"] }
+tor-hsservice = { version = "0", features = ["full"] }
+tor-proto = { version = "0", features = ["full"] }
+safelog = "0"
+tokio = { version = "1", features = ["full"] }
+tracing-subscriber = "0"
+h2 = "0"
+bytes = "1"
+http = "1"
+tokio-native-tls = "0"
+native-tls = "0"
+tor-rtcompat = { version = "0", features = ["full"] }
+axum = { version = "0", features = ["http2", "ws"] }
+tower-service = "0"

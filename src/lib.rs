@@ -1,0 +1,160 @@
+#![warn(clippy::pedantic, clippy::nursery, clippy::all, clippy::cargo)]
+#![allow(clippy::multiple_crate_versions, clippy::module_name_repetitions)]
+
+use std::sync::{LazyLock, Mutex};
+
+use anyhow::{bail, Result};
+use arti_client::{TorClient, TorClientConfig};
+use axum::Router;
+use futures::StreamExt;
+use hyper::{body::Incoming, Request};
+use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio_native_tls::TlsAcceptor;
+use tor_cell::relaycell::msg::Connected;
+use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, StreamRequest};
+use tor_proto::stream::IncomingStreamRequest;
+use tor_rtcompat::tokio::TokioNativeTlsRuntime;
+use tower_service::Service;
+
+static ONION_NAME: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+
+/// Serve a web application over an onion service.
+///
+/// This function creates a new Tor client, launches an onion service, and serves a web application.
+///
+/// # Arguments
+/// `app` - The axum `Router` to serve.
+/// `tls_acceptor` - The `TlsAcceptor` to use for the web server.
+/// `nickname` - The nickname of the onion service.
+///
+/// # Returns
+/// An `anyhow::Result` indicating success or failure.
+///
+/// # Errors
+/// This function returns an error if any of the following occur:
+/// - The nickname fails to parse.
+/// - The onion service fails to launch.
+/// - The TLS acceptor fails to create.
+/// - The web server fails to start.
+/// - The Tor client fails to create.
+/// - The Tor client fails to bootstrap.
+/// - The Tor client fails to create a stream.
+/// - The Tor client fails to connect to the onion service.
+pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Result<()> {
+	tracing_subscriber::fmt::init();
+
+	// create a new Tor client
+	let config = TorClientConfig::default();
+	let Ok(runtime) = TokioNativeTlsRuntime::current() else {
+		bail!("failed to get current tokio runtime");
+	};
+	let client = TorClient::with_runtime(runtime);
+	let Ok(client) = client.config(config).create_bootstrapped().await else {
+		bail!("failed to create bootstrapped Tor client");
+	};
+
+	// launch an onion service
+	let Ok(nickname) = nickname.parse::<HsNickname>() else {
+		bail!("failed to parse nickname");
+	};
+	let Ok(svc_cfg) = OnionServiceConfigBuilder::default().nickname(nickname).build() else {
+		bail!("failed to build onion service config");
+	};
+	let Ok((service, request_stream)) = client.launch_onion_service(svc_cfg) else {
+		bail!("failed to launch onion service");
+	};
+
+	// get the service name
+	let Some(service_name) = service.onion_name() else {
+		bail!("failed to get onion service name");
+	};
+	let service_name = service_name.to_string();
+
+	match ONION_NAME.lock() {
+		Ok(mut guard) => {
+			(*guard).clone_from(&service_name);
+		}
+		Err(err) => {
+			eprintln!("failed to lock nickname: {err}");
+		}
+	}
+
+	// create a stream to handle incoming requests
+	let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
+	tokio::pin!(stream_requests);
+
+	while let Some(stream_request) = stream_requests.next().await {
+		let tls_acceptor = tls_acceptor.clone();
+		let app = app.clone();
+
+		tokio::spawn(async move {
+			// handle the incoming request
+			let result = handle_stream_request(stream_request, tls_acceptor.clone(), app.clone()).await;
+
+			if let Err(err) = result {
+				eprintln!("error handling stream request: {err}");
+			}
+		});
+	}
+
+	drop(service);
+	bail!("onion service exited cleanly");
+}
+
+async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
+	match stream_request.request() {
+		IncomingStreamRequest::Begin(begin) if begin.port() == 80 || begin.port() == 443 => {
+			// Accept the incoming stream and wrap it in a TLS stream
+			let Ok(onion_service_stream) = stream_request.accept(Connected::new_empty()).await else {
+				bail!("failed to accept onion service stream");
+			};
+			let Ok(tls_onion_service_stream) = tls_acceptor.accept(onion_service_stream).await else {
+				bail!("failed to accept TLS stream");
+			};
+
+			// Wrap the stream in a `tokio_util::compat::Compat` to make it compatible with tokio's `AsyncRead` and `AsyncWrite`.
+			let stream = TokioIo::new(tls_onion_service_stream);
+
+			// Hyper also has its own `Service` trait and doesn't use tower. We can use `hyper::service::service_fn` to create a hyper `Service` that calls our app through `tower::Service::call`.
+			let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
+				// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
+				// We don't need to call `poll_ready` since `Router` is always ready.
+				app.clone().call(request)
+			});
+
+			let ret = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(stream, hyper_service).await;
+
+			if let Err(err) = ret {
+				eprintln!("error serving connection: {err}");
+			}
+		}
+		_ => {
+			eprintln!("rejecting request: {:?}", stream_request.request());
+			stream_request.shutdown_circuit()?;
+		}
+	}
+
+	Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+	use axum::{routing::get, Router};
+	use native_tls::Identity;
+	use tokio_native_tls::TlsAcceptor;
+
+	use super::*;
+
+	#[tokio::test]
+	async fn test_serve() {
+		let app = Router::new().route("/", get(|| async { "Hello, World!" }));
+
+		let c = include_bytes!("../self_signed_certs/cert.pem");
+		let k = include_bytes!("../self_signed_certs/key.pem");
+		let cert = Identity::from_pkcs8(c, k).unwrap();
+		let tls_acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::builder(cert).build().unwrap());
+		let nickname = "onyums-yum-yum-test";
+
+		serve(app, tls_acceptor, nickname).await.unwrap();
+	}
+}

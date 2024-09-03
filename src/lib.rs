@@ -24,11 +24,13 @@
 //! }
 //! ```
 
-use std::sync::{LazyLock, Mutex};
+use std::{
+	net::SocketAddr, sync::{LazyLock, Mutex}
+};
 
 use anyhow::{bail, Result};
 use arti_client::{TorClient, TorClientConfig};
-use axum::{extract::connect_info::Connected as AxumConnected, Router};
+use axum::{extract::connect_info::Connected as AxumConnected, serve::IncomingStream, Router};
 use futures::StreamExt;
 use hyper::{body::Incoming, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -68,7 +70,7 @@ pub fn get_onion_name() -> String {
 /// - The Tor client fails to create a stream.
 /// - The Tor client fails to connect to the onion service.
 pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Result<()> {
-	std::env::set_var("RUST_LOG", "hyper,jsonrpsee=trace");
+	std::env::set_var("RUST_LOG", "hyper,http");
 
 	tracing_subscriber::fmt::init();
 
@@ -139,7 +141,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				bail!("failed to accept onion service stream");
 			};
 
-			let connect_info = ConnectionInfo { circuit_id: onion_service_stream.circuit().unique_id().to_string() };
+			let connect_info = ConnectionInfo { circuit_id: Some(onion_service_stream.circuit().unique_id().to_string()), socket_addr: None };
 
 			let Ok(tls_onion_service_stream) = tls_acceptor.accept(onion_service_stream).await else {
 				bail!("failed to accept TLS stream");
@@ -191,18 +193,25 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionInfo {
-	pub circuit_id: String,
+	pub circuit_id: Option<String>,
+	pub socket_addr: Option<SocketAddr>,
 }
 
 impl AxumConnected<Request<Incoming>> for ConnectionInfo {
 	fn connect_info(target: Request<Incoming>) -> Self {
-		Self { circuit_id: target.extensions().get::<Self>().unwrap().circuit_id.clone() }
+		Self { circuit_id: target.extensions().get::<Self>().unwrap().circuit_id.clone(), socket_addr: None }
 	}
 }
 
-impl AxumConnected<Self> for ConnectionInfo {
-	fn connect_info(target: Self) -> Self {
+impl AxumConnected<ConnectionInfo> for ConnectionInfo {
+	fn connect_info(target: ConnectionInfo) -> Self {
 		target
+	}
+}
+
+impl AxumConnected<IncomingStream<'_>> for ConnectionInfo {
+	fn connect_info(target: IncomingStream<'_>) -> Self {
+		Self { circuit_id: None, socket_addr: Some(target.local_addr().unwrap()) }
 	}
 }
 

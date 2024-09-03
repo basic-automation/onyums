@@ -155,6 +155,8 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				let _ = request.extensions_mut().insert(connect_info.clone());
 				let connect_info = connect_info.clone();
 
+				println!("request: {request:?}");
+
 				let app = app.clone();
 				let res = std::thread::spawn(move || {
 					let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

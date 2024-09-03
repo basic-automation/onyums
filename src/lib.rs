@@ -1,5 +1,6 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions, clippy::module_name_repetitions)]
+#![feature(addr_parse_ascii)]
 
 //! # Onyums
 //! Onyums is a simple axum wrapper for serving tor onion services.
@@ -27,7 +28,7 @@ use std::sync::{LazyLock, Mutex};
 
 use anyhow::{bail, Result};
 use arti_client::{TorClient, TorClientConfig};
-use axum::Router;
+use axum::{extract::connect_info::Connected as AxumConnected, Router};
 use futures::StreamExt;
 use hyper::{body::Incoming, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -95,6 +96,7 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 		bail!("failed to get onion service name");
 	};
 	let service_name = service_name.to_string();
+	eprintln!("onion service name: {service_name}");
 
 	match ONION_NAME.lock() {
 		Ok(mut guard) => {
@@ -134,6 +136,9 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 			let Ok(onion_service_stream) = stream_request.accept(Connected::new_empty()).await else {
 				bail!("failed to accept onion service stream");
 			};
+
+			let connect_info = ConnectionInfo { circuit_id: onion_service_stream.circuit().unique_id().to_string() };
+
 			let Ok(tls_onion_service_stream) = tls_acceptor.accept(onion_service_stream).await else {
 				bail!("failed to accept TLS stream");
 			};
@@ -141,11 +146,28 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 			// Wrap the stream in a `tokio_util::compat::Compat` to make it compatible with tokio's `AsyncRead` and `AsyncWrite`.
 			let stream = TokioIo::new(tls_onion_service_stream);
 
+			//let app = app.clone().into_make_service_with_connect_info::<SocketAddr>().call(socket_addr).await.unwrap();
+
 			// Hyper also has its own `Service` trait and doesn't use tower. We can use `hyper::service::service_fn` to create a hyper `Service` that calls our app through `tower::Service::call`.
-			let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
+			let hyper_service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
 				// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
 				// We don't need to call `poll_ready` since `Router` is always ready.
-				app.clone().call(request)
+				request.extensions_mut().insert(connect_info.clone()).unwrap();
+				let connect_info = connect_info.clone();
+
+				let app = app.clone();
+				let res = std::thread::spawn(move || {
+					let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+
+					#[allow(clippy::async_yields_async)]
+					runtime.block_on(async { app.clone().into_make_service_with_connect_info::<ConnectionInfo>().call(connect_info.clone()).await.unwrap().call(request) })
+				})
+				.join()
+				.unwrap();
+				res
+
+				//app.clone().into_make_service_with_connect_info::<SocketAddr>().call(socket_addr).await.unwrap().call(request)
+				//app.clone().call(request)
 			});
 
 			let ret = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(stream, hyper_service).await;
@@ -161,6 +183,23 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 	}
 
 	Ok(())
+}
+
+#[derive(Clone, Debug)]
+pub struct ConnectionInfo {
+	pub circuit_id: String,
+}
+
+impl AxumConnected<Request<Incoming>> for ConnectionInfo {
+	fn connect_info(target: Request<Incoming>) -> Self {
+		Self { circuit_id: target.extensions().get::<Self>().unwrap().circuit_id.clone() }
+	}
+}
+
+impl AxumConnected<Self> for ConnectionInfo {
+	fn connect_info(target: Self) -> Self {
+		target
+	}
 }
 
 #[cfg(test)]

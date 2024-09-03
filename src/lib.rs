@@ -152,7 +152,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 			let hyper_service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
 				// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
 				// We don't need to call `poll_ready` since `Router` is always ready.
-				request.extensions_mut().insert(connect_info.clone()).unwrap();
+				let _ = request.extensions_mut().insert(connect_info.clone());
 				let connect_info = connect_info.clone();
 
 				let app = app.clone();

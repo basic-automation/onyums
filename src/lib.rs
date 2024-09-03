@@ -185,7 +185,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 	Ok(())
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct ConnectionInfo {
 	pub circuit_id: String,
 }

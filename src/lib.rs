@@ -68,6 +68,8 @@ pub fn get_onion_name() -> String {
 /// - The Tor client fails to create a stream.
 /// - The Tor client fails to connect to the onion service.
 pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Result<()> {
+	std::env::set_var("RUST_LOG", "hyper,jsonrpsee=trace");
+
 	tracing_subscriber::fmt::init();
 
 	// create a new Tor client
@@ -155,7 +157,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				let _ = request.extensions_mut().insert(connect_info.clone());
 				let connect_info = connect_info.clone();
 
-				println!("request: {request:?}");
+				eprintln!("request: {request:?}");
 
 				let app = app.clone();
 				let res = std::thread::spawn(move || {

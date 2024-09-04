@@ -153,10 +153,10 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 			//let app = app.clone().into_make_service_with_connect_info::<SocketAddr>().call(socket_addr).await.unwrap();
 
 			// Hyper also has its own `Service` trait and doesn't use tower. We can use `hyper::service::service_fn` to create a hyper `Service` that calls our app through `tower::Service::call`.
-			let hyper_service = hyper::service::service_fn(move |mut request: Request<Incoming>| {
+			let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
 				// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
 				// We don't need to call `poll_ready` since `Router` is always ready.
-				let _ = request.extensions_mut().insert(connect_info.clone());
+				//let _ = request.extensions_mut().insert(connect_info.clone());
 				let connect_info = connect_info.clone();
 
 				eprintln!("request: {request:?}");
@@ -203,8 +203,8 @@ impl AxumConnected<Request<Incoming>> for ConnectionInfo {
 	}
 }
 
-impl AxumConnected<ConnectionInfo> for ConnectionInfo {
-	fn connect_info(target: ConnectionInfo) -> Self {
+impl AxumConnected<Self> for ConnectionInfo {
+	fn connect_info(target: Self) -> Self {
 		target
 	}
 }

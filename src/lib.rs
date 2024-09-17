@@ -24,9 +24,7 @@
 //! }
 //! ```
 
-use std::{
-	net::SocketAddr, sync::{LazyLock, Mutex}
-};
+use std::{net::SocketAddr, sync::LazyLock};
 
 use anyhow::{bail, Result};
 use arti_client::{TorClient, TorClientConfig};
@@ -34,6 +32,7 @@ use axum::{extract::connect_info::Connected as AxumConnected, serve::IncomingStr
 use futures::StreamExt;
 use hyper::{body::Incoming, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
+use tokio::sync::Mutex;
 use tokio_native_tls::TlsAcceptor;
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, StreamRequest};
@@ -102,14 +101,7 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 	let service_name = service_name.to_string();
 	eprintln!("onion service name: {service_name}");
 
-	match ONION_NAME.lock() {
-		Ok(mut guard) => {
-			(*guard).clone_from(&service_name);
-		}
-		Err(err) => {
-			eprintln!("failed to lock nickname: {err}");
-		}
-	}
+	ONION_NAME.lock().await.clone_from(&service_name);
 
 	// create a stream to handle incoming requests
 	let stream_requests = tor_hsservice::handle_rend_requests(request_stream);

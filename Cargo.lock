@@ -2260,23 +2260,18 @@ dependencies = [
  "anyhow",
  "arti-client",
  "axum",
- "bytes",
  "futures",
- "h2",
- "http",
  "hyper",
  "hyper-util",
  "native-tls",
- "safelog",
  "tokio",
  "tokio-native-tls",
- "tokio-util",
  "tor-cell",
+ "tor-cert",
  "tor-hsservice",
  "tor-proto",
  "tor-rtcompat",
  "tower-service",
- "tracing-subscriber",
 ]
 
 [[package]]
@@ -3539,10 +3534,7 @@ dependencies = [
  "futures-core",
  "futures-io",
  "futures-sink",
- "futures-util",
- "hashbrown 0.14.5",
  "pin-project-lite",
- "slab",
  "tokio",
 ]
 

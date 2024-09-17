@@ -71,8 +71,6 @@ pub fn get_onion_name() -> String {
 pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Result<()> {
 	std::env::set_var("RUST_LOG", "hyper,http");
 
-	tracing_subscriber::fmt::init();
-
 	// create a new Tor client
 	let config = TorClientConfig::default();
 	let Ok(runtime) = TokioNativeTlsRuntime::current() else {
@@ -99,7 +97,6 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 		bail!("failed to get onion service name");
 	};
 	let service_name = service_name.to_string();
-	eprintln!("onion service name: {service_name}");
 
 	ONION_NAME.lock().await.clone_from(&service_name);
 
@@ -147,9 +144,6 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
 				// We don't need to call `poll_ready` since `Router` is always ready.
 				let connect_info = connect_info.clone();
-
-				eprintln!("request: {request:?}");
-
 				let app = app.clone();
 				let res = std::thread::spawn(move || {
 					let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();

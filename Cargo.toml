@@ -1,6 +1,6 @@
 [package]
 name = "onyums"
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
@@ -16,7 +16,7 @@ hyper-util = { version = "0", features = ["full"] }
 tokio-util = { version = "0", features = ["full"] }
 futures = "0"
 arti-client = { version = "0", features = ["full", "static"] }
-tor-cell = { version = "0", features = ["full"] }
+tor-cell = { version = "0.22.0", features = ["full"] }
 tor-hsservice = { version = "0", features = ["full"] }
 tor-proto = { version = "0", features = ["full"] }
 safelog = "0"

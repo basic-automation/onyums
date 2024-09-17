@@ -150,13 +150,10 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 			// Wrap the stream in a `tokio_util::compat::Compat` to make it compatible with tokio's `AsyncRead` and `AsyncWrite`.
 			let stream = TokioIo::new(tls_onion_service_stream);
 
-			//let app = app.clone().into_make_service_with_connect_info::<SocketAddr>().call(socket_addr).await.unwrap();
-
 			// Hyper also has its own `Service` trait and doesn't use tower. We can use `hyper::service::service_fn` to create a hyper `Service` that calls our app through `tower::Service::call`.
 			let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
 				// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
 				// We don't need to call `poll_ready` since `Router` is always ready.
-				//let _ = request.extensions_mut().insert(connect_info.clone());
 				let connect_info = connect_info.clone();
 
 				eprintln!("request: {request:?}");
@@ -171,9 +168,6 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				.join()
 				.unwrap();
 				res
-
-				//app.clone().into_make_service_with_connect_info::<SocketAddr>().call(socket_addr).await.unwrap().call(request)
-				//app.clone().call(request)
 			});
 
 			let ret = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(stream, hyper_service).await;

@@ -12,16 +12,17 @@ categories = ["network-programming", "web-programming::http-client"]
 [dependencies]
 anyhow = "1.0.89"
 hyper = { version = "1.4.1", features = ["full"] }
-hyper-util = { version = "0.1.8", features = ["full"] }
-futures = "0.3.30"
-arti-client = { version = "0.22.0", features = ["full", "static"] }
-tor-cell = { version = "0.22.0", features = ["full"] }
-tor-hsservice = { version = "0.22.0", features = ["full"] }
-tor-proto = { version = "0.22.0", features = ["full"] }
+hyper-util = { version = "0.1.9", features = ["full"] }
+futures = "0.3.31"
+arti-client = { version = "0.23.0", features = ["full", "static"] }
+tor-cell = { version = "0.23.0", features = ["full"] }
+tor-hsservice = { version = "0.23.0", features = ["full"] }
+tor-proto = { version = "0.23.0", features = ["full"] }
 tokio = { version = "1.40.0", features = ["full"] }
 tokio-native-tls = "0.3.1"
 native-tls = "0.2.12"
-tor-rtcompat = { version = "0.22.0", features = ["full"] }
-axum = { version = "0.8.0-alpha.1", features = ["http2"] }
+tor-rtcompat = { version = "0.23.0", features = ["full"] }
+axum = { version = "0.7.7", features = ["http2"] }
 tower-service = "0.3.3"
-tor-cert = "0.22.0"
+tor-cert = "0.23.0"
+balens_log = { git = "https://github.com/basic-automation/balens-log" }

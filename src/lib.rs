@@ -70,7 +70,7 @@ pub fn get_onion_name() -> String {
 /// - The Tor client fails to create a stream.
 /// - The Tor client fails to connect to the onion service.
 pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Result<()> {
-        let serve_trace_span = span!(Level::INFO, "serve");
+        let serve_trace_span = span!(Level::INFO, "onyums - serve");
         let _info_trace_guard = serve_trace_span.enter();
         event!(Level::INFO, "Setting up onion service...");
 
@@ -120,7 +120,7 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 
         event!(Level::INFO, "Waiting for Incoming request...");
 	while let Some(stream_request) = stream_requests.next().await {
-                let incoming_request_trace_span = span!(Level::INFO, "incoming_request");
+                let incoming_request_trace_span = span!(Level::INFO, "onyums - incoming_request");
                 let _requests_trace_guard = incoming_request_trace_span.enter();
                 event!(Level::INFO, "New incoming request found...");
 		let tls_acceptor = tls_acceptor.clone();
@@ -142,7 +142,7 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 }
 
 async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
-        let hadling_request_trace_span = span!(Level::INFO, "hadling_request");
+        let hadling_request_trace_span = span!(Level::INFO, "onyums - hadling_request");
         let _hadling_request_trace_guard = hadling_request_trace_span.enter();
 	match stream_request.request() {
 		IncomingStreamRequest::Begin(begin) if begin.port() == 80 || begin.port() == 443 => {

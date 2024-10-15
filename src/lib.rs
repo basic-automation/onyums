@@ -29,7 +29,6 @@ use std::{net::SocketAddr, sync::LazyLock};
 use anyhow::{bail, Result};
 use arti_client::{TorClient, TorClientConfig};
 use axum::{extract::connect_info::Connected as AxumConnected, serve::IncomingStream, Router};
-use balens_log::{log, Level as LogLevel};
 use futures::StreamExt;
 use hyper::{body::Incoming, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -40,6 +39,7 @@ use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, StreamRequest
 use tor_proto::stream::IncomingStreamRequest;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tower_service::Service;
+use tracing::{event, span, Level};
 
 static ONION_NAME: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 
@@ -70,55 +70,62 @@ pub fn get_onion_name() -> String {
 /// - The Tor client fails to create a stream.
 /// - The Tor client fails to connect to the onion service.
 pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Result<()> {
-	std::env::set_var("RUST_LOG", "hyper,http");
+        let subscriber = tracing_subscriber::fmt::Subscriber::builder().with_max_level(Level::INFO).finish();
+        tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
+
+        let serve_trace_span = span!(Level::INFO, "serve");
+        let _info_trace_guard = serve_trace_span.enter();
+        event!(Level::INFO, "Setting up onion service...");
 
 	// create a new Tor client
-        log(LogLevel::Info, "Creating Tor client...".to_string());
+        event!(Level::INFO, "Creating Tor client...");
 	let config = TorClientConfig::default();
 	let Ok(runtime) = TokioNativeTlsRuntime::current() else {
-		log(LogLevel::Error, "Failed to get current tokio runtime.".to_string());
+                event!(Level::ERROR, "Failed to get current tokio runtime.");
 		bail!("Failed to get current tokio runtime.");
 	};
 	let client = TorClient::with_runtime(runtime);
 	let Ok(client) = client.config(config).create_bootstrapped().await else {
-		log(LogLevel::Error, "Failed to create bootstrapped Tor client.".to_string());
+                event!(Level::ERROR, "Failed to create bootstrapped Tor client.");
 		bail!("Failed to create bootstrapped Tor client.");
 	};
 
 	// launch an onion service
-        log(LogLevel::Info, "Launching onion service...".to_string());
+        event!(Level::INFO, "Launching onion service...");
 	let Ok(nickname) = nickname.parse::<HsNickname>() else {
-                log(LogLevel::Error, "Failed to parse nickname.".to_string());
+                event!(Level::ERROR, "Failed to parse nickname.");
 		bail!("Failed to parse nickname.");
 	};
 	let Ok(svc_cfg) = OnionServiceConfigBuilder::default().nickname(nickname).build() else {
-                log(LogLevel::Error, "Failed to build onion service config.".to_string());
+                event!(Level::ERROR, "Failed to build onion service config.");
 		bail!("Failed to build onion service config.");
 	};
 	let Ok((service, request_stream)) = client.launch_onion_service(svc_cfg) else {
-		log(LogLevel::Error, "Failed to launch onion service.".to_string());
+                event!(Level::ERROR, "Failed to launch onion service.");
                 bail!("Failed to launch onion service.");
 	};
 
 	// get the service name
-        log(LogLevel::Info, "Getting the onion service name...".to_string());
+        event!(Level::INFO, "Getting the onion service name...");
 	let Some(service_name) = service.onion_name() else {
-                log(LogLevel::Error, "Failed to get onion service name.".to_string());
+                event!(Level::ERROR, "Failed to get onion service name.");
 		bail!("Failed to get onion service name.");
 	};
 	let service_name = service_name.to_string();
-        log(LogLevel::Info, format!("Onion service name: {service_name}"));
+        event!(Level::INFO, "Onion service name: {service_name}");
 
 	ONION_NAME.lock().await.clone_from(&service_name);
 
 	// create a stream to handle incoming requests
-        log(LogLevel::Info, "Creating an steam to handle incoming requests...".to_string());
+        event!(Level::INFO, "Creating a stream to handle incoming requests...");
 	let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
 	tokio::pin!(stream_requests);
 
-        log(LogLevel::Info, "Handling incoming request".to_string());
+        event!(Level::INFO, "Handling incoming request...");
 	while let Some(stream_request) = stream_requests.next().await {
-                log(LogLevel::Info, "New incoming request found...".to_string());
+                let serve_trace_span = span!(Level::INFO, "handle_incoming_request");
+                let _requests_trace_guard = serve_trace_span.enter();
+                event!(Level::INFO, "New incoming request found...");
 		let tls_acceptor = tls_acceptor.clone();
 		let app = app.clone();
 
@@ -127,7 +134,7 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 			let result = handle_stream_request(stream_request, tls_acceptor.clone(), app.clone()).await;
 
 			if let Err(err) = result {
-                                log(LogLevel::Error, format!("error handling stream request: {err}"));
+                                event!(Level::ERROR, "Error handling stream request: {err}");
 			}
 		});
 	}
@@ -233,7 +240,7 @@ mod tests {
 
 		match serve(app, tls_acceptor, nickname).await {
 			Ok(()) => (),
-			Err(e) => log(LogLevel::Debug, e.to_string()),
+			Err(e) => event!(Level::DEBUG, "Error serving onion service: {e}"),
 		}
 	}
 }

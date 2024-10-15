@@ -70,9 +70,6 @@ pub fn get_onion_name() -> String {
 /// - The Tor client fails to create a stream.
 /// - The Tor client fails to connect to the onion service.
 pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Result<()> {
-        let subscriber = tracing_subscriber::fmt::Subscriber::builder().with_max_level(Level::INFO).finish();
-        tracing::subscriber::set_global_default(subscriber).expect("setting default subscriber failed");
-
         let serve_trace_span = span!(Level::INFO, "serve");
         let _info_trace_guard = serve_trace_span.enter();
         event!(Level::INFO, "Setting up onion service...");
@@ -121,10 +118,10 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 	let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
 	tokio::pin!(stream_requests);
 
-        event!(Level::INFO, "Handling incoming request...");
+        event!(Level::INFO, "Waiting for Incoming request...");
 	while let Some(stream_request) = stream_requests.next().await {
-                let serve_trace_span = span!(Level::INFO, "handle_incoming_request");
-                let _requests_trace_guard = serve_trace_span.enter();
+                let incoming_request_trace_span = span!(Level::INFO, "incoming_request");
+                let _requests_trace_guard = incoming_request_trace_span.enter();
                 event!(Level::INFO, "New incoming request found...");
 		let tls_acceptor = tls_acceptor.clone();
 		let app = app.clone();
@@ -134,45 +131,52 @@ pub async fn serve(app: Router, tls_acceptor: TlsAcceptor, nickname: &str) -> Re
 			let result = handle_stream_request(stream_request, tls_acceptor.clone(), app.clone()).await;
 
 			if let Err(err) = result {
-                                event!(Level::ERROR, "Error handling stream request: {err}");
+                                event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
 			}
 		});
 	}
 
 	drop(service);
-	bail!("onion service exited cleanly");
+        event!(Level::INFO, "Onion service exited cleanly.");
+	bail!("Onion service exited cleanly");
 }
 
 async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
+        let hadling_request_trace_span = span!(Level::INFO, "hadling_request");
+        let _hadling_request_trace_guard = hadling_request_trace_span.enter();
 	match stream_request.request() {
 		IncomingStreamRequest::Begin(begin) if begin.port() == 80 || begin.port() == 443 => {
 			// Accept the incoming stream and wrap it in a TLS stream
+                        event!(Level::INFO, "Accepting the incoming stream and wraping it in a TLS stream...");
 			let Ok(onion_service_stream) = stream_request.accept(Connected::new_empty()).await else {
-				bail!("failed to accept onion service stream");
+				event!(Level::ERROR, "Failed to accept onion service stream.");
+                                bail!("failed to accept onion service stream");
 			};
 
 			let connect_info = ConnectionInfo { circuit_id: Some(onion_service_stream.circuit().unique_id().to_string()), socket_addr: None };
 
 			let Ok(tls_onion_service_stream) = tls_acceptor.accept(onion_service_stream).await else {
-				bail!("failed to accept TLS stream");
+				event!(Level::ERROR, "Failed to accept TLS stream.");
+                                bail!("failed to accept TLS stream");
 			};
 
 			// Wrap the stream in a `tokio_util::compat::Compat` to make it compatible with tokio's `AsyncRead` and `AsyncWrite`.
+                        event!(Level::INFO, "Wrapping the steam for tokio compatability...");
 			let stream = TokioIo::new(tls_onion_service_stream);
-
+                        
 			// Hyper also has its own `Service` trait and doesn't use tower. We can use `hyper::service::service_fn` to create a hyper `Service` that calls our app through `tower::Service::call`.
-			let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
+                        let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
 				// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
 				// We don't need to call `poll_ready` since `Router` is always ready.
 				let connect_info = connect_info.clone();
 				let app = app.clone();
 				let res = std::thread::spawn(move || {
-					println!("create tokio runtime.");
+                                        event!(Level::INFO, "Creating tokio runtime...");
 					let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
 					#[allow(clippy::async_yields_async)]
 					runtime.block_on(async {
-						println!("serving connection.");
+                                                event!(Level::INFO, "Serving connection...");
 						app.clone().into_make_service_with_connect_info::<ConnectionInfo>().call(connect_info.clone()).await.unwrap().call(request)
 					})
 				})
@@ -181,14 +185,17 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				res
 			});
 
+                        // Serve the connection with hyper's `auto::Builder`.
+                        event!(Level::INFO, "Serving the connection with hyper...");
 			let ret = hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).serve_connection_with_upgrades(stream, hyper_service).await;
 
 			if let Err(err) = ret {
-				eprintln!("error serving connection: {err}");
+                                event!(Level::ERROR, "Error serving connection: {err}");
 			}
 		}
 		_ => {
-			eprintln!("rejecting request: {:?}", stream_request.request());
+                        // Reject the incoming request
+                        event!(Level::INFO, "Rejecting the incoming request {:?}...", stream_request.request());
 			stream_request.shutdown_circuit()?;
 		}
 	}

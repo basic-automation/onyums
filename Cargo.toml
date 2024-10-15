@@ -1,9 +1,7 @@
-cargo-features = ["edition2024"]
-
 [package]
 name = "onyums"
 version = "0.1.16"
-edition = "2024"
+edition = "2021"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
 readme = "README.md"

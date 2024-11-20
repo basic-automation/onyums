@@ -1,6 +1,6 @@
 [package]
 name = "onyums"
-version = "0.1.16"
+version = "0.1.17"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
@@ -26,3 +26,4 @@ axum = { version = "0.7.7", features = ["http2"] }
 tower-service = "0.3.3"
 tor-cert = "0.23.0"
 tracing = "0.1.40"
+rcgen = "0.13.1"

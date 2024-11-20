@@ -473,11 +473,10 @@ checksum = "ace50bade8e6234aa140d9a2f552bbee1db4d353f69b8217bc503490fc1a9f26"
 
 [[package]]
 name = "axum"
-version = "0.7.9"
+version = "0.8.0-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "edca88bc138befd0323b20752846e6587272d3b03b0343c8ea28a6f819e6e71f"
+checksum = "4132c8995c63b222c56f38b80748c23323d7012d1f783b0f42e92782c2676690"
 dependencies = [
- "async-trait",
  "axum-core",
  "bytes",
  "futures-util",
@@ -507,11 +506,10 @@ dependencies = [
 
 [[package]]
 name = "axum-core"
-version = "0.4.5"
+version = "0.5.0-alpha.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09f2bd6146b97ae3359fa0cc6d6b376d9539582c7b4220f041a33ec24c226199"
+checksum = "f3405ae79f3aab93ae35fe2944aff9bf0f5aac918c0229f3528043c5a454d17d"
 dependencies = [
- "async-trait",
  "bytes",
  "futures-util",
  "http",
@@ -2304,9 +2302,9 @@ dependencies = [
 
 [[package]]
 name = "matchit"
-version = "0.7.3"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e7465ac9959cc2b1404e8e2367b43684a6d13790fe23056cc8c6c5a6b7bcb94"
+checksum = "56e8fcd7bd6025a951597d6ba2f8e48a121af7e262f2b52a006a09c8d61f9304"
 
 [[package]]
 name = "memchr"
@@ -2552,7 +2550,7 @@ dependencies = [
 
 [[package]]
 name = "onyums"
-version = "0.1.18"
+version = "0.1.19"
 dependencies = [
  "anyhow",
  "arti-client",

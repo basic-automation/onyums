@@ -15,12 +15,8 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     let app = Router::new().route("/", get(|| async { "Hello, World!" }));
-//!     let c = include_bytes!("../self_signed_certs/cert.pem");
-//!     let k = include_bytes!("../self_signed_certs/key.pem");
-//!     let identity = Identity::from_pem(c, k).unwrap();
-//!     let tls_acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::builder(identity).build().unwrap());
 //!
-//!     serve(app, tls_acceptor, "my_onion").await.unwrap();
+//!     serve(app, "my_onion").await.unwrap();
 //! }
 //! ```
 
@@ -33,7 +29,6 @@ use futures::StreamExt;
 use hyper::{body::Incoming, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Mutex;
-use tokio_native_tls::TlsAcceptor;
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, StreamRequest};
 use tor_proto::stream::IncomingStreamRequest;
@@ -41,8 +36,12 @@ use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tower_service::Service;
 use tracing::{event, span, Level};
 extern crate rcgen;
-use rcgen::{generate_simple_self_signed, CertifiedKey};
-use tokio_native_tls::native_tls::{Identity, Protocol};
+use std::sync::Arc;
+
+use rcgen::generate_simple_self_signed;
+use tokio_rustls::{
+	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
+};
 
 static ONION_NAME: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
 
@@ -116,13 +115,13 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 
 	ONION_NAME.lock().await.clone_from(&service_name);
 
-        let tls_acceptor = match tls_acceptor() {
-                Ok(tls_acceptor) => tls_acceptor,
-                Err(e) => {
-                        event!(Level::ERROR, "Creating TLS acceptor: {:?}", e);
-                        bail!(format!("Creating TLS acceptor: {:?}", e))
-                }
-        };
+	let tls_acceptor = match tls_acceptor() {
+		Ok(tls_acceptor) => tls_acceptor,
+		Err(e) => {
+			event!(Level::ERROR, "Creating TLS acceptor: {:?}", e);
+			bail!(format!("Creating TLS acceptor: {:?}", e))
+		}
+	};
 
 	// create a stream to handle incoming requests
 	event!(Level::INFO, "Creating a stream to handle incoming requests...");
@@ -135,11 +134,11 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 		let _requests_trace_guard = incoming_request_trace_span.enter();
 		event!(Level::INFO, "New incoming request found...");
 		let app = app.clone();
-                let tls_acceptor = tls_acceptor.clone();
+		let tls_acceptor = tls_acceptor.clone();
 
 		tokio::spawn(async move {
 			// handle the incoming request
-			let result = handle_stream_request(stream_request, tls_acceptor,  app.clone()).await;
+			let result = handle_stream_request(stream_request, tls_acceptor, app.clone()).await;
 
 			if let Err(err) = result {
 				event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
@@ -241,17 +240,23 @@ impl AxumConnected<IncomingStream<'_>> for ConnectionInfo {
 fn tls_acceptor() -> Result<TlsAcceptor> {
 	let onion_name = get_onion_name();
 	let subject_alt_names = vec![onion_name];
-	let CertifiedKey { cert, key_pair } = match generate_simple_self_signed(subject_alt_names) {
-		Ok(cert) => cert,
-		Err(e) => bail!(format!("Generating self-signed certificate: {:?}", e)),
+	let cert = generate_simple_self_signed(subject_alt_names).unwrap();
+	let key_der = match PrivatePkcs8KeyDer::from_pem_slice(cert.key_pair.serialize_pem().as_bytes()) {
+		Ok(key_der) => PrivateKeyDer::Pkcs8(key_der),
+		Err(e) => {
+			event!(Level::ERROR, "Error converting key to der: {:?}", e);
+			bail!(format!("Error converting key to der: {:?}", e))
+		}
 	};
-
-	let key_pem = key_pair.serialize_pem();
-	let cert_pem = cert.pem();
-
-	let id = Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap();
-	let native_tls_acceptor = tokio_native_tls::native_tls::TlsAcceptor::builder(id).min_protocol_version(Some(Protocol::Tlsv12)).build().unwrap();
-	Ok(TlsAcceptor::from(native_tls_acceptor))
+	let server_config = match rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], key_der) {
+		Ok(server_config) => server_config,
+		Err(e) => {
+			event!(Level::ERROR, "Error creating server config: {:?}", e);
+			bail!(format!("Error creating server config: {:?}", e))
+		}
+	};
+	let acceptor = TlsAcceptor::from(Arc::new(server_config));
+	Ok(acceptor)
 }
 
 #[cfg(test)]
@@ -262,6 +267,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn test_serve() {
+		let tracing_subscriber = tracing_subscriber::fmt().with_max_level(tracing::Level::DEBUG).finish();
+		tracing::subscriber::set_global_default(tracing_subscriber).expect("setting default subscriber failed");
+
 		let app = Router::new().route("/", get(|| async { "Hello, World!" }));
 		let nickname = "onyums-yum-yum-test2";
 

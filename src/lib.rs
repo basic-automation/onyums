@@ -248,7 +248,7 @@ fn tls_acceptor() -> Result<TlsAcceptor> {
 	let cert_pem = cert.pem();
 
 	let id = Identity::from_pkcs8(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap();
-	let native_tls_acceptor = native_tls::TlsAcceptor::builder(id).min_protocol_version(Some(Protocol::Tlsv12)).build().unwrap();
+	let native_tls_acceptor = tokio_native_tls::native_tls::TlsAcceptor::builder(id).min_protocol_version(Some(Protocol::Tlsv12)).build().unwrap();
 	Ok(TlsAcceptor::from(native_tls_acceptor))
 }
 

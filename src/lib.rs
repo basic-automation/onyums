@@ -116,6 +116,14 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 
 	ONION_NAME.lock().await.clone_from(&service_name);
 
+        let tls_acceptor = match tls_acceptor() {
+                Ok(tls_acceptor) => tls_acceptor,
+                Err(e) => {
+                        event!(Level::ERROR, "Creating TLS acceptor: {:?}", e);
+                        bail!(format!("Creating TLS acceptor: {:?}", e))
+                }
+        };
+
 	// create a stream to handle incoming requests
 	event!(Level::INFO, "Creating a stream to handle incoming requests...");
 	let stream_requests = tor_hsservice::handle_rend_requests(request_stream);
@@ -127,10 +135,11 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 		let _requests_trace_guard = incoming_request_trace_span.enter();
 		event!(Level::INFO, "New incoming request found...");
 		let app = app.clone();
+                let tls_acceptor = tls_acceptor.clone();
 
 		tokio::spawn(async move {
 			// handle the incoming request
-			let result = handle_stream_request(stream_request, app.clone()).await;
+			let result = handle_stream_request(stream_request, tls_acceptor,  app.clone()).await;
 
 			if let Err(err) = result {
 				event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
@@ -143,7 +152,7 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 	bail!("Onion service exited cleanly");
 }
 
-async fn handle_stream_request(stream_request: StreamRequest, app: Router) -> Result<()> {
+async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
 	let hadling_request_trace_span = span!(Level::INFO, "onyums - hadling_request");
 	let _hadling_request_trace_guard = hadling_request_trace_span.enter();
 	match stream_request.request() {
@@ -157,13 +166,6 @@ async fn handle_stream_request(stream_request: StreamRequest, app: Router) -> Re
 
 			let connect_info = ConnectionInfo { circuit_id: Some(onion_service_stream.circuit().unique_id().to_string()), socket_addr: None };
 
-			let tls_acceptor = match tls_acceptor() {
-				Ok(tls_acceptor) => tls_acceptor,
-				Err(e) => {
-					event!(Level::ERROR, "Creating TLS acceptor: {:?}", e);
-					bail!(format!("Creating TLS acceptor: {:?}", e))
-				}
-			};
 			let Ok(tls_onion_service_stream) = tls_acceptor.accept(onion_service_stream).await else {
 				event!(Level::ERROR, "Failed to accept TLS stream.");
 				bail!("failed to accept TLS stream");

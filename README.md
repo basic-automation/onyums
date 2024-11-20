@@ -7,14 +7,13 @@ Onyums is a simple axum wrapper for serving tor onion services. It provides the 
 
 *******************
 ####  **NEW! - Onyums now supports websockets over Tor!**
+####  **NEW! - Onyums now generates self-signed certs automatically on the fly!**
 *******************
 
 
 ## Hello world example
 ```rust
 use axum::{routing::get, Router};
-use native_tls::Identity;
-use tokio_native_tls::TlsAcceptor;
 use onyums::serve;
 
 #[tokio::main]
@@ -22,15 +21,9 @@ async fn main() {
         // standard axum router
         let app = Router::new().route("/", get(|| async { "Hello, World!" }));
 
-        // create tls identity & acceptor
-        let c = include_bytes!("../self_signed_certs/cert.pem");
-        let k = include_bytes!("../self_signed_certs/key.pem");
-        let identity = Identity::from_pem(c, k).unwrap();
-        let tls_acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::builder(identity).build().unwrap());
-
         // start the serve
-        // pass in the router, tls acceptor, and the server nickname (used to generate an onion address).
-        serve(app, tls_acceptor, "my_onion").await.unwrap();
+        // pass in the router and the server nickname (used to generate an onion address).
+        serve(app, "my_onion").await.unwrap();
 }
 ```
 ****
@@ -47,8 +40,6 @@ use axum_extra::TypedHeader;
 
 use std::borrow::Cow;
 use std::ops::ControlFlow;
-use native_tls::Identity;
-use tokio_native_tls::TlsAcceptor;
 use onyums::{serve, ConnectionInfo};
 
 #[tokio::main]
@@ -56,15 +47,9 @@ async fn main() {
         // build our application with some routes
         let app = Router::new().route("/ws", get(ws_handler));
 
-        // create tls identity & acceptor
-        let c = include_bytes!("../self_signed_certs/cert.pem");
-        let k = include_bytes!("../self_signed_certs/key.pem");
-        let identity = Identity::from_pem(c, k).unwrap();
-        let tls_acceptor = TlsAcceptor::from(native_tls::TlsAcceptor::builder(identity).build().unwrap());
-
         // start the serve
-        // pass in the router, tls acceptor, and the server nickname (used to generate an onion address).
-        serve(app, tls_acceptor, "my_onion").await.unwrap();
+        // pass in the router and the server nickname (used to generate an onion address).
+        serve(app, "my_onion").await.unwrap();
 }
 
 /// The handler for the HTTP request (this gets called when the HTTP GET lands at the start

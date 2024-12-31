@@ -24,7 +24,7 @@ use std::{net::SocketAddr, sync::LazyLock};
 
 use anyhow::{bail, Result};
 use arti_client::{TorClient, TorClientConfig};
-use axum::{extract::connect_info::Connected as AxumConnected, serve::IncomingStream, Router};
+use axum::{extract::connect_info::Connected as AxumConnected, Router};
 use futures::StreamExt;
 use hyper::{body::Incoming, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -231,11 +231,11 @@ impl AxumConnected<Self> for ConnectionInfo {
 	}
 }
 
-impl AxumConnected<IncomingStream<'_>> for ConnectionInfo {
+/* impl AxumConnected<IncomingStream<'_>> for ConnectionInfo {
 	fn connect_info(target: IncomingStream<'_>) -> Self {
 		Self { circuit_id: None, socket_addr: Some(target.local_addr().unwrap()) }
 	}
-}
+} */
 
 fn tls_acceptor() -> Result<TlsAcceptor> {
 	let onion_name = get_onion_name();

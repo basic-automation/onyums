@@ -1,6 +1,6 @@
 [package]
 name = "onyums"
-version = "0.1.22"
+version = "0.1.23"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
@@ -10,22 +10,22 @@ keywords = ["tor", "http", "request", "server", "SOCKS"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-anyhow = "1.0.93"
-hyper = { version = "1.5.1", features = ["full"] }
+anyhow = "1.0.95"
+hyper = { version = "1.5.2", features = ["full"] }
 hyper-util = { version = "0.1.10", features = ["full"] }
 futures = "0.3.31"
-arti-client = { version = "0.24.0", features = ["full", "static"] }
-tor-cell = { version = "0.24.0", features = ["full"] }
-tor-hsservice = { version = "0.24.0", features = ["full"] }
-tor-proto = { version = "0.24.0", features = ["full"] }
-tokio = { version = "1.41.1", features = ["full"] }
-tor-rtcompat = { version = "0.24.0", features = ["full"] }
-axum = { version = "0.8.0-alpha.1", features = ["http2"] }
+arti-client = { version = "0.25.0", features = ["full", "static"] }
+tor-cell = { version = "0.25.0", features = ["full"] }
+tor-hsservice = { version = "0.25.0", features = ["full"] }
+tor-proto = { version = "0.25.0", features = ["full"] }
+tor-rtcompat = { version = "0.25.0", features = ["full"] }
+tor-cert = "0.25.0"
+tokio = { version = "1.42.0", features = ["full"] }
+axum = { version = "0.8.0-rc.1", features = ["http2"] }
 tower-service = "0.3.3"
-tor-cert = "0.24.0"
-tracing = "0.1.40"
-rcgen = "0.13.1"
-tokio-rustls = { version = "0.26.0", default-features = false, features = ["logging", "tls12", "ring"] }
+tracing = "0.1.41"
+rcgen = "0.13.2"
+tokio-rustls = { version = "0.26.1", default-features = false, features = ["logging", "tls12", "ring"] }
 
 [dev-dependencies]
 tracing-subscriber = "0.3.18"

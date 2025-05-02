@@ -1,7 +1,7 @@
 [package]
 name = "onyums"
 version = "0.1.23"
-edition = "2021"
+edition = "2024"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
 readme = "README.md"
@@ -10,22 +10,22 @@ keywords = ["tor", "http", "request", "server", "SOCKS"]
 categories = ["network-programming", "web-programming::http-client"]
 
 [dependencies]
-anyhow = { workspace = true }
-hyper = { workspace = true, features = ["full"] }
-hyper-util = { workspace = true, features = ["full"] }
-futures = { workspace = true }
-arti-client = { workspace = true, features = ["full", "static"] }
-tor-cell = { workspace = true, features = ["full"] }
-tor-hsservice = { workspace = true, features = ["full"] }
-tor-proto = { workspace = true, features = ["full"] }
-tor-rtcompat = { workspace = true, features = ["full"] }
-tor-cert = { workspace = true }
-tokio = { workspace = true, features = ["full"] }
-axum = { workspace = true, features = ["http2"] }
-tower-service = { workspace = true }
-tracing = { workspace = true }
-rcgen = { workspace = true }
-tokio-rustls = { workspace = true, default-features = false, features = ["logging", "tls12", "ring"] }
+anyhow = "1.0.98"
+hyper = { version = "1.6.0", features = ["full"] }
+hyper-util = { version = "0.1.11", features = ["full"] }
+futures = "0.3.31"
+arti-client = { version = "0.30.0", features = ["full", "static"] }
+tor-cell = { version = "0.30.0", features = ["full"] }
+tor-hsservice = { version = "0.30.0", features = ["full"] }
+tor-proto = { version = "0.30.0", features = ["full", "stream-ctrl"] }
+tor-rtcompat = { version = "0.30.0", features = ["full"] }
+tor-cert = "0.30.0"
+tokio = { version = "1.44.2", features = ["full"] }
+axum = { version = "0.8.4", features = ["http2"] }
+tower-service = "0.3.3"
+tracing = "0.1.41"
+rcgen = "0.13.2"
+tokio-rustls = { version = "0.26.2", default-features = false, features = ["logging", "tls12", "ring"] }
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true }
+tracing-subscriber = "0.3.19"

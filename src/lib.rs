@@ -29,9 +29,10 @@ use futures::StreamExt;
 use hyper::{body::Incoming, Request};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Mutex;
-use tor_cell::relaycell::msg::Connected;
+use tor_cell::relaycell::msg::EndReason; // Import EndReason instead of Reason
+use tor_cell::relaycell::msg::{Connected, End}; // Import End
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, StreamRequest};
-use tor_proto::stream::IncomingStreamRequest;
+use tor_proto::stream::{ClientStreamCtrl, IncomingStreamRequest};
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tower_service::Service;
 use tracing::{event, span, Level};
@@ -106,7 +107,7 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 
 	// get the service name
 	event!(Level::INFO, "Getting the onion service name...");
-	let Some(service_name) = service.onion_name() else {
+	let Some(service_name) = service.onion_address() else {
 		event!(Level::ERROR, "Failed to get onion service name.");
 		bail!("Failed to get onion service name.");
 	};
@@ -154,8 +155,10 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
 	let hadling_request_trace_span = span!(Level::INFO, "onyums - hadling_request");
 	let _hadling_request_trace_guard = hadling_request_trace_span.enter();
-	match stream_request.request() {
-		IncomingStreamRequest::Begin(begin) if begin.port() == 80 || begin.port() == 443 => {
+	match stream_request.request().clone() {
+		// Clone request to use `begin` later
+		IncomingStreamRequest::Begin(begin) if begin.port() == 443 => {
+			// Only handle port 443 for TLS
 			// Accept the incoming stream and wrap it in a TLS stream
 			event!(Level::INFO, "Accepting the incoming stream and wraping it in a TLS stream...");
 			let Ok(onion_service_stream) = stream_request.accept(Connected::new_empty()).await else {
@@ -163,11 +166,16 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				bail!("failed to accept onion service stream");
 			};
 
-			let connect_info = ConnectionInfo { circuit_id: Some(onion_service_stream.circuit().unique_id().to_string()), socket_addr: None };
+			let circuit_id = onion_service_stream.client_stream_ctrl().and_then(|ctrl_stream| ctrl_stream.circuit().map(|circuit| circuit.unique_id().to_string()));
+			let connect_info = ConnectionInfo { circuit_id, socket_addr: None };
 
-			let Ok(tls_onion_service_stream) = tls_acceptor.accept(onion_service_stream).await else {
-				event!(Level::ERROR, "Failed to accept TLS stream.");
-				bail!("failed to accept TLS stream");
+			// Accept the TLS connection, logging the specific error on failure
+			let tls_onion_service_stream = match tls_acceptor.accept(onion_service_stream).await {
+				Ok(stream) => stream,
+				Err(e) => {
+					event!(Level::ERROR, "Failed to accept TLS stream: {:?}", e); // Log the detailed error
+					bail!(format!("failed to accept TLS stream: {:?}", e));
+				}
 			};
 
 			// Wrap the stream in a `tokio_util::compat::Compat` to make it compatible with tokio's `AsyncRead` and `AsyncWrite`.
@@ -180,7 +188,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 				// We don't need to call `poll_ready` since `Router` is always ready.
 				let connect_info = connect_info.clone();
 				let app = app.clone();
-				let res = std::thread::spawn(move || {
+				std::thread::spawn(move || {
 					event!(Level::INFO, "Creating tokio runtime...");
 					let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
 
@@ -191,8 +199,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 					})
 				})
 				.join()
-				.unwrap();
-				res
+				.unwrap()
 			});
 
 			// Serve the connection with hyper's `auto::Builder`.
@@ -202,6 +209,13 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 			if let Err(err) = ret {
 				event!(Level::ERROR, "Error serving connection: {err}");
 			}
+		}
+		IncomingStreamRequest::Begin(begin) if begin.port() == 80 => {
+			// Handle Port 80 (Plain HTTP) - Currently rejecting
+			event!(Level::INFO, "Rejecting plain HTTP request on port 80.");
+			// Construct an End message with a reason using the correct type and constructor
+			let end_msg = End::new_with_reason(EndReason::MISC);
+			stream_request.reject(end_msg).await?; // Pass the End message
 		}
 		_ => {
 			// Reject the incoming request

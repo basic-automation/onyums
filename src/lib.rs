@@ -22,26 +22,26 @@
 
 use std::{net::SocketAddr, sync::LazyLock};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use arti_client::{TorClient, TorClientConfig};
-use axum::{extract::connect_info::Connected as AxumConnected, Router};
+use axum::{Router, extract::connect_info::Connected as AxumConnected};
 use futures::StreamExt;
-use hyper::{body::Incoming, Request};
+use hyper::{Request, body::Incoming};
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Mutex;
 use tor_cell::relaycell::msg::EndReason; // Import EndReason instead of Reason
 use tor_cell::relaycell::msg::{Connected, End}; // Import End
-use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, StreamRequest};
+use tor_hsservice::{HsNickname, StreamRequest, config::OnionServiceConfigBuilder};
 use tor_proto::stream::{ClientStreamCtrl, IncomingStreamRequest};
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tower_service::Service;
-use tracing::{event, span, Level};
+use tracing::{Level, event, span};
 extern crate rcgen;
 use std::sync::Arc;
 
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
-	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
+	TlsAcceptor, rustls, rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject}
 };
 
 static ONION_NAME: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
@@ -275,7 +275,7 @@ fn tls_acceptor() -> Result<TlsAcceptor> {
 
 #[cfg(test)]
 mod tests {
-	use axum::{routing::get, Router};
+	use axum::{Router, routing::get};
 
 	use super::*;
 

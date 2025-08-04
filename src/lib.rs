@@ -255,7 +255,8 @@ fn tls_acceptor() -> Result<TlsAcceptor> {
 	let onion_name = get_onion_name();
 	let subject_alt_names = vec![onion_name];
 	let cert = generate_simple_self_signed(subject_alt_names).unwrap();
-	let key_der = match PrivatePkcs8KeyDer::from_pem_slice(cert.key_pair.serialize_pem().as_bytes()) {
+
+	let key_der = match PrivatePkcs8KeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()) {
 		Ok(key_der) => PrivateKeyDer::Pkcs8(key_der),
 		Err(e) => {
 			event!(Level::ERROR, "Error converting key to der: {:?}", e);

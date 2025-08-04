@@ -1,6 +1,6 @@
 [package]
 name = "onyums"
-version = "0.1.24"
+version = "0.1.25"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
@@ -12,19 +12,19 @@ categories = ["network-programming", "web-programming::http-client"]
 [dependencies]
 anyhow = "1.0.98"
 hyper = { version = "1.6.0", features = ["full"] }
-hyper-util = { version = "0.1.11", features = ["full"] }
+hyper-util = { version = "0.1.16", features = ["full"] }
 futures = "0.3.31"
-arti-client = { version = "0.30.0", features = ["full", "static"] }
-tor-cell = { version = "0.30.0", features = ["full"] }
-tor-hsservice = { version = "0.30.0", features = ["full"] }
-tor-proto = { version = "0.30.0", features = ["full", "stream-ctrl"] }
-tor-rtcompat = { version = "0.30.0", features = ["full"] }
-tor-cert = "0.30.0"
-tokio = { version = "1.44.2", features = ["full"] }
+arti-client = { version = "0.32.0", features = ["full", "static"] }
+tor-cell = { version = "0.32.0", features = ["full"] }
+tor-hsservice = { version = "0.32.0", features = ["full"] }
+tor-proto = { version = "0.32.0", features = ["full", "stream-ctrl"] }
+tor-rtcompat = { version = "0.32.0", features = ["full"] }
+tor-cert = "0.32.0"
+tokio = { version = "1.47.1", features = ["full"] }
 axum = { version = "0.8.4", features = ["http2"] }
 tower-service = "0.3.3"
 tracing = "0.1.41"
-rcgen = "0.13.2"
+rcgen = "0.14.3"
 tokio-rustls = { version = "0.26.2", default-features = false, features = ["logging", "tls12", "ring"] }
 
 [dev-dependencies]

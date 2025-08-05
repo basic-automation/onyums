@@ -8,6 +8,7 @@ Onyums is a simple axum wrapper for serving tor onion services. It provides the 
 *******************
 ####  **NEW! - Onyums now supports websockets over Tor!**
 ####  **NEW! - Onyums now generates self-signed certs automatically on the fly!**
+#### **NEW! - Onyums now automatically upgrades http urls to https with no extra work on your end.**
 *******************
 
 

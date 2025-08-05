@@ -14,17 +14,26 @@ Onyums is a simple axum wrapper for serving tor onion services. It provides the 
 
 ## Hello world example
 ```rust
-use axum::{routing::get, Router};
-use onyums::serve;
+use onyums::{serve, routing::get, Router};
 
 #[tokio::main]
 async fn main() {
-        // standard axum router
-        let app = Router::new().route("/", get(|| async { "Hello, World!" }));
+	// spawn an onyums server on a new thread and return the onion address
+	tokio::spawn(async {
+		let app = Router::new().route("/", axum_get(|| async { "Hello, World!" }));
+		serve(app, "my_onion").await.unwrap();
+	});
 
-        // start the serve
-        // pass in the router and the server nickname (used to generate an onion address).
-        serve(app, "my_onion").await.unwrap();
+        // wait until `get_onion_name()` returns a non-empty String
+        // then the server is ready
+        let mut onion_name = String::new();
+        while onion_name.is_empty() {
+		onion_name = get_onion_name();
+
+                // wait for 200 milliseconds before checking again
+                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+	}
+	println!("Onion Address: {onion_name}");
 }
 ```
 ****

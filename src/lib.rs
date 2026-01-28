@@ -30,8 +30,9 @@ use hyper_util::rt::{TokioExecutor, TokioIo};
 use tokio::sync::Mutex;
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, RendRequest, RunningOnionService, StreamRequest};
-use tor_proto::stream::{ClientStreamCtrl, IncomingStreamRequest};
+use tor_proto::client::stream::IncomingStreamRequest;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
+use safelog::DisplayRedacted;
 use tower_service::Service;
 use tracing::{event, span, Level};
 extern crate rcgen;
@@ -63,13 +64,15 @@ fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &st
 	event!(Level::INFO, "Launching onion service...");
 	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
 	let svc_cfg = OnionServiceConfigBuilder::default().nickname(nickname).build().map_err(|_| anyhow::anyhow!("Failed to build onion service config."))?;
-	client.launch_onion_service(svc_cfg).map_err(|_| anyhow::anyhow!("Failed to launch onion service."))
+	client.launch_onion_service(svc_cfg)
+		.map_err(|_| anyhow::anyhow!("Failed to launch onion service."))?
+		.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
 }
 
 /// Retrieves and stores the onion service name.
 async fn get_and_store_onion_name(service: &Arc<RunningOnionService>) -> Result<String> {
 	event!(Level::INFO, "Getting the onion service name...");
-	let service_name = service.onion_address().ok_or_else(|| anyhow::anyhow!("Failed to get onion service name."))?.to_string();
+	let service_name = service.onion_address().ok_or_else(|| anyhow::anyhow!("Failed to get onion service name."))?.display_unredacted().to_string();
 	event!(Level::INFO, "Onion service name: {service_name}");
 
 	// Ensure we store the name with .onion suffix, but not double .onion
@@ -168,8 +171,7 @@ async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsA
 	event!(Level::INFO, "Accepting the incoming stream and wrapping it in a TLS stream...");
 	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
 
-	let circuit_id = onion_service_stream.client_stream_ctrl().and_then(|ctrl_stream| ctrl_stream.circuit().map(|circuit| circuit.unique_id().to_string()));
-	let connect_info = ConnectionInfo { circuit_id, socket_addr: None };
+	let connect_info = ConnectionInfo { circuit_id: None, socket_addr: None };
 
 	// Accept the TLS connection, logging the specific error on failure
 	let tls_onion_service_stream = tls_acceptor.accept(onion_service_stream).await.map_err(|e| anyhow::anyhow!("failed to accept TLS stream: {:?}", e))?;

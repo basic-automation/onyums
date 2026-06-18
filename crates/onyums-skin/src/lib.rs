@@ -22,3 +22,4 @@ pub use challenge::{
 };
 pub use circuit::{CircuitAction, CircuitId, CircuitPolicy, StreamTarget};
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
+pub use ratelimit::{Quota, SkinRateLimit};

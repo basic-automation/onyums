@@ -3,7 +3,7 @@
 //! The default is SHA-256 hashcash (MIT, pure Rust, near-free server verification) —
 //! the correct asymmetry for an access gate. Heavier or "useful-work" backends
 //! (Equi-X, RandomX) can implement [`Pow`] behind cargo features; they are never the
-//! default. See `docs/skin.md` §4.3 for the rationale, including why RandomX-WASM
+//! default. See `ROADMAP.md` §4.3 for the rationale, including why RandomX-WASM
 //! mine-to-enter was rejected.
 
 /// A PoW puzzle handed to the client.
@@ -28,12 +28,12 @@ pub struct Hashcash;
 impl Pow for Hashcash {
     fn new_puzzle(&self, _difficulty: u32) -> Puzzle {
         // TODO(skin v0.1): random 32-byte seed at the requested difficulty.
-        unimplemented!("hashcash puzzle generation — see docs/skin.md")
+        unimplemented!("hashcash puzzle generation — see ROADMAP.md")
     }
 
     fn verify(&self, _puzzle: &Puzzle, _solution: &[u8]) -> bool {
         // TODO(skin v0.1): accept iff SHA-256(seed || solution) has >= difficulty
         // leading zero bits.
-        unimplemented!("hashcash verification — see docs/skin.md")
+        unimplemented!("hashcash verification — see ROADMAP.md")
     }
 }

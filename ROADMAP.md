@@ -109,7 +109,7 @@ onyums **ships these active**, not as exotic add-ons an operator has to discover
 > **Onyums Skin** — the broader "Cloudflare for Tor" abuse-defense layer (challenge/PoW gate,
 > stateless clearance tokens, token/circuit-keyed rate limiting, no-JS fallbacks, and a pure-Rust
 > WAF) is the major expansion of this phase. It lands as a standalone `onyums-skin` crate. Full
-> design, component decisions, and API sketch: [docs/skin.md](docs/skin.md).
+> design, component decisions, and API sketch: [crates/onyums-skin/ROADMAP.md](crates/onyums-skin/ROADMAP.md).
 
 ---
 

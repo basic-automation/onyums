@@ -2,7 +2,7 @@
 //!
 //! A clearance is minted after a client clears a gate and is the key the rate
 //! limiter counts on (never an IP). It carries no server-side state; the token is
-//! self-verifying via HMAC-SHA256 / JWT. See `docs/skin.md` §4.1.
+//! self-verifying via HMAC-SHA256 / JWT. See `ROADMAP.md`.
 
 use std::time::{Duration, SystemTime};
 

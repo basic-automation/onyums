@@ -7,7 +7,7 @@
 //! `StreamRequest`.
 //!
 //! **Status: scaffolding.** The architecture, component decisions, and full API are
-//! pinned in `docs/skin.md` of the onyums repository. The types exported here are
+//! pinned in this crate's `ROADMAP.md`. The types exported here are
 //! the v0.1 skeleton; method bodies are intentionally unimplemented until v0.1 lands.
 
 #![allow(dead_code)]

@@ -3,7 +3,7 @@
 //! A normal axum app cannot express this; onyums calls [`CircuitPolicy`] from its
 //! `RendRequest` / `StreamRequest` loop, supplying a host-assigned [`CircuitId`] and
 //! the requested [`StreamTarget`]. This generalizes the one-off port-443/80 gate that
-//! currently lives in onyums' `handle_stream_request`. See `docs/skin.md` §4.5.
+//! currently lives in onyums' `handle_stream_request`. See `ROADMAP.md`.
 
 /// What to do with a circuit / stream / request at the Tor layer.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -3,7 +3,7 @@
 //! A [`Challenge`] decides what to do with an un-cleared request: pass it, present
 //! an interstitial, or reject it. Built-in implementations are PoW (needs JS),
 //! server-rendered CAPTCHA (no JS), and a patience tarpit (no JS). See
-//! `docs/skin.md` §4.2.
+//! the crate `ROADMAP.md`.
 
 use axum::http::request::Parts;
 use axum::response::Response;

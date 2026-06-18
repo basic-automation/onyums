@@ -106,6 +106,11 @@ onyums **ships these active**, not as exotic add-ons an operator has to discover
   policy hook to reject circuits. We already `shutdown_circuit()` in `handle_stream_request` for
   non-80/443 ports — generalize that one-off into a first-class policy callback.
 
+> **Onyums Shield** — the broader "Cloudflare for Tor" abuse-defense layer (challenge/PoW gate,
+> stateless clearance tokens, token/circuit-keyed rate limiting, no-JS fallbacks, and a pure-Rust
+> WAF) is the major expansion of this phase. It lands as a standalone `onion-shield` crate. Full
+> design, component decisions, and API sketch: [docs/shield.md](docs/shield.md).
+
 ---
 
 ## Phase 3 — TLS-first transport & protocol versatility — target `0.7`

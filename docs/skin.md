@@ -1,4 +1,4 @@
-# Onyums Shield — design doc
+# Onyums Skin — design doc
 
 Status: **draft / design**. This document pins the architecture and API surface for onyums's
 "Cloudflare for Tor" abuse-defense layer **before** any code is written. It is the output of a
@@ -25,7 +25,7 @@ handle, plus an **app-issued clearance token** that acts as a synthetic, rotatab
 identity. Everything that is pure request-logic (WAF, header/redirect rules, caching) ports
 directly.
 
-**Honest non-goals.** Shield does *not* reproduce the half of Cloudflare that is a global anycast
+**Honest non-goals.** Skin does *not* reproduce the half of Cloudflare that is a global anycast
 network: no volumetric L3/4 absorption, no IP/ASN/geo logic, no TLS fingerprinting, no global bot
 ML, no CDN edge distribution. Those are structurally impossible in a single local server, and over
 Tor the IP-based ones are moot anyway. Tor's rendezvous architecture already provides the
@@ -35,7 +35,7 @@ origin-IP-masking / no-inbound-ports posture that Cloudflare Tunnel/Spectrum sel
 
 ## 2. Shape: a standalone crate
 
-Shield is a **separate crate, `onion-shield`**, not code buried in onyums — same split philosophy
+Skin is a **separate crate, `onyums-skin`**, not code buried in onyums — same split philosophy
 as `onyums` and `artiqwest`. It is **framework-agnostic**:
 
 - A **`tower` / `axum` middleware layer** usable by *any* axum app (Tor or not) — this is where the
@@ -43,11 +43,11 @@ as `onyums` and `artiqwest`. It is **framework-agnostic**:
 - A **Tor-aware circuit-policy hook** (`CircuitPolicy`) that onyums wires to `RendRequest` /
   `StreamRequest` for the per-circuit dimension that a normal HTTP app can't express.
 
-onyums depends on `onion-shield` and connects the two halves. A non-Tor user still gets the
+onyums depends on `onyums-skin` and connects the two halves. A non-Tor user still gets the
 WAF/challenge/rate-limit value through the middleware alone.
 
 ```
-onion-shield (new crate, MIT)
+onyums-skin (new crate, MIT)
 ├── tower/axum Layer  ──────────────►  any axum app
 └── CircuitPolicy hook  ────────────►  onyums wires to RendRequest/StreamRequest
 ```
@@ -148,7 +148,7 @@ PoW effort control loop, but at the app layer where onyums *can* observe request
 
 ```rust
 // Reuse `governor`; key is the clearance TokenId (preferred) or CircuitId (fallback).
-pub struct ShieldRateLimit {
+pub struct SkinRateLimit {
     by_token: DefaultKeyedRateLimiter<TokenId>,
     by_circuit: DefaultKeyedRateLimiter<CircuitId>,
 }
@@ -193,51 +193,51 @@ incoming circuit ─► CircuitPolicy.on_new_circuit
                       ▼ Accept/Challenge
    stream ─► CircuitPolicy.on_new_stream (target port/host)
                       ▼
-   HTTP request ─► [Shield tower Layer]
+   HTTP request ─► [Skin tower Layer]
         1. WAF inspect (v2)             ─► block ─► 403
         2. clearance cookie/path valid? ─► no ─► Challenge.issue ─► interstitial / Reject
         3. rate limit (key=TokenId)     ─► exceeded ─► challenge / 429
         4. pass ─► inner axum Router
 ```
 
-Challenge submission (PoW nonce / CAPTCHA answer) hits a Shield-owned route, which on
+Challenge submission (PoW nonce / CAPTCHA answer) hits a Skin-owned route, which on
 `Challenge.verify` mints a `Clearance` and redirects back.
 
 ---
 
-## 6. Module layout (`onion-shield`)
+## 6. Module layout (`onyums-skin`)
 
 ```
-onion-shield/
+onyums-skin/
 ├── src/
-│   ├── lib.rs            // ShieldLayer (tower), builder, re-exports
+│   ├── lib.rs            // SkinLayer (tower), builder, re-exports
 │   ├── clearance.rs      // Clearance, ClearanceStore (hmac/jwt)
 │   ├── challenge/
 │   │   ├── mod.rs        // Challenge trait, Gate, chain/fallback
 │   │   ├── pow.rs        // Pow trait + Hashcash; interstitial page
 │   │   ├── captcha.rs    // CaptchaChallenge (reuse `captcha`/`easy-captcha`)
 │   │   └── patience.rs   // PatienceChallenge (no-JS tarpit)
-│   ├── ratelimit.rs      // ShieldRateLimit over `governor`
+│   ├── ratelimit.rs      // SkinRateLimit over `governor`
 │   ├── circuit.rs        // CircuitPolicy trait, CircuitAction, accounting
 │   └── waf/              // v2: wirefilter + regex + aho-corasick
 └── Cargo.toml
 ```
 
 onyums adds a thin adapter wiring `CircuitPolicy` to `RendRequest`/`StreamRequest` and inserting
-`ShieldLayer` into its Router.
+`SkinLayer` into its Router.
 
 ---
 
 ## 7. The no-JS strategy (explicit)
 
-Because Tor "Safer"/"Safest" kill JS *and* WASM, Shield must degrade rather than fail:
+Because Tor "Safer"/"Safest" kill JS *and* WASM, Skin must degrade rather than fail:
 
 1. **Default**: PoW challenge for JS clients (cheap, no tracking).
 2. **No-JS detected / configured**: fall back to a **server-rendered CAPTCHA** (answer via plain
    form) or a **patience tarpit** (timed delay, zero client compute).
 3. **Strongest gate, when applicable**: Tor **restricted discovery** (allowlist of client keys,
    stable in Arti 1.7) — cryptographic access control *upstream* of any challenge. Managed in
-   onyums config, not Shield.
+   onyums config, not Skin.
 
 Supporting no-JS abuse defense is a genuine differentiator: Cloudflare never solved it (every
 Cloudflare challenge requires JS).
@@ -246,7 +246,7 @@ Cloudflare challenge requires JS).
 
 ## 8. Licensing
 
-Target: **MIT** for `onion-shield`, all default deps permissive (`governor`, `jsonwebtoken`,
+Target: **MIT** for `onyums-skin`, all default deps permissive (`governor`, `jsonwebtoken`,
 `hmac`/`sha2`, `captcha` pending audit, `regex`/`aho-corasick`, `wirefilter` Apache-2.0). No
 copyleft and no FFI in the default build. Optional PoW backends (`equix` Rust crate is LGPL-3.0; a
 RandomX backend is BSD-3 algo) live behind cargo features so the default stays clean.
@@ -256,12 +256,12 @@ RandomX backend is BSD-3 algo) live behind cargo features so the default stays c
 ## 9. Phasing
 
 - **v0.1 — gate core.** `ClearanceStore`, `Challenge` trait, `Hashcash` PoW + interstitial,
-  `CaptchaChallenge`, `PatienceChallenge`, `ShieldRateLimit`, `ShieldLayer` (tower). Pure HTTP;
+  `CaptchaChallenge`, `PatienceChallenge`, `SkinRateLimit`, `SkinLayer` (tower). Pure HTTP;
   usable by any axum app.
 - **v0.2 — Tor dimension.** `CircuitPolicy` + accounting; onyums adapter wiring
   `RendRequest`/`StreamRequest`; "Under Attack Mode" toggle; adaptive PoW difficulty.
 - **v0.3 — WAF.** `wirefilter`-based engine + curated starter ruleset.
-- **Tracks onyums roadmap.** Shield is the concrete form of Onyums Shield pillars 1–5; restricted
+- **Tracks onyums roadmap.** Skin is the concrete form of Onyums Skin pillars 1–5; restricted
   discovery and service-side PoW (pillar 6) stay in onyums/arti config.
 
 ---

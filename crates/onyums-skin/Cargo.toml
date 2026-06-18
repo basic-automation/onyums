@@ -1,0 +1,13 @@
+[package]
+name = "onyums-skin"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/basic-automation/onyums"
+description = "A 'Cloudflare for Tor' abuse-defense layer for onion services: challenge/PoW gate, stateless clearance tokens, token/circuit-keyed rate limiting, no-JS fallbacks."
+keywords = ["tor", "ddos", "captcha", "proof-of-work", "waf"]
+categories = ["web-programming", "network-programming"]
+
+[dependencies]
+axum = { workspace = true }
+tracing = { workspace = true }

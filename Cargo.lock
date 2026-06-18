@@ -2788,6 +2788,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "onyums-skin"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "tracing",
+]
+
+[[package]]
 name = "openssl"
 version = "0.10.80"
 source = "registry+https://github.com/rust-lang/crates.io-index"

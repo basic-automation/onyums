@@ -1,3 +1,4 @@
 /target
 /self_signed_certs
 *.pem
+/scratch

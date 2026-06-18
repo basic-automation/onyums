@@ -111,6 +111,23 @@ onyums **ships these active**, not as exotic add-ons an operator has to discover
 > WAF) is the major expansion of this phase. It lands as a standalone `onyums-skin` crate. Full
 > design, component decisions, and API sketch: [crates/onyums-skin/ROADMAP.md](crates/onyums-skin/ROADMAP.md).
 
+**Skin integration (the onyums side).** What onyums itself must do to consume `onyums-skin` — these
+land as Skin's phases ship, and are the onyums-roadmap counterpart to that crate's roadmap:
+
+- **Insert `SkinLayer` into the served `Router`** so the challenge/PoW gate, clearance-token check,
+  token-keyed rate limiting, and (later) the WAF run ahead of the application on the HTTP path.
+- **Implement `onyums_skin::CircuitPolicy` and drive it from the rendezvous loop** —
+  `handle_stream_request` maps `CircuitAction::{Accept, Challenge, Reject, Shutdown}` onto accept /
+  the challenge gate / reject / `shutdown_circuit()`, giving Skin the per-circuit dimension a plain
+  HTTP app can't express. This is the concrete form of the "circuit policy & rate caps" bullet above.
+- **Expose it through the builder** — `.skin(SkinConfig)` (secure default **on**; `.no_skin()` to
+  opt down), plus an **Under Attack Mode** toggle that forces every new circuit through the gate.
+- **Feed Skin's adaptive-difficulty signal** from onyums-observed circuit/request rate, since the
+  intro-layer PoW effort is not surfaced by Arti.
+- **Compose with the Tor-native layers in this phase** — restricted discovery (a descriptor-crypto
+  allowlist) and service-side PoW sit *beneath* Skin's app-layer gate; surface Skin's security
+  events (challenge/WAF/rate-limit/teardown) into the Phase 4 observability stream.
+
 ---
 
 ## Phase 3 — TLS-first transport & protocol versatility — target `0.7`

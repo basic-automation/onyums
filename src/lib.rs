@@ -1,6 +1,5 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions, clippy::module_name_repetitions)]
-#![feature(addr_parse_ascii)]
 
 //! # Onyums
 //! Onyums is a simple axum wrapper for serving tor onion services.
@@ -51,7 +50,7 @@ pub fn get_onion_name() -> String {
 }
 
 /// Sets up and bootstraps a Tor client.
-async fn setup_tor_client() -> Result<TorClient<TokioNativeTlsRuntime>> {
+async fn setup_tor_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	event!(Level::INFO, "Creating Tor client...");
 	let config = TorClientConfig::default();
 	let runtime = TokioNativeTlsRuntime::current().map_err(|_| anyhow::anyhow!("Failed to get current tokio runtime."))?;

@@ -28,6 +28,8 @@ tracing-subscriber = "0.3.23"
 # onyums-skin gate-core deps — pure Rust, no FFI (MIT/Apache).
 sha2 = "0.10.9"
 rand = "0.9.2"
+hmac = "0.12.1"
+base64 = "0.22.1"
 
 [package]
 name = "onyums"

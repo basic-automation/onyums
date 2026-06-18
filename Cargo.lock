@@ -2792,6 +2792,8 @@ name = "onyums-skin"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64",
+ "hmac",
  "rand 0.9.4",
  "sha2",
  "tracing",

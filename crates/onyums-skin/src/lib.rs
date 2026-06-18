@@ -17,7 +17,8 @@ pub mod circuit;
 pub mod clearance;
 pub mod ratelimit;
 
-pub use challenge::pow::{Hashcash, Pow, Puzzle};
-pub use challenge::{Challenge, Gate};
+pub use challenge::{
+	Challenge, Gate, pow::{Hashcash, Pow, Puzzle}
+};
 pub use circuit::{CircuitAction, CircuitId, CircuitPolicy, StreamTarget};
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, TokenId};

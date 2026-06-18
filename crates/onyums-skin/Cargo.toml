@@ -11,3 +11,5 @@ categories = ["web-programming", "network-programming"]
 [dependencies]
 axum = { workspace = true }
 tracing = { workspace = true }
+sha2 = { workspace = true }
+rand = { workspace = true }

@@ -175,6 +175,84 @@ arbitrary protocols.
 
 ---
 
+## Phase 5 — The framework layer: batteries-included MVC over axum — target `0.9+`
+
+axum/hyper/tower give onyums a fast, correct HTTP core but a *microframework* surface — routing and
+extractors, nothing above. Rails, Laravel, and Phoenix win on everything above that line:
+scaffolding, an ORM with migrations, server-rendered views, forms + validation, auth, sessions,
+background jobs. This phase brings a curated set of those batteries to onyums as high-level
+abstractions over the existing stack — and two facts make the server-rendered-MVC tradition fit an
+onion service *better* than it fits the clearnet:
+
+1. **No-JS-first is the native idiom here.** Tor "Safer"/"Safest" disable JS and WASM, so the
+   Rails/Phoenix server-rendered-HTML-with-progressive-enhancement model isn't a throwback — it is
+   the *correct* default for an onion site. It also dovetails with onyums-skin's no-JS gate.
+2. **Self-contained / no-daemon is the native deployment.** Onion services run on a single box and
+   avoid external services (Redis, S3, SMTP) for anonymity and operational simplicity. Rails 8's
+   "Solid" direction — DB-backed queue/cache/cable, SQLite in production, no Redis — maps onto that
+   exactly. **The organizing rule for this phase: every battery must run with no external daemon.**
+
+Consistent with onyums' frontier posture, these ship wired-up and convention-first, not as a bag of
+optional parts. Where a mature pure-Rust crate exists we **reuse**; the value onyums adds is the
+*conventions and glue* that make them feel like one framework.
+
+### A. Server-rendered MVC core (no-JS-first)
+- **Views / templating** — `askama` / `rinja` (compile-time, type-checked, Jinja-like) as the
+  default, `maud` for macro HTML, with first-class `IntoResponse` integration. *Reuse.*
+- **Typed forms + validation** — `axum::Form` extraction + `garde` / `validator`, with
+  server-rendered error re-rendering (Laravel Form Requests / Phoenix changesets). The no-JS form is
+  the primary UI, not a fallback. *Reuse + glue.*
+- **Flash messages + CSRF** — signed/encrypted-cookie flash and per-form CSRF tokens, on by default
+  for state-changing requests (Rails/Laravel parity). `axum-extra` cookies + a CSRF layer.
+  *Reuse + small build.*
+
+### B. Self-contained data & jobs (no daemon)
+- **ORM + migrations** — `sqlx` (compile-time-checked queries + migrations) or `sea-orm` (richer
+  entity API), defaulting to **SQLite in production** (Rails-8 style), with migrations + seeds. The
+  one pragmatic FFI is the SQLite C engine (`rusqlite`/`libsqlite3-sys`); the fully pure-Rust path
+  (Turso's `limbo`) is the track to watch for a no-FFI onyums. *Reuse.*
+- **Background jobs / queue** — `apalis` on its **SQLite backend** (no Redis): the Solid-Queue
+  analog — enqueue, retry, schedule, all in the app DB. *Reuse.*
+- **Cache** — `moka` in-process (Solid-Cache analog for a single box); a DB-backed tier optional.
+  *Reuse.*
+- **Sessions** — `tower-sessions` with a SQLite store and signed/encrypted cookies, composing with
+  onyums-skin clearance tokens into one identity story. *Reuse.*
+
+### C. Auth & secrets
+- **Built-in auth scaffold** — password auth (`argon2` via `password-auth`) + session login
+  (`axum-login`), generated and wired à la Rails 8 `generate authentication` / `mix phx.gen.auth`.
+  **Tor-aware:** it layers on onyums-skin's gate and Tor restricted discovery rather than
+  reinventing access control. *Reuse + scaffold.*
+- **Encrypted credentials / typed config** — a Rails-credentials-style encrypted store for what an
+  onion box must hold (HS identity keys, the clearance-signing secret, app secrets), plus typed
+  config with dev/prod profiles (`figment`). *Build (thin).*
+
+### D. Scaffolding & conventions (the Rails `new` / `generate` story)
+- **`onyums new` / `onyums generate`** — a companion CLI (`cargo-generate` template + a binary) that
+  scaffolds a convention-over-configuration onion-service app: directory layout, a wired Router,
+  migrations and views dirs, the secure defaults already on. The single biggest DX lever these
+  frameworks pull. *Build (on `cargo-generate` + `clap`).*
+- **Dev error pages + health check** — friendly dev exception pages and a `/up` liveness endpoint
+  (Rails 8). *Build (small).*
+- **Test harness without live Tor** — request-level tests via `tower::ServiceExt::oneshot` plus
+  factory/fixture conventions; this is also the "testable without Tor" need noted in Cross-cutting.
+  *Reuse + conventions.*
+
+### Explicit non-goals (the un-Rails parts)
+- **No mailer.** Email over Tor leaks anonymity and needs a daemon — a non-goal, not a default.
+- **No heavy asset pipeline.** Ship fingerprinted static-asset serving, not a Propshaft/Vite bundler;
+  onion sites are lean and no-JS-leaning.
+- **No LiveView/Hotwire reactive layer.** Server-driven reactive UIs require client JS, contradicting
+  the no-JS-first thesis. Keep WS-over-Tor + SSE + simple pub/sub; don't build a JS-dependent
+  reactive framework.
+- **No ActiveRecord "magic."** Rust favors explicitness — migrations + a typed query convention
+  (`sqlx`/`sea-orm`), not a metaprogrammed model layer.
+
+This layer likely grows into companion crates (an `onyums-web` / `onyums-cli` family) rather than
+bloating the core server crate, mirroring the `onyums` / `onyums-skin` split.
+
+---
+
 ## Cross-cutting: developer experience
 
 - **Re-export the arti stack we depend on** (as we do `axum`) so downstreams can't get
@@ -221,4 +299,6 @@ You descend a tier only to *change* a default, never to *enable* a basic capabil
 Sequencing rationale: Phase 0 is pure enablement; Phases 1–2 deliver the highest-leverage,
 default-on, *Tor-specific* differentiators (stable identity + live abuse resistance — things no
 clearnet framework offers); Phase 3 enforces TLS while broadening protocol reach; Phase 4 rounds
-out observability and scale.
+out observability and scale; Phase 5 is the longer-horizon batteries-included framework layer that
+turns the secure transport into a full app platform — server-rendered, no-JS-first, and
+self-contained, the way an onion service actually wants to be built.

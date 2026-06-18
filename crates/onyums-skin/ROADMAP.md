@@ -29,9 +29,12 @@ decisions, the API surface, and the phased plan to build them out.
 5. **Cost, not prevention.** Synthetic identities (tokens, circuits) are inherently rotatable. The
    goal is never to stop rotation — it is to make each fresh identity cost a fresh proof-of-work
    solve. Tune the cost; don't chase an un-winnable absolute.
-6. **Permissive by default.** MIT, with **no FFI and no copyleft in the default build**. Heavier or
-   experimental backends (Equi-X, RandomX, ModSecurity/Coraza) live behind cargo features so the
-   default stays clean and pure-Rust.
+6. **100% Rust — no FFI, ever.** The entire crate is pure Rust: no C, C++, or Go bindings, no
+   `cgo`, no linked system libraries — not in the default build and **not behind a feature flag
+   either**. This rules out FFI-only options like a Coraza/ModSecurity WAF binding or a RandomX
+   miner: if a capability can't be had in pure Rust, it doesn't ship. Licensing is **MIT** with
+   **no copyleft in the default build**; the one feature-gated dependency is the pure-Rust `equix`
+   PoW crate, gated for its LGPL license, not for any foreign code.
 7. **Honest non-goals.** Skin reproduces the *per-server-logic* half of Cloudflare. It does **not**
    reproduce the global-anycast half: no volumetric L3/4 absorption, no IP/ASN/geo logic, no TLS
    fingerprinting, no global bot ML, no CDN edge distribution. Over Tor the IP-based ones are moot
@@ -80,7 +83,7 @@ express.
 
 | Component | Decision | Crate / basis | License |
 |---|---|---|---|
-| PoW | **Build**, pluggable `Pow` trait, **SHA-256 hashcash default** | hand-rolled (~50 LOC); Equi-X/RandomX as optional backends | MIT |
+| PoW | **Build**, pluggable `Pow` trait, **SHA-256 hashcash default** | hand-rolled (~50 LOC); pure-Rust Equi-X as an optional (LGPL) backend | MIT |
 | Rate limiter | **Reuse** | `governor` + `tower_governor` (key is generic → key on token) | MIT/Apache |
 | Clearance token | **Reuse** | `jsonwebtoken`, or `hmac`+`sha2` for a minimal internal token | MIT |
 | No-JS CAPTCHA | **Reuse** | `captcha` / `easy-captcha` (GIF) — server-rendered, no JS | audit `captcha` |
@@ -92,8 +95,9 @@ lightweight throwaway PoW with near-free server verification — the correct asy
 gate. SHA-256 hashcash is MIT, pure Rust, no FFI, no copyleft. RandomX-WASM mine-to-enter was
 evaluated and rejected: WASM is disabled at Tor "Safer"/"Safest", RandomX can't JIT or do directed
 rounding in WASM, browser yield is micro-cents, and browser mining is uniformly flagged as malware.
-Equi-X (BSD-3 at the source; LGPL only in Arti's Rust crate) and a RandomX backend remain
-implementable behind the `Pow` trait for anyone who wants them — opt-in, never default.
+Equi-X — Tor's own puzzle, available as the pure-Rust (LGPL) `equix` crate — is implementable behind
+the `Pow` trait as an opt-in, license-gated feature. A RandomX backend would require C++ FFI and is
+therefore ruled out by the 100%-Rust commitment.
 
 ### Core API sketch
 
@@ -118,7 +122,7 @@ pub trait Pow: Send + Sync {
     fn new_puzzle(&self, difficulty: u32) -> Puzzle;
     fn verify(&self, puzzle: &Puzzle, solution: &[u8]) -> bool;
 }
-pub struct Hashcash;   // default; EquiX / RandomXPool behind cargo features
+pub struct Hashcash;   // default; pure-Rust EquiX behind an opt-in (LGPL) feature
 
 // CircuitPolicy — the Tor dimension; onyums drives this.
 pub enum CircuitAction { Accept, Challenge, Reject, Shutdown }
@@ -217,8 +221,9 @@ Request inspection — 100% IP-free, the cleanest Cloudflare carry-over.
   multi-signature matching, evaluated as a `tower` layer over request URI/method/headers/body.
 - A curated starter ruleset (SQLi / XSS / path traversal / protocol anomalies); not OWASP-CRS-
   complete at first, but extensible with custom rules.
-- No Go/cgo/FFI — consistent with the crate's clean stable-Rust posture. (Coraza-FFI remains a
-  possible *optional* feature later for operators who want full OWASP CRS.)
+- No Go/cgo/FFI — the 100%-Rust commitment rules out a Coraza/ModSecurity binding outright, so
+  OWASP-CRS coverage is reached by porting rules into the pure-Rust engine, never by linking a
+  foreign one.
 
 **Done when:** signature attacks are blocked with no IP dependency, rules are operator-extensible,
 and the engine runs ahead of the gate in the layer order.
@@ -251,8 +256,9 @@ The research-grade, Tor-specific bets — none have prior art in this environmen
 - **Restricted-discovery orchestration** — helpers that bridge onyums' Arti client-authorization
   (restricted discovery, stable in Arti 1.7) into Skin's policy as the strongest, upstream gate: an
   allowlist enforced in descriptor crypto before any traffic arrives.
-- **Pluggable PoW backends** — `EquiX` (Tor's own puzzle, BSD algo) and a documented, opt-in
-  `RandomXPool` "useful-work" backend, behind cargo features.
+- **Pluggable PoW backend** — `EquiX`, Tor's own puzzle via the pure-Rust `equix` crate, behind an
+  opt-in (LGPL) cargo feature. RandomX "useful-work" mining stays excluded: it would require C++
+  FFI, and was independently rejected on Tor-WASM and reputation grounds.
 - **Multi-instance coordination** — share a clearance-signing secret across Onionbalance backends so
   a token minted at one backend is honored at another.
 - **Edge-rules & caching** — local response cache and transform/redirect middleware (low effort;
@@ -280,9 +286,10 @@ Carrier for the clearance under no-JS — cookie vs. signed URL path segment —
 
 Target **MIT** for the crate, with all default dependencies permissive: `governor`, `jsonwebtoken`,
 `hmac`/`sha2`, `captcha` (pending license audit; `easy-captcha` is a fallback), `regex`/
-`aho-corasick`, `wirefilter` (Apache-2.0). **No copyleft and no FFI in the default build.** Optional
-PoW backends (`equix` Rust crate is LGPL-3.0; a RandomX backend is BSD-3 algorithm) and an optional
-Coraza-FFI WAF live behind cargo features so the default stays clean.
+`aho-corasick`, `wirefilter` (Apache-2.0). The crate is **100% pure Rust — no FFI in any build,
+default or feature-gated** (this excludes a Coraza/ModSecurity WAF binding and any RandomX backend).
+**No copyleft in the default build.** The single feature-gated dependency is the pure-Rust `equix`
+PoW crate, gated solely because it is LGPL-3.0, keeping the default build copyleft-free.
 
 ---
 
@@ -309,8 +316,9 @@ Coraza-FFI WAF live behind cargo features so the default stays clean.
 - **Adaptive-difficulty signal** — app-observable request rate is the only input (intro-layer PoW
   effort is not surfaced by Arti); what window and curve?
 - **CAPTCHA license** — audit the `captcha` crate's non-standard license before depending on it.
-- **WAF scope** — a hand-rolled ruleset will not reach OWASP-CRS parity quickly; set expectations,
-  and keep Coraza-FFI as an optional escape hatch.
+- **WAF scope** — a hand-rolled pure-Rust ruleset will not reach OWASP-CRS parity quickly; set
+  expectations. The 100%-Rust rule means there is no Coraza-FFI escape hatch, so CRS coverage is a
+  rule-porting effort.
 
 ---
 

@@ -19,7 +19,7 @@
 use std::{net::SocketAddr, sync::LazyLock};
 
 use anyhow::{bail, Result};
-use arti_client::{TorClient, TorClientConfig};
+use arti_client::{config::TorClientConfigBuilder, TorClient};
 use axum::extract::connect_info::Connected as AxumConnected;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -50,9 +50,17 @@ pub fn get_onion_name() -> String {
 }
 
 /// Sets up and bootstraps a Tor client.
+///
+/// Uses onyums-specific state and cache directories (`./tor/onyums/state`,
+/// `./tor/onyums/cache`) rather than arti's shared `TorClientConfig::default()`
+/// location. This keeps the cache from growing without bound across runs while
+/// staying isolated from any sibling arti instance on the machine (e.g. an
+/// artiqwest client using `./tor/arti`), avoiding a state-directory collision.
 async fn setup_tor_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	event!(Level::INFO, "Creating Tor client...");
-	let config = TorClientConfig::default();
+	let config = TorClientConfigBuilder::from_directories("./tor/onyums/state", "./tor/onyums/cache")
+		.build()
+		.map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))?;
 	let runtime = TokioNativeTlsRuntime::current().map_err(|_| anyhow::anyhow!("Failed to get current tokio runtime."))?;
 	let client = TorClient::with_runtime(runtime);
 	client.config(config).create_bootstrapped().await.map_err(|_| anyhow::anyhow!("Failed to create bootstrapped Tor client."))

@@ -283,18 +283,15 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   *Reuse + small build.*
 
 ### B. Self-contained data & jobs (no daemon)
-- **Database — Turso by default.** The default datastore is **Turso** (SQLite-compatible): the
-  embedded **libSQL** today — single-file, no daemon, with optional embedded replicas / sync for
-  backup without standing up a database server — converging on the **pure-Rust Turso Database**
-  (formerly Limbo) as it matures, which also lands the no-FFI goal. This keeps the self-contained /
-  single-box thesis and matches the wider toolchain (sibling projects already run on Turso/libSQL). A
-  query + migration layer (`sqlx` compile-time-checked queries, or `sea-orm` for a richer entity
-  API) plus seeds sits on top. *Reuse (libSQL today) → track the pure-Rust engine.*
-- **Background jobs / queue** — `apalis` on its **SQLite backend** (no Redis): the Solid-Queue
+- **Database — Turso by default.** The default datastore is **Turso** (SQLite-compatible). This keeps 
+  the self-contained / single-box thesis and matches the wider toolchain (sibling projects already 
+  run on Turso). A query + migration layer (`sqlx` compile-time-checked queries, or `sea-orm` 
+  for a richer entity API) plus seeds sits on top.*
+- **Background jobs / queue** — `apalis` on its **Turso backend** (no Redis): the Solid-Queue
   analog — enqueue, retry, schedule, all in the app DB. *Reuse.*
 - **Cache** — `moka` in-process (Solid-Cache analog for a single box); a DB-backed tier optional.
   *Reuse.*
-- **Sessions** — `tower-sessions` with a SQLite store and signed/encrypted cookies, composing with
+- **Sessions** — `tower-sessions` with a Turso store and signed/encrypted cookies, composing with
   onyums-skin clearance tokens into one identity story. *Reuse.*
 - **Outbound mailer (Tor-native, opt-in)** — transactional email (password resets, notifications) à
   la ActionMailer, but **relayed through onyums' own embedded arti `TorClient`** to an external SMTP

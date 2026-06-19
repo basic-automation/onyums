@@ -7,6 +7,131 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-19 — finish onyums-skin Phase 2 accounting/difficulty; start Phase 3 WAF (6 increments)
+
+Branch `routine/onyums-2026-06-19` → PR (base `master`). Run 3's PR #6 had merged
+to `master` (head `2d1f041`), so this run branched fresh off updated `master`. With
+onyums Phase 0 done and skin Phase 1 complete, and the onyums-side Phase 2
+`CircuitPolicy` wiring still **blocked** on a live-Tor prerequisite (a real
+per-circuit id; see run 3's stop reason), this run took the tractable no-Tor queue:
+it **finished onyums-skin ROADMAP Phase 2's app-layer half** (per-circuit rate cap,
+byte budget, adaptive difficulty, and wiring difficulty into the PoW gate) and
+**opened Phase 3 (WAF)** (pure-Rust detection engine + running it ahead of the gate).
+Workspace stayed green and clippy-clean after every increment. Pure-Rust, no-FFI
+posture held; the one new dep (`regex`) is MIT/Apache.
+
+**Increment 1 — time-windowed per-circuit request-rate cap.** *onyums-skin Phase 2,
+"per-circuit accounting (… request rate …)".* Files: `crates/onyums-skin/src/circuit.rs`,
+`src/lib.rs`. Added a fixed-window request-rate circuit-breaker to
+`AccountingCircuitPolicy` (`max_request_rate(max, per)` → `Reject` past the window
+quota, then resets), distinct from the cumulative `max_requests` lifetime ceiling.
+Time comes from a new injectable `Clock` trait (`SystemClock` default; `ManualClock`
+advances a monotonic offset), so the window is testable without sleeping; the clock
+is read before the lock so a user clock is never called under the mutex. Internal
+`CircuitState` now holds the public `CircuitStats` plus window counters (the public
+type is unchanged). **5 new unit tests.**
+
+**Increment 2 — per-circuit byte accounting + data budget.** *onyums-skin Phase 2,
+"per-circuit accounting (… bytes)".* Files: `src/circuit.rs`. `CircuitStats` gains a
+cumulative `bytes` field; `CircuitPolicy` gains an `on_bytes(id, bytes)` hook with a
+default no-op `Accept` (so other impls are unaffected). `AccountingCircuitPolicy`
+records bytes (saturating) and, with `max_bytes(n)`, returns `Shutdown` once a
+circuit's transfer exceeds the budget — a bandwidth-exhaustion breaker beside the
+stream/request caps. **5 new unit tests.**
+
+**Increment 3 — `AdaptiveDifficulty` controller.** *onyums-skin Phase 2, "Adaptive
+PoW difficulty … driven by app-observable request rate".* Files:
+`crates/onyums-skin/src/difficulty.rs` (new), `src/lib.rs`. Arti does not surface the
+intro-layer PoW effort, so the only attack signal is Skin's own request rate.
+`AdaptiveDifficulty` maps a fixed-window observed rate to a PoW difficulty
+(leading-zero-bits): dormant at a low `baseline`, linearly ramped toward `max` across
+a `[low_rate, high_rate]` band — Tor's PoW effort loop one layer up. Rate counted via
+the injectable `Clock` (deterministic with `ManualClock`); `u128` interpolation; clamps
+guard degenerate bands (`max < baseline`, `high <= low`). **6 new unit tests.**
+
+**Increment 4 — drive `PowChallenge` difficulty from the controller.** *onyums-skin
+Phase 2, adaptive-difficulty wiring.* Files: `crates/onyums-skin/src/challenge/pow.rs`.
+`PowChallenge::with_adaptive_difficulty(Arc<AdaptiveDifficulty>)`: issued puzzles use
+`max(static floor, controller.current())`, so the configured difficulty is a floor the
+controller raises under load but never lowers. Safe — `verify` already re-derives
+difficulty from the *signed* envelope, never a client claim, so per-puzzle difficulty
+variation adds no forgery surface. **2 new unit tests.**
+
+**Increment 5 — WAF detection engine + starter ruleset (Phase 3 start).** *onyums-skin
+ROADMAP Phase 3 (WAF), engine + curated ruleset.* Files: `crates/onyums-skin/src/waf/mod.rs`
+(new), `src/lib.rs`, `Cargo.toml`, `crates/onyums-skin/Cargo.toml`, `Cargo.lock`. Pure-Rust,
+IP-free engine: `Waf` compiles `Rule`s into one `regex::RegexSet` (single-pass match,
+`aho-corasick` literal prefiltering inside `regex` — honoring the roadmap's
+regex+aho-corasick choice with no FFI). `inspect(&Parts)` scans method, target, and
+header values; lowest matching rule index wins (deterministic); `WafMatch` reports rule
+id, category, location. `starter_rules()` covers SQLi/XSS/path-traversal/protocol-anomaly
+(conservative, not OWASP-CRS-complete — CRS coverage is a pure-Rust rule-porting effort,
+never a Coraza/ModSecurity FFI). Rules are operator-extensible (`Waf::new` over any rule
+iterator, validating patterns up front). Added pure-Rust `regex` (MIT/Apache) to
+`[workspace.dependencies]`. **11 new unit tests.**
+
+**Increment 6 — run the WAF ahead of the gate in `SkinLayer`.** *onyums-skin Phase 3,
+"the engine runs ahead of the gate in the layer order".* Files:
+`crates/onyums-skin/src/layer.rs`, `src/waf/mod.rs`. `Skin`/`SkinBuilder` gain an
+optional `Waf`; `.waf(Waf)` enables it and `decide()` runs it first and
+unconditionally — a signature attack is `403`'d before any clearance/challenge/app
+work, even on a cleared circuit. Off unless configured; `Skin::secure_default()` now
+enables the starter ruleset (secure-by-default). Documented honestly that inspection
+is over the **raw** (un-decoded) request strings, so an encoded payload is not yet
+caught — normalization/decode-before-match is the deliberate next slice. **4 new layer
+tests** (header signature → 403; WAF blocks a *cleared* client's traversal, proving
+order; benign request still reaches the challenge; no-WAF default unchanged).
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after every increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **82 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 50 at run start; +32 across the six increments).
+- `cargo test -p onyums --lib -- --skip test_serve`: **8 passed; 0 failed** (1 filtered)
+  — confirms adding the WAF to `secure_default` did not regress onyums' no-Tor
+  integration tests.
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** (two `collapsible_if`
+  warnings in the WAF/layer wiring fixed directly with let-chains; no `#[allow]` added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open
+- **onyums-skin Phase 2 (Tor dimension & Under Attack Mode): app-layer half DONE.**
+  Per-circuit stream/request/byte caps, time-windowed request rate, Under Attack Mode,
+  `AdaptiveDifficulty`, and PoW-gate difficulty wiring all land. The Phase-2 "Done when"
+  (gate per circuit, escalate difficulty under load, cap concurrency, tear down abusive
+  circuits) is satisfied **on the Skin side**; the onyums-side `CircuitPolicy` wiring
+  into `handle_stream_request` remains the only open Phase-2 piece and is still BLOCKED
+  on the live-Tor per-circuit-id prerequisite (run 3's diagnosis stands).
+- **onyums-skin Phase 3 (WAF): STARTED.** DONE: pure-Rust detection engine, starter
+  ruleset, operator-extensible rules, and WAF-first wiring in `SkinLayer` +
+  `secure_default`. OPEN: input normalization / percent-decoding (encoded-payload
+  coverage; the documented next slice), request-**body** inspection, a `wirefilter`
+  rule-expression language, and a broader ruleset toward OWASP-CRS parity.
+- BLOCKED: onyums Phase 2 `CircuitPolicy` wiring (live-Tor per-circuit id); skin Phase 1
+  `CaptchaChallenge` (the `captcha` crate license audit — an open ROADMAP question).
+- NOT STARTED: onyums Phase 1 (identity: `.ephemeral()`, BYO key, vanity mining),
+  Phase 3 (TLS-first/strict), Phase 4 (observability/multi-service); skin Phase 4
+  (observability), Phase 5 (frontier).
+
+**STOP REASON:** Landed 6 verifiable increments (well above the 2–4 bar), forming one
+coherent arc: onyums-skin Phase 2's entire app-layer half plus the opening of Phase 3
+(WAF engine + gate wiring). The natural next slice — WAF input normalization /
+percent-decoding — opens the double-decoding-evasion design space and is better as its
+own focused increment than a rushed seventh; the other near items are blocked (onyums
+`CircuitPolicy` on live Tor, `CaptchaChallenge` on a license audit) or are large
+not-started phases. Everything is green, clippy-clean, and fully unit-tested where no
+live Tor is required; nothing is half-landed.
+
+**NEXT STEP:** Add WAF input normalization — percent-decode (and lowercase where
+appropriate) the target and header values before matching, with an explicit guard
+against double-decoding evasion, so encoded payloads (`%3Cscript%3E`, `..%2f`) are
+caught; extend with request-body inspection behind a size cap. In parallel-tractable
+no-Tor work: grow `starter_rules()` toward broader OWASP-CRS coverage, and (once onyums
+extracts a real per-circuit id — the still-blocking Phase-4 plumbing) drive
+`AccountingCircuitPolicy` + `AdaptiveDifficulty` from onyums' `handle_stream_request`.
+
+---
+
 ## 2026-06-18 (run 3) — finish onyums Phase 0; begin Phase 2 Skin integration (4 increments)
 
 Branch `routine/onyums-2026-06-18-3` → PR (base `master`). Same-day rerun: runs 1

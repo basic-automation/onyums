@@ -7,6 +7,129 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-18 (run 3) — finish onyums Phase 0; begin Phase 2 Skin integration (4 increments)
+
+Branch `routine/onyums-2026-06-18-3` → PR (base `master`). Same-day rerun: runs 1
+and 2 had merged to `master` (PR #5, head `f71fcf5`), so this run branched fresh
+off that updated `master`. It **completed onyums ROADMAP Phase 0** (the last open
+items — the `ONION_NAME` singleton and the readiness/shutdown handle), then opened
+**onyums Phase 2 (Skin integration)** now that onyums-skin Phase 1 is done: wired
+the `SkinLayer` into the served `Router` and built the concrete `CircuitPolicy`
+the rendezvous loop will drive. Workspace stayed green and clippy-clean throughout.
+
+**Increment 1 — typed `OnionAddress` + thread it through serve.** *onyums Phase 0
+groundwork (toward killing `ONION_NAME`) + Phase 1 "typed OnionAddress" helper.*
+Files: `src/lib.rs`. Introduced an `OnionAddress` newtype (normalized to exactly
+one trailing `.onion` suffix) and threaded it explicitly from the launched service
+to the two consumers that read the global — `tls_acceptor` (cert SAN) and the
+port-80→HTTPS redirect — so the serve path no longer touches the `static`.
+`get_and_store_onion_name` became the side-effect-free, now-sync `get_onion_address`;
+`initialize_onion_service` followed. The global was kept as a write-only compat shim
+for `get_onion_name()` *in this increment only* (removed in increment 2), making
+this a pure non-breaking refactor. **4 new unit tests** (bare/single/repeated-suffix
+normalization, Display/`Into<String>`).
+
+**Increment 2 — per-service handle builder; remove the `ONION_NAME` global.**
+*onyums Phase 0, "Kill the global `ONION_NAME` singleton" + "First-class readiness +
+graceful shutdown".* Files: `src/lib.rs`, `Cargo.toml`, `Cargo.lock`, `README.md`.
+`OnionService::builder().router(app).nickname("x").serve().await?` bootstraps the
+client and launches the service (address known immediately), runs the accept loop
+on a spawned task, and returns an `OnionServiceHandle` exposing `onion_address()`,
+`ready().await` (resolves on arti's status stream reaching *fully reachable* —
+descriptor published, intro points satisfactory — the meaningful readiness, not
+"address known"), and `shutdown().await` (cancels the loop via a `CancellationToken`
+and joins; full teardown on drop). `serve(app, nickname)` is now a thin wrapper
+preserving the "blocks until stop" contract. The handle holds the `TorClient` Arc so
+the service's background machinery lives for the handle's lifetime; `launch_`/
+`initialize_onion_service` gained `+ use<>` so the client can move into the handle
+while the stream lives on (edition-2024 RPIT capture). Removed the global and the
+public `get_onion_name()` (intended breaking change); README hello-world rewritten
+to the builder. Added `tokio-util` (CancellationToken) to the workspace. **2 new
+no-Tor unit tests** (builder rejects missing router / missing nickname, validated
+before any bootstrap).
+
+**Increment 3 — wire onyums-skin `SkinLayer` into the served Router.** *onyums Phase 2
+(Skin integration), "Insert `SkinLayer` into the served `Router`" + "Expose it
+through the builder — `.skin(SkinConfig)` … `.no_skin()`".* Files: `src/lib.rs`,
+`Cargo.toml`, `Cargo.lock`. Now that onyums-skin Phase 1 is complete, onyums depends
+on it (path dep via `[workspace.dependencies]`) and re-exports `onyums_skin` + `Skin`.
+The builder gained `.skin(Skin)` (tune) and `.no_skin()` (the explicit opt-*down*);
+with no choice, `Skin::secure_default()` (PoW + no-JS patience fallback + token rate
+limiting) is applied — secure-by-default, you opt down never up. Modeled as a
+`SkinChoice` enum and an extracted `apply_skin(router, choice)` seam. **2 new no-Tor
+integration tests** drive the layered `Router` via `tower::ServiceExt::oneshot` (the
+roadmap's "test harness without live Tor"): `no_skin` forwards (200 "ok"); the secure
+default intercepts an uncleared request with the PoW interstitial and the app body
+never leaks. Added a `tower` dev-dependency.
+
+**Increment 4 — `AccountingCircuitPolicy` (skin Phase 2 first slice).** *onyums-skin
+ROADMAP Phase 2, "CircuitPolicy + per-circuit accounting … CircuitAction including
+Shutdown" + "Under Attack Mode".* Files: `crates/onyums-skin/src/circuit.rs`,
+`crates/onyums-skin/src/lib.rs`. The trait/`CircuitAction`/`CircuitId`/`StreamTarget`
+already existed; this added the concrete policy onyums' rendezvous loop will drive.
+`AccountingCircuitPolicy` keeps cumulative `CircuitStats { streams, requests }` per
+`CircuitId` and enforces opt-in circuit-breakers: `under_attack(true)` returns
+`Challenge` on every new circuit (Under Attack Mode), `max_streams(n)` tears down a
+stream-fanning circuit wholesale (`Shutdown`), `max_requests(n)` `Reject`s requests
+past the cap. With no caps it is accept-all accounting substrate (`stats` for
+observability/adaptive difficulty); `forget` lets the host drop torn-down circuits
+(no stream-close hook). Panic-free under lock poisoning. **6 new unit tests**.
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after every increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums --lib -- --skip test_serve`: **8 passed; 0 failed; 0 ignored**
+  (1 filtered out = `test_serve`). Up from 1 (test_serve only) at run start.
+- `cargo test -p onyums-skin`: **50 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 44 at run start).
+- `cargo clippy --workspace --all-targets`: **0 warnings** (every increment fixed
+  clippy directly — `unused async`, `missing_panics_doc`→poison-recover,
+  `large_enum_variant`→Box, `derivable_impls`→`#[derive(Default)]`, `doc_markdown`;
+  no `#[allow]` added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open
+- **onyums Phase 0 (foundational refactors): DONE.** All three bullets are now closed —
+  thread+runtime hack (run 2), `ONION_NAME` singleton killed (this run), first-class
+  readiness + graceful shutdown handle (this run). `serve()` is a wrapper over the
+  builder; the secure one-liner is unchanged.
+- **onyums Phase 2 (Skin integration): STARTED.** DONE: `SkinLayer` inserted into the
+  Router, secure-default-on with `.skin()`/`.no_skin()` builder controls.
+- **onyums-skin Phase 2: STARTED.** DONE: `AccountingCircuitPolicy` (per-circuit
+  accounting + caps + Under Attack Mode).
+- OPEN (onyums Phase 2): drive `onyums_skin::CircuitPolicy` from `handle_stream_request`
+  (map `CircuitAction` onto accept/challenge/reject/`shutdown_circuit`); the **Under
+  Attack Mode** builder toggle; feed Skin's adaptive-difficulty signal from observed
+  circuit/request rate. **Prerequisite:** onyums must first extract a real per-circuit
+  identifier (`ConnectionInfo.circuit_id` is hardcoded `None` today) — that is Phase 4
+  "enriched `ConnectionInfo`" and blocks the CircuitPolicy wiring.
+- OPEN (onyums-skin Phase 2): time-windowed per-circuit *rate* (this slice is
+  cumulative-count caps); per-circuit byte accounting; adaptive PoW difficulty.
+- BLOCKED: `CaptchaChallenge` (skin Phase 1) — still on the `captcha` crate license audit.
+- NOT STARTED: onyums Phase 1 (identity: `.ephemeral()`, BYO key, vanity mining),
+  Phase 3 (TLS-first/strict), Phase 4 (observability/multi-service); skin Phase 3 (WAF).
+
+**STOP REASON:** Landed 4 verifiable increments (top of the 2–4 bar), closing out the
+entire onyums Phase 0 and opening Phase 2 Skin integration on both sides of the split.
+The natural next item — driving `CircuitPolicy` from onyums' rendezvous loop — is
+**blocked on a real prerequisite**: `handle_stream_request` has no per-circuit id to
+key the policy on (`ConnectionInfo.circuit_id` is hardcoded `None`), so it needs the
+Phase 4 `ConnectionInfo` circuit-id extraction first, and that work lives on the
+live-Tor serve path this routine cannot runtime-verify — it deserves a dedicated start,
+not a rushed late one. Everything is green, clippy-clean, and fully unit-tested where
+no live Tor is required; nothing is half-landed.
+
+**NEXT STEP:** Extract a real per-circuit identifier in onyums (enrich `ConnectionInfo`
+so `circuit_id` is populated from the rendezvous/stream layer instead of `None`) — the
+Phase 4 plumbing that unblocks Phase 2's `CircuitPolicy` wiring. Then drive
+`AccountingCircuitPolicy` from `handle_stream_request`, mapping `CircuitAction::{Accept,
+Challenge, Reject, Shutdown}` onto accept / the Skin gate / reject / `shutdown_circuit()`,
+and add the **Under Attack Mode** builder toggle. In parallel-tractable, no-Tor work:
+the skin-side time-windowed per-circuit rate cap (with an injectable clock for
+testability) builds directly on this run's accounting.
+
+---
+
 ## 2026-06-18 (run 2) — finish skin Phase 1 gate core + onyums Phase 0 slice (6 increments)
 
 Branch `routine/onyums-2026-06-18-2` → PR (base `master`). Same-day rerun: the morning's

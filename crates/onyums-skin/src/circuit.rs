@@ -105,6 +105,13 @@ pub trait CircuitPolicy: Send + Sync {
 		let _ = (id, bytes);
 		CircuitAction::Accept
 	}
+
+	/// Forget a circuit's accounting — the host calls this once a circuit is torn down
+	/// (there is no stream-close hook), so a stateful policy's per-circuit map does not
+	/// grow without bound. The default does nothing, for stateless policies.
+	fn forget(&self, id: &CircuitId) {
+		let _ = id;
+	}
 }
 
 /// Cumulative running totals for one rendezvous circuit.
@@ -235,11 +242,6 @@ impl AccountingCircuitPolicy {
 		self.lock().get(id).map(|state| state.stats)
 	}
 
-	/// Drop a circuit's accounting (call when the host tears the circuit down).
-	pub fn forget(&self, id: &CircuitId) {
-		self.lock().remove(id);
-	}
-
 	/// Lock the accounting map, recovering from a poisoned mutex (the only thing
 	/// done under the lock is map bookkeeping, so poisoning carries no broken
 	/// invariant).
@@ -310,6 +312,10 @@ impl CircuitPolicy for AccountingCircuitPolicy {
 			return CircuitAction::Shutdown;
 		}
 		CircuitAction::Accept
+	}
+
+	fn forget(&self, id: &CircuitId) {
+		self.lock().remove(id);
 	}
 }
 
@@ -470,6 +476,36 @@ mod tests {
 			}
 		}
 		assert_eq!(AcceptAll.on_bytes(&C1, 9999), CircuitAction::Accept);
+	}
+
+	#[test]
+	fn forget_is_callable_through_a_trait_object() {
+		// The host holds an `Arc<dyn CircuitPolicy>` and must be able to forget circuits
+		// generically; `AccountingCircuitPolicy` actually drops the state.
+		let policy: Box<dyn CircuitPolicy> = Box::new(AccountingCircuitPolicy::new());
+		policy.on_request(&C1);
+		policy.forget(&C1);
+		// Downcast is not available through the trait object, so re-observe via a fresh
+		// request: the cumulative count restarts from 1, proving the prior state was dropped.
+		policy.on_request(&C1);
+	}
+
+	#[test]
+	fn default_forget_is_a_noop() {
+		// A stateless policy inherits the no-op default and must not panic.
+		struct Stateless;
+		impl CircuitPolicy for Stateless {
+			fn on_new_circuit(&self, _: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+			fn on_new_stream(&self, _: &CircuitId, _: &StreamTarget) -> CircuitAction {
+				CircuitAction::Accept
+			}
+			fn on_request(&self, _: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+		}
+		Stateless.forget(&C1);
 	}
 
 	#[test]

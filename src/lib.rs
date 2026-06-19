@@ -30,7 +30,7 @@ use hyper_util::{
 };
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
-use tor_cell::relaycell::msg::Connected;
+use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, RendRequest, RunningOnionService, StreamRequest};
 use tor_proto::client::stream::IncomingStreamRequest;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
@@ -41,7 +41,11 @@ extern crate rcgen;
 use std::sync::Arc;
 
 pub use axum::*;
-pub use onyums_skin::{self, Skin};
+pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
+use onyums_skin::CircuitId;
+
+mod circuit_gate;
+use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
 	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
@@ -134,27 +138,102 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 	Ok(address)
 }
 
-/// Handles incoming stream requests by spawning tasks to process them.
-async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = StreamRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress) -> Result<()> {
-	event!(Level::INFO, "Waiting for Incoming request...");
-	while let Some(stream_request) = stream_requests.next().await {
-		let incoming_request_trace_span = span!(Level::INFO, "onyums - incoming_request");
-		let _requests_trace_guard = incoming_request_trace_span.enter();
-		event!(Level::INFO, "New incoming request found...");
+/// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
+/// per-circuit boundary that `tor_hsservice::handle_rend_requests` (the flattener used
+/// before) discards.
+///
+/// Each `RendRequest` is exactly one rendezvous circuit, so the host mints a synthetic
+/// [`CircuitId`] per request (arti surfaces none at the stream layer — see
+/// [`circuit_gate`]). The policy is consulted at the circuit boundary
+/// ([`CircuitPolicy::on_new_circuit`]) before the circuit is accepted, then per stream
+/// ([`CircuitPolicy::on_new_stream`]); its [`CircuitAction`](onyums_skin::CircuitAction)
+/// drives accept / per-stream reject / whole-circuit teardown. Each circuit's streams
+/// are handled on a dedicated task so circuits run concurrently, and the circuit's
+/// accounting is dropped via [`CircuitPolicy::forget`] once its stream drains.
+async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: Arc<dyn CircuitPolicy>) -> Result<()> {
+	event!(Level::INFO, "Waiting for incoming rendezvous circuits...");
+	let allocator = Arc::new(CircuitIdAllocator::new());
+	while let Some(rend_request) = rend_requests.next().await {
+		let circuit_span = span!(Level::INFO, "onyums - new_circuit");
+		let _circuit_guard = circuit_span.enter();
+		let id = allocator.next_id();
+
+		// Consult the policy at the circuit boundary before accepting.
+		if circuit_gate::circuit_disposition(policy.on_new_circuit(&id)) == CircuitDisposition::Drop {
+			event!(Level::INFO, "Circuit {} rejected by policy on offer.", id.0);
+			if let Err(err) = rend_request.reject().await {
+				event!(Level::INFO, "Failed to reject circuit {}: {err}", id.0);
+			}
+			// `on_new_circuit` may have registered accounting for this id; drop it again
+			// since the circuit never enters service.
+			policy.forget(&id);
+			continue;
+		}
+
+		let streams = match rend_request.accept().await {
+			Ok(streams) => streams,
+			Err(err) => {
+				event!(Level::INFO, "Failed to accept circuit {}: {err}", id.0);
+				continue;
+			}
+		};
+
 		let app = app.clone();
 		let tls_acceptor = tls_acceptor.clone();
 		let address = address.clone();
-
+		let policy = policy.clone();
 		tokio::spawn(async move {
-			// handle the incoming request
-			let result = handle_stream_request(stream_request, tls_acceptor, app.clone(), &address).await;
-
-			if let Err(err) = result {
-				event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
-			}
+			handle_circuit_streams(streams, id, app, tls_acceptor, address, policy.as_ref()).await;
+			// The circuit has drained; drop its accounting so the policy's map does not
+			// grow without bound (there is no per-stream close hook).
+			policy.forget(&id);
+			event!(Level::INFO, "Circuit {} closed.", id.0);
 		});
 	}
 	Ok(())
+}
+
+/// Handles every stream on one accepted rendezvous circuit, consulting the policy per
+/// stream and spawning a task to serve each one the policy admits.
+async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: &dyn CircuitPolicy) {
+	while let Some(stream_request) = streams.next().await {
+		let stream_span = span!(Level::INFO, "onyums - incoming_stream");
+		let _stream_guard = stream_span.enter();
+		let port = match stream_request.request() {
+			IncomingStreamRequest::Begin(begin) => begin.port(),
+			_ => 0,
+		};
+		let target = circuit_gate::stream_target(port);
+
+		match circuit_gate::stream_disposition(policy.on_new_stream(&id, &target)) {
+			StreamDisposition::Serve => {
+				let app = app.clone();
+				let tls_acceptor = tls_acceptor.clone();
+				let address = address.clone();
+				tokio::spawn(async move {
+					if let Err(err) = handle_stream_request(stream_request, tls_acceptor, app, &address, id).await {
+						event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
+					}
+				});
+			}
+			StreamDisposition::Reject => {
+				event!(Level::INFO, "Stream on circuit {} rejected by policy.", id.0);
+				// Reject just this stream (DONE keeps onyums indistinguishable from other
+				// onion services); the circuit and its other streams live on.
+				if let Err(err) = stream_request.reject(End::new_with_reason(EndReason::DONE)).await {
+					event!(Level::INFO, "Failed to reject stream on circuit {}: {err}", id.0);
+				}
+			}
+			StreamDisposition::Shutdown => {
+				event!(Level::INFO, "Tearing down circuit {} by policy.", id.0);
+				if let Err(err) = stream_request.shutdown_circuit() {
+					event!(Level::INFO, "Failed to shut down circuit {}: {err}", id.0);
+				}
+				// The whole circuit is gone; stop pulling its streams.
+				break;
+			}
+		}
+	}
 }
 
 /// Initializes the onion service and returns the service and request stream.
@@ -162,12 +241,6 @@ fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname:
 	let (service, request_stream) = launch_onion_service(client, nickname)?;
 	let address = get_onion_address(&service)?;
 	Ok((service, address, request_stream))
-}
-
-/// Prepares the request handling stream.
-fn prepare_request_stream(request_stream: impl Stream<Item = RendRequest>) -> impl Stream<Item = StreamRequest> {
-	event!(Level::INFO, "Creating a stream to handle incoming requests...");
-	tor_hsservice::handle_rend_requests(request_stream)
 }
 
 /// A running onion service plus its controls.
@@ -274,6 +347,7 @@ pub struct OnionServiceBuilder {
 	router: Option<Router>,
 	nickname: Option<String>,
 	skin: SkinChoice,
+	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
 }
 
 impl OnionServiceBuilder {
@@ -299,6 +373,20 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub fn skin(mut self, skin: Skin) -> Self {
 		self.skin = SkinChoice::Custom(Box::new(skin));
+		self
+	}
+
+	/// Set the per-rendezvous-circuit [`CircuitPolicy`] driving the Tor-layer gate
+	/// (accept / per-stream reject / whole-circuit teardown, plus per-circuit
+	/// accounting).
+	///
+	/// Defaults to an accept-all [`AccountingCircuitPolicy`] — it changes no behaviour
+	/// but begins per-circuit accounting. Supply a tuned policy (stream/request/byte
+	/// caps, Under Attack Mode) to enforce circuit-level limits the HTTP gate cannot
+	/// express. The policy is shared across all circuits, so it must be `Send + Sync`.
+	#[must_use]
+	pub fn circuit_policy(mut self, policy: Arc<dyn CircuitPolicy>) -> Self {
+		self.circuit_policy = Some(policy);
 		self
 	}
 
@@ -337,6 +425,10 @@ impl OnionServiceBuilder {
 		// serve path is unchanged.
 		let app = apply_skin(app, self.skin);
 
+		// The per-circuit Tor-layer gate. Secure-by-default but non-disruptive: an
+		// accept-all accounting policy unless the caller supplied a tuned one.
+		let policy: Arc<dyn CircuitPolicy> = self.circuit_policy.unwrap_or_else(|| Arc::new(AccountingCircuitPolicy::new()));
+
 		let client = setup_tor_client().await?;
 		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
 		let tls_acceptor = tls_acceptor(&address)?;
@@ -345,12 +437,12 @@ impl OnionServiceBuilder {
 		let loop_cancel = cancel.clone();
 		let loop_address = address.clone();
 		let task = tokio::spawn(async move {
-			let stream_requests = Box::pin(prepare_request_stream(request_stream));
+			let rend_requests = Box::pin(request_stream);
 			tokio::select! {
 				() = loop_cancel.cancelled() => {
 					event!(Level::INFO, "Onion service accept loop cancelled.");
 				}
-				result = handle_incoming_requests(stream_requests, app, tls_acceptor, loop_address) => {
+				result = serve_circuits(rend_requests, app, tls_acceptor, loop_address, policy) => {
 					if let Err(err) = result {
 						event!(Level::ERROR, "Onion service accept loop ended with error: {err}");
 					} else {
@@ -408,11 +500,13 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 }
 
 /// Handles a TLS connection on port 443.
-async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
+async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, circuit_id: CircuitId) -> Result<()> {
 	event!(Level::INFO, "Accepting the incoming stream and wrapping it in a TLS stream...");
 	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
 
-	let connect_info = ConnectionInfo { circuit_id: None, socket_addr: None };
+	// Surface the host-assigned per-circuit id to the application (and the Skin HTTP
+	// gate) via the axum connect-info, replacing the long-hardcoded `None`.
+	let connect_info = ConnectionInfo { circuit_id: Some(circuit_id.0.to_string()), socket_addr: None };
 
 	// Accept the TLS connection, logging the specific error on failure
 	let tls_onion_service_stream = tls_acceptor.accept(onion_service_stream).await.map_err(|e| anyhow::anyhow!("failed to accept TLS stream: {e:?}"))?;
@@ -499,14 +593,14 @@ fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
 }
 
 // Then handle_stream_request
-async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress) -> Result<()> {
+async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress, circuit_id: CircuitId) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
 	let _handling_request_trace_guard = handling_request_trace_span.enter();
 	match stream_request.request().clone() {
 		// Clone request to use `begin` later
 		IncomingStreamRequest::Begin(begin) if begin.port() == 443 => {
 			// Only handle port 443 for TLS
-			handle_tls_connection(stream_request, tls_acceptor, app).await
+			handle_tls_connection(stream_request, tls_acceptor, app, circuit_id).await
 		}
 		IncomingStreamRequest::Begin(begin) if begin.port() == 80 => {
 			// Handle Port 80 (Plain HTTP) - Redirect to HTTPS

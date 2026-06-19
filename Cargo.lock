@@ -2872,8 +2872,12 @@ dependencies = [
  "base64",
  "governor",
  "hmac",
+ "http-body-util",
  "rand 0.9.4",
  "sha2",
+ "tokio",
+ "tower-layer",
+ "tower-service",
  "tracing",
 ]
 

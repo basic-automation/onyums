@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
+readme = "README.md"
 description = "A 'Cloudflare for Tor' abuse-defense layer for onion services: challenge/PoW gate, stateless clearance tokens, token/circuit-keyed rate limiting, no-JS fallbacks."
 keywords = ["tor", "ddos", "captcha", "proof-of-work", "waf"]
 categories = ["web-programming", "network-programming"]
@@ -16,3 +17,9 @@ rand = { workspace = true }
 hmac = { workspace = true }
 base64 = { workspace = true }
 governor = { workspace = true }
+tower-service = { workspace = true }
+tower-layer = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+http-body-util = { workspace = true }

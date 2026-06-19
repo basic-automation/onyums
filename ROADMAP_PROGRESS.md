@@ -7,6 +7,118 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-18 (run 2) — finish skin Phase 1 gate core + onyums Phase 0 slice (6 increments)
+
+Branch `routine/onyums-2026-06-18-2` → PR (base `master`). Same-day rerun: the morning's
+PR #4 (the previous entry) merged to `master`, so this run branched fresh off the updated
+`master` (585bdcb). It **completed the onyums-skin Phase 1 gate core** — the PoW
+`Challenge`, the `SkinLayer` middleware, replay protection, and the one-call secure
+default — then took the first bounded **onyums Phase 0** slice (the per-request
+thread+runtime fix) and cleared the root crate's clippy baseline. Workspace stayed green
+and clippy-clean throughout.
+
+**Increment 1 — PowChallenge (signed-puzzle JS PoW gate).** *onyums-skin Phase 1,
+"Hashcash `Pow` … + the JS interstitial page that solves it."* Files:
+`src/challenge/pow.rs`, `src/lib.rs`. The proof-of-work `Challenge`: `make_puzzle` packs
+a random seed, difficulty, and expiry into an HMAC-SHA256 envelope handed to the client;
+`open_puzzle` re-derives them from the *verified* envelope so a client can't pick an easy
+seed, replay a stale puzzle, or downgrade difficulty. Submission rides the query string
+(`?puzzle=&nonce=`) so `verify` needs only request `Parts` — no body buffering. `issue`
+renders a self-contained interstitial with a plain-JS SHA-256 hashcash solver that mirrors
+`Hashcash` exactly. `needs_js()` is true (chain falls back to patience/CAPTCHA for no-JS).
+**9 new tests.**
+
+**Increment 2 — SkinLayer gate middleware + builder.** *onyums-skin Phase 1, "`SkinLayer`
+(tower middleware) wiring inspect → clearance-check → challenge → rate-limit, plus the
+challenge-submission route."* Files: `Cargo.toml`, `crates/onyums-skin/Cargo.toml`,
+`src/layer.rs` (new), `src/lib.rs`. `Skin` (Arc-shared config) + `SkinBuilder`
+(secure-by-default: unset store ⇒ random HMAC store; empty chain ⇒ fail-closed 403). The
+sync core `Skin::decide` runs the ROADMAP lifecycle minus WAF: valid clearance → rate-limit
+on token id (429 on trip) → forward; submission to `/.skin/pow` → `verify` → mint clearance
++ 303 redirect with Set-Cookie; else present challenge / 403. `decide` is tower/async-free
+(directly testable); `SkinService` is the thin `tower_layer::Layer`/`tower_service::Service`
+wrapper (clone-and-swap, no body buffering). Added `tower-layer` to the workspace;
+`tower-service`/`tower-layer` as skin deps; `tokio`+`http-body-util` dev-deps. **9 new
+tests** incl. two `#[tokio::test]` end-to-end (cleared request reaches the app; uncleared
+body never leaks).
+
+**Increment 3 — single-use replay protection.** *onyums-skin Phase 1, "single-use replay
+protection."* Files: `src/challenge/pow.rs`. Without it, one solved puzzle could be
+resubmitted to mint unlimited clearances (unlimited rate-limit budget), defeating
+"cost per identity." `PowChallenge` now records redeemed puzzle seeds in a bounded
+`Mutex<HashMap<[u8;32], SystemTime>>`; `verify` clears a solved puzzle exactly once and
+rejects replays, pruning entries against each puzzle's own expiry. Single-use on the
+*solution*, not the clearance (which stays a multi-use session identity). **1 new test.**
+
+**Increment 4 — Skin::secure_default() + doc example.** *onyums-skin Phase 1 "Done when"
+(require the gate in a few lines; no-JS path always works).* Files: `src/layer.rs`,
+`src/lib.rs`. One-call gate: JS PoW + no-JS patience fallback + token rate limiting + a
+fresh random store, with a runnable doctest. Also refreshed the now-inaccurate crate-level
+docs (the header still called the crate unimplemented scaffolding). **1 new unit test + 1
+doc test.**
+
+**Increment 5 — onyums Phase 0: drop per-request thread+runtime hack.** *onyums ROADMAP
+Phase 0, "Fix the per-request thread+runtime hack."* Files: `src/lib.rs`.
+`handle_tls_connection` previously spawned a fresh OS thread *and* a new current-thread
+tokio runtime for every hyper request just to drive the async service setup, joining the
+thread before returning the response future — the ROADMAP's "correctness and throughput
+landmine." Now the per-connection axum service is built once by awaiting the always-ready
+`IntoMakeServiceWithConnectInfo` on the existing runtime and bridged to hyper via
+`hyper_util::service::TowerToHyperService` — no thread, no nested runtime, no join; the
+service is reused across keep-alive requests. Removed the `#[allow(clippy::async_yields_async)]`
+the old shape required. Not runtime-tested (live-Tor `test_serve` is network-bound).
+
+**Increment 6 — clear onyums clippy baseline.** *Cross-cutting cleanup enabling Phase 0
+work.* Files: `src/lib.rs`, `crates/onyums-skin/Cargo.toml`, `crates/onyums-skin/README.md`
+(new). The root crate enables pedantic/nursery/cargo but had six latent warnings (never
+surfaced because Phase 0 was untouched). Cleared all six with no `#[allow]`: uninlined
+format args (×3), an underscore-bound-then-used `_begin`, a `case_sensitive_file_extension_comparisons`
+on the `.onion` suffix normalization (rewritten to `format!("{}.onion",
+name.trim_end_matches(".onion"))`, behavior-equivalent and also collapsing accidental
+repeats), and onyums-skin's missing `package.readme` (added a README + the key).
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after every increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not our code).
+- `cargo test -p onyums-skin`: **44 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (final; up from 24 at start of run).
+- `cargo clippy --workspace --all-targets`: **0 code warnings** (onyums root went from 6
+  pre-existing → 0; onyums-skin clean throughout; no `#[allow]` added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open
+- **onyums-skin Phase 1 (gate core): DONE.** Hashcash `Pow`; `PowChallenge` + JS
+  interstitial + signed-puzzle/replay; `HmacClearanceStore`; `SkinRateLimit`;
+  `PatienceChallenge`; `ChallengeChain`; `SkinLayer` + `SkinBuilder`; `Skin::secure_default()`.
+  The "Done when" criteria are met: a plain axum app gates in one line, mints a stateless
+  token, rate-limits by it, and a no-JS client always has a path.
+- OPEN (skin Phase 1): `CaptchaChallenge` — still **blocked** on the `captcha` crate
+  license audit (ROADMAP open question); not started, no dep added.
+- onyums Phase 0: thread+runtime hack **DONE**; **OPEN**: kill the `ONION_NAME` singleton
+  and the first-class readiness/graceful-shutdown handle (interdependent — see next step).
+- NOT STARTED: skin Phase 2 (CircuitPolicy/Tor dimension), Phase 3 (WAF); onyums Phase 1
+  (identity), Phase 2 (Skin integration — consumes the now-built skin API).
+
+**STOP REASON:** Landed 6 verifiable increments (above the 2–4 bar), closing out the entire
+onyums-skin Phase 1 gate core plus a clean onyums Phase 0 slice and clippy baseline. The
+remaining workable items are either **blocked** (`CaptchaChallenge` on the license audit)
+or a **large, interdependent refactor** (the `ONION_NAME` singleton kill is entangled with
+the Phase 0 readiness/shutdown handle and ripples through `serve`, `tls_acceptor`,
+`handle_stream_request`, and the public `get_onion_name` API — a breaking change best
+designed as one focused increment). That refactor touches the live-Tor serve path, which
+this routine cannot runtime-verify, so it deserves a dedicated start rather than a rushed
+late-night one. Workspace is green and clippy-clean; nothing is half-landed.
+
+**NEXT STEP:** onyums Phase 0 — kill the `ONION_NAME` global. Design a per-service handle
+returned from the builder that exposes `onion_address()` / `ready()` / `shutdown()`
+(CancellationToken), thread the onion name through `serve → handle_incoming_requests →
+handle_stream_request`/`tls_acceptor` instead of the static, and replace the public
+`get_onion_name()` poll-the-global pattern. Do it as one focused increment (it is a
+breaking API change). Afterwards, onyums Phase 2 can begin wiring the now-complete
+`onyums-skin` `SkinLayer` into the served `Router`.
+
+---
+
 ## 2026-06-18 — onyums-skin Phase 1 gate core (5 increments)
 
 Branch `routine/onyums-2026-06-18` → PR (base `master`). The `onyums-skin` crate began

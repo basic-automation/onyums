@@ -281,6 +281,18 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
 - **Flash messages + CSRF** — signed/encrypted-cookie flash and per-form CSRF tokens, on by default
   for state-changing requests (Rails/Laravel parity). `axum-extra` cookies + a CSRF layer.
   *Reuse + small build.*
+- **Live / reactive enhancement (WS- or SSE-over-Tor, enhancement-only)** — server-authoritative
+  reactive state: the server owns the state and pushes diffs/patches over a WebSocket (or SSE for
+  one-way streams) over Tor — onyums already ships WS-over-Tor — to a client island (`<rust>`→WASM
+  or the Vue `<script>`) that applies them. This is the Phoenix-LiveView idea, bound by the
+  no-JS-first discipline: it is **strictly an enhancement**. Every interaction must also keep a
+  plain server path (a `<form>` POST / link), so a no-JS client gets the full server-rendered
+  baseline and simply no live updates — a naive LiveView clone, where the primary UX *only* works
+  through the socket, is the thing we don't build. Tor-aware by construction: Tor's RTT is high, so
+  updates are **coarse-grained and batched** (not per-keystroke diffs); the island reconnects and
+  resyncs state when a rendezvous circuit drops; and the per-connection cost (an open circuit +
+  server-side state per client) sits behind the onyums-skin gate. SSE is the lighter default for
+  server→client-only streams. *Build — the live counterpart of the SFC islands.*
 
 ### B. Self-contained data & jobs (no daemon)
 - **Database — Turso by default.** The default datastore is **Turso** (SQLite-compatible). This keeps 
@@ -326,9 +338,10 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   opt-in (see section B) — only receiving is excluded.
 - **No heavy asset pipeline.** Ship fingerprinted static-asset serving, not a Propshaft/Vite bundler;
   onion sites are lean and no-JS-leaning.
-- **No LiveView/Hotwire reactive layer.** Server-driven reactive UIs require client JS, contradicting
-  the no-JS-first thesis. Keep WS-over-Tor + SSE + simple pub/sub; don't build a JS-dependent
-  reactive framework.
+- **No JS-*required* reactive layer.** We *do* ship server-driven reactivity (see "Live / reactive
+  enhancement" in section A) — over WS-/SSE-over-Tor, as an enhancement. What we don't build is the
+  LiveView/Hotwire model where the primary UX *assumes* a live socket and breaks with JS off; every
+  action keeps a no-JS server path.
 - **No ActiveRecord "magic."** Rust favors explicitness — migrations + a typed query convention
   (`sqlx`/`sea-orm`), not a metaprogrammed model layer.
 

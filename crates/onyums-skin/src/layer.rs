@@ -16,17 +16,18 @@
 //! Tor-specific per-circuit dimension is a separate `CircuitPolicy` (Phase 2).
 
 use std::{
-	future::Future, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration
+	future::Future, num::NonZeroU32, pin::Pin, sync::Arc, task::{Context, Poll}, time::Duration
 };
 
 use axum::{
 	body::Body, http::{HeaderValue, StatusCode, header, request::Parts}, response::{IntoResponse, Response}
 };
+use rand::RngCore;
 use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{
-	challenge::{Challenge, ChallengeChain, Gate}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, ratelimit::SkinRateLimit
+	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, ratelimit::SkinRateLimit
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -38,6 +39,14 @@ const DEFAULT_SUBMIT_PATH: &str = "/.skin/pow";
 const DEFAULT_RETURN_PATH: &str = "/";
 /// Default lifetime of a minted clearance.
 const DEFAULT_CLEARANCE_TTL: Duration = Duration::from_secs(3600);
+
+/// Default PoW difficulty for [`Skin::secure_default`] — a few hundred ms of browser
+/// work, negligible server-side. Tune via the builder under load.
+const DEFAULT_DIFFICULTY: u32 = 18;
+/// Default no-JS patience-tarpit wait for [`Skin::secure_default`].
+const DEFAULT_PATIENCE_DELAY: Duration = Duration::from_secs(5);
+/// Default per-token request rate for [`Skin::secure_default`].
+const DEFAULT_RATE_PER_SEC: u32 = 30;
 
 /// The assembled, immutable gate configuration shared (behind an [`Arc`]) by every
 /// cloned [`SkinService`]. Build one with [`Skin::builder`].
@@ -57,6 +66,39 @@ impl Skin {
 	#[must_use]
 	pub fn builder() -> SkinBuilder {
 		SkinBuilder::default()
+	}
+
+	/// The batteries-included secure gate, in one call: a JS proof-of-work challenge
+	/// with a no-JS patience-tarpit fallback (so a Tor "Safer"/"Safest" client always
+	/// has a path), token-keyed rate limiting, and a fresh random signing store.
+	///
+	/// This is the "secure and complete by default" entry point — relax it by building
+	/// with [`Skin::builder`] instead (lower difficulty, no rate limit, a shared store
+	/// for multi-instance honoring, ...). Note the store is process-local, so minted
+	/// clearances do not survive a restart; pass a shared [`HmacClearanceStore`] via the
+	/// builder when that matters.
+	///
+	/// ```
+	/// use axum::{Router, routing::get};
+	/// use onyums_skin::Skin;
+	///
+	/// let app: Router = Router::new().route("/", get(|| async { "hello" }));
+	/// // One line turns the app into a PoW-gated, rate-limited, no-JS-capable service.
+	/// let gated: Router = app.layer(Skin::secure_default().into_layer());
+	/// # let _ = gated;
+	/// ```
+	#[must_use]
+	pub fn secure_default() -> Skin {
+		let store = HmacClearanceStore::generate();
+		let mut pow_secret = [0u8; 32];
+		rand::rng().fill_bytes(&mut pow_secret);
+		let rate = SkinRateLimit::per_second(NonZeroU32::new(DEFAULT_RATE_PER_SEC).expect("DEFAULT_RATE_PER_SEC is nonzero"));
+		Skin::builder()
+			.store(Arc::new(store.clone()))
+			.challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY)))
+			.challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY)))
+			.rate_limit(rate)
+			.build()
 	}
 
 	/// Turn this gate into a [`SkinLayer`] for `Router::layer`.
@@ -304,6 +346,13 @@ mod tests {
 
 	fn parts_with_cookie(path: &str, cookie: &str) -> Parts {
 		Request::builder().uri(path).header(header::COOKIE, cookie).body(()).unwrap().into_parts().0
+	}
+
+	#[test]
+	fn secure_default_gates_uncleared_requests() {
+		// The one-call gate must challenge an uncleared request, never forward it.
+		let skin = Skin::secure_default();
+		assert!(matches!(skin.decide(&bare_parts("/")), Decision::Respond(_)));
 	}
 
 	#[test]

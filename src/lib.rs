@@ -16,7 +16,7 @@
 //! }
 //! ```
 
-use std::{net::SocketAddr, sync::LazyLock};
+use std::{net::SocketAddr, sync::Mutex};
 
 use anyhow::{bail, Result};
 use arti_client::{config::TorClientConfigBuilder, TorClient};
@@ -28,7 +28,8 @@ use hyper::{body::Incoming, Request, Response, StatusCode};
 use hyper_util::{
 	rt::{TokioExecutor, TokioIo}, service::TowerToHyperService
 };
-use tokio::sync::Mutex;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, RendRequest, RunningOnionService, StreamRequest};
 use tor_proto::client::stream::IncomingStreamRequest;
@@ -40,15 +41,55 @@ extern crate rcgen;
 use std::sync::Arc;
 
 pub use axum::*;
+pub use onyums_skin::{self, Skin};
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
 	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
 };
 
-static ONION_NAME: LazyLock<Mutex<String>> = LazyLock::new(|| Mutex::new(String::new()));
+/// A Tor v3 onion service address — the service's public identity.
+///
+/// Normalized to exactly one trailing `.onion` suffix, so it is safe to use
+/// directly as a TLS subject-alternative-name or an HTTP redirect host. This is
+/// the typed replacement for the stringly-typed, process-global onion name: the
+/// address is threaded explicitly from the launched service to the handlers that
+/// need it (TLS cert generation, the port-80 → HTTPS redirect) rather than read
+/// from a shared `static`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnionAddress(String);
 
-pub fn get_onion_name() -> String {
-	ONION_NAME.try_lock().map_or_else(|_| String::new(), |guard| (*guard.clone()).to_string())
+impl OnionAddress {
+	/// Normalize a raw onion service name to exactly one trailing `.onion`
+	/// suffix, handling a bare name, a single suffix, or accidental repetition.
+	#[must_use]
+	pub fn normalized(name: &str) -> Self {
+		Self(format!("{}.onion", name.trim_end_matches(".onion")))
+	}
+
+	/// The full address, including the `.onion` suffix.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+
+	/// The host used for TLS SANs and redirect targets. Identical to
+	/// [`Self::as_str`]; named for intent at the call site.
+	#[must_use]
+	pub fn host(&self) -> &str {
+		&self.0
+	}
+}
+
+impl std::fmt::Display for OnionAddress {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+impl From<OnionAddress> for String {
+	fn from(address: OnionAddress) -> Self {
+		address.0
+	}
 }
 
 /// Sets up and bootstraps a Tor client.
@@ -69,7 +110,11 @@ async fn setup_tor_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 }
 
 /// Launches an onion service with the given nickname.
-fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest>)> {
+///
+/// The returned request stream is self-contained (`use<>`) — it does not borrow
+/// the client — so callers can move the client elsewhere (e.g. into a handle)
+/// while keeping the stream.
+fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
 	event!(Level::INFO, "Launching onion service...");
 	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
 	let svc_cfg = OnionServiceConfigBuilder::default().nickname(nickname).build().map_err(|_| anyhow::anyhow!("Failed to build onion service config."))?;
@@ -78,23 +123,19 @@ fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &st
 		.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
 }
 
-/// Retrieves and stores the onion service name.
-async fn get_and_store_onion_name(service: &Arc<RunningOnionService>) -> Result<String> {
+/// Retrieves the onion service address from the launched service.
+fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress> {
 	event!(Level::INFO, "Getting the onion service name...");
 	let service_name = service.onion_address().ok_or_else(|| anyhow::anyhow!("Failed to get onion service name."))?.display_unredacted().to_string();
 	event!(Level::INFO, "Onion service name: {service_name}");
 
-	// Normalize to exactly one trailing `.onion` suffix (handles a bare name, a single
-	// suffix, or any accidental repetition).
-	let clean_name = format!("{}.onion", service_name.trim_end_matches(".onion"));
-
-	event!(Level::INFO, "Cleaned onion service name: {clean_name}");
-	ONION_NAME.lock().await.clone_from(&clean_name);
-	Ok(clean_name)
+	let address = OnionAddress::normalized(&service_name);
+	event!(Level::INFO, "Cleaned onion service name: {address}");
+	Ok(address)
 }
 
 /// Handles incoming stream requests by spawning tasks to process them.
-async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = StreamRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor) -> Result<()> {
+async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = StreamRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress) -> Result<()> {
 	event!(Level::INFO, "Waiting for Incoming request...");
 	while let Some(stream_request) = stream_requests.next().await {
 		let incoming_request_trace_span = span!(Level::INFO, "onyums - incoming_request");
@@ -102,10 +143,11 @@ async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = Stream
 		event!(Level::INFO, "New incoming request found...");
 		let app = app.clone();
 		let tls_acceptor = tls_acceptor.clone();
+		let address = address.clone();
 
 		tokio::spawn(async move {
 			// handle the incoming request
-			let result = handle_stream_request(stream_request, tls_acceptor, app.clone()).await;
+			let result = handle_stream_request(stream_request, tls_acceptor, app.clone(), &address).await;
 
 			if let Err(err) = result {
 				event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
@@ -116,10 +158,10 @@ async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = Stream
 }
 
 /// Initializes the onion service and returns the service and request stream.
-async fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest>)> {
+fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
 	let (service, request_stream) = launch_onion_service(client, nickname)?;
-	let _service_name = get_and_store_onion_name(&service).await?;
-	Ok((service, request_stream))
+	let address = get_onion_address(&service)?;
+	Ok((service, address, request_stream))
 }
 
 /// Prepares the request handling stream.
@@ -128,9 +170,220 @@ fn prepare_request_stream(request_stream: impl Stream<Item = RendRequest>) -> im
 	tor_hsservice::handle_rend_requests(request_stream)
 }
 
-/// Serve a web application over an onion service.
+/// A running onion service plus its controls.
 ///
-/// This function creates a new Tor client, launches an onion service, and serves a web application.
+/// Returned by [`OnionServiceBuilder::serve`]. The accept loop runs on a spawned
+/// task; this handle is how you observe readiness, read the stable `.onion`
+/// address, and stop the service — the per-service replacement for the old
+/// poll-the-global `get_onion_name()` pattern.
+///
+/// Dropping the handle drops the underlying Tor client and onion service, tearing
+/// the service down. Use [`Self::shutdown`] for a graceful stop you can await.
+pub struct OnionServiceHandle {
+	address: OnionAddress,
+	service: Arc<RunningOnionService>,
+	// Kept alive so the onion service's background machinery (intro points,
+	// descriptor publishing) keeps running for the lifetime of the handle.
+	_client: Arc<TorClient<TokioNativeTlsRuntime>>,
+	cancel: CancellationToken,
+	task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl OnionServiceHandle {
+	/// The service's stable `.onion` address.
+	#[must_use]
+	pub const fn onion_address(&self) -> &OnionAddress {
+		&self.address
+	}
+
+	/// Resolve once the service is believed to be fully reachable — its
+	/// descriptor is published and its introduction points are satisfactory.
+	///
+	/// This is the meaningful sense of "ready": after it returns, clients can
+	/// actually reach the service, unlike the old global which was populated the
+	/// instant the address was known (long before the descriptor was up).
+	pub async fn ready(&self) {
+		if self.service.status().state().is_fully_reachable() {
+			return;
+		}
+		let mut events = self.service.status_events();
+		while let Some(status) = events.next().await {
+			if status.state().is_fully_reachable() {
+				return;
+			}
+		}
+	}
+
+	/// Stop accepting new connections and await the accept loop's exit.
+	///
+	/// Cancels the spawned accept loop via its [`CancellationToken`] and joins
+	/// the task. Idempotent: a second call is a no-op. Full teardown of the Tor
+	/// client and onion service happens when the handle is dropped.
+	pub async fn shutdown(&self) {
+		self.cancel.cancel();
+		let task = self.task.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(task) = task {
+			let _ = task.await;
+		}
+	}
+
+	/// Await the accept loop's natural exit without cancelling it.
+	///
+	/// Used by the blocking [`serve`] wrapper to preserve the historical
+	/// "runs until it stops" contract.
+	async fn join(&self) {
+		let task = self.task.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(task) = task {
+			let _ = task.await;
+		}
+	}
+}
+
+/// How the onyums-skin abuse-defense gate is applied to the served router.
+///
+/// Secure by default: with no explicit choice, the secure-default Skin gate is
+/// on. You opt *down* (`no_skin`) or *across* (a custom [`Skin`]), never *up*.
+#[derive(Default)]
+enum SkinChoice {
+	/// Apply [`Skin::secure_default`] — the frontier secure-by-default posture.
+	#[default]
+	Default,
+	/// Apply a caller-supplied gate. Boxed: a `Skin` is much larger than the unit
+	/// variants.
+	Custom(Box<Skin>),
+	/// No Skin gate — an explicit opt-down.
+	Disabled,
+}
+
+/// Apply the chosen Skin gate to the router. Extracted from `serve` so the gate
+/// wiring is testable with `tower::ServiceExt::oneshot` and no live Tor network.
+fn apply_skin(app: Router, skin: SkinChoice) -> Router {
+	match skin {
+		SkinChoice::Default => app.layer(Skin::secure_default().into_layer()),
+		SkinChoice::Custom(skin) => app.layer((*skin).into_layer()),
+		SkinChoice::Disabled => app,
+	}
+}
+
+/// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
+/// need it.
+///
+/// Obtain one from [`OnionService::builder`].
+#[derive(Default)]
+pub struct OnionServiceBuilder {
+	router: Option<Router>,
+	nickname: Option<String>,
+	skin: SkinChoice,
+}
+
+impl OnionServiceBuilder {
+	/// Set the axum [`Router`] to serve. Required.
+	#[must_use]
+	pub fn router(mut self, app: Router) -> Self {
+		self.router = Some(app);
+		self
+	}
+
+	/// Set the onion service nickname (its local keystore identity). Required.
+	#[must_use]
+	pub fn nickname(mut self, nickname: impl Into<String>) -> Self {
+		self.nickname = Some(nickname.into());
+		self
+	}
+
+	/// Replace the default Skin gate with a caller-tuned [`Skin`].
+	///
+	/// The secure-default gate (`PoW` + no-JS patience fallback + token rate
+	/// limiting) is *already on* without this call; use it only to tune the gate,
+	/// not to enable it. See [`Skin::builder`].
+	#[must_use]
+	pub fn skin(mut self, skin: Skin) -> Self {
+		self.skin = SkinChoice::Custom(Box::new(skin));
+		self
+	}
+
+	/// Opt *down*: serve the router with no Skin abuse-defense gate.
+	///
+	/// An explicit, named relaxation of the secure default — the gate is on
+	/// unless you call this.
+	#[must_use]
+	pub fn no_skin(mut self) -> Self {
+		self.skin = SkinChoice::Disabled;
+		self
+	}
+
+	/// Launch the onion service and return a handle once the address is known.
+	///
+	/// The Tor client is bootstrapped and the service launched before this
+	/// returns, so [`OnionServiceHandle::onion_address`] is immediately
+	/// available; the accept loop then runs on a spawned task. Await
+	/// [`OnionServiceHandle::ready`] for actual reachability.
+	///
+	/// # Errors
+	/// Returns an error if the router or nickname is unset, the nickname fails to
+	/// parse, the Tor client fails to bootstrap, the onion service fails to
+	/// launch, or the TLS acceptor fails to build.
+	pub async fn serve(self) -> Result<OnionServiceHandle> {
+		let serve_trace_span = span!(Level::INFO, "onyums - serve");
+		let _info_trace_guard = serve_trace_span.enter();
+		event!(Level::INFO, "Setting up onion service...");
+
+		let app = self.router.ok_or_else(|| anyhow::anyhow!("router not set on OnionServiceBuilder"))?;
+		let nickname = self.nickname.ok_or_else(|| anyhow::anyhow!("nickname not set on OnionServiceBuilder"))?;
+
+		// Insert the onyums-skin gate ahead of the application on the HTTP path
+		// (Phase 2 Skin integration). Secure-by-default unless the caller opted down
+		// with `no_skin`. `Router::layer` keeps the `Router` type, so the rest of the
+		// serve path is unchanged.
+		let app = apply_skin(app, self.skin);
+
+		let client = setup_tor_client().await?;
+		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
+		let tls_acceptor = tls_acceptor(&address)?;
+
+		let cancel = CancellationToken::new();
+		let loop_cancel = cancel.clone();
+		let loop_address = address.clone();
+		let task = tokio::spawn(async move {
+			let stream_requests = Box::pin(prepare_request_stream(request_stream));
+			tokio::select! {
+				() = loop_cancel.cancelled() => {
+					event!(Level::INFO, "Onion service accept loop cancelled.");
+				}
+				result = handle_incoming_requests(stream_requests, app, tls_acceptor, loop_address) => {
+					if let Err(err) = result {
+						event!(Level::ERROR, "Onion service accept loop ended with error: {err}");
+					} else {
+						event!(Level::INFO, "Onion service accept loop ended.");
+					}
+				}
+			}
+		});
+
+		Ok(OnionServiceHandle { address, service, _client: client, cancel, task: Mutex::new(Some(task)) })
+	}
+}
+
+/// Entry point for the builder API.
+///
+/// `OnionService::builder()` returns the same full secure stack `serve()` gives
+/// you, with hooks to tune or relax the defaults.
+pub struct OnionService;
+
+impl OnionService {
+	/// Start building an onion service.
+	#[must_use]
+	pub fn builder() -> OnionServiceBuilder {
+		OnionServiceBuilder::default()
+	}
+}
+
+/// Serve a web application over an onion service, blocking until it stops.
+///
+/// A thin wrapper over [`OnionService::builder`] that preserves the original
+/// one-line entry point and its "runs until the service stops" contract. For
+/// readiness, the address, or graceful shutdown, use the builder directly and
+/// hold the returned [`OnionServiceHandle`].
 ///
 /// # Arguments
 /// `app` - The axum `Router` to serve.
@@ -144,28 +397,12 @@ fn prepare_request_stream(request_stream: impl Stream<Item = RendRequest>) -> im
 /// - The nickname fails to parse.
 /// - The onion service fails to launch.
 /// - The TLS acceptor fails to create.
-/// - The web server fails to start.
 /// - The Tor client fails to create.
 /// - The Tor client fails to bootstrap.
-/// - The Tor client fails to create a stream.
-/// - The Tor client fails to connect to the onion service.
 pub async fn serve(app: Router, nickname: &str) -> Result<()> {
-	let serve_trace_span = span!(Level::INFO, "onyums - serve");
-	let _info_trace_guard = serve_trace_span.enter();
-	event!(Level::INFO, "Setting up onion service...");
-
-	let client = setup_tor_client().await?;
-
-	let (service, request_stream) = initialize_onion_service(&client, nickname).await?;
-
-	let tls_acceptor = tls_acceptor()?;
-
-	let stream_requests = prepare_request_stream(request_stream);
-	tokio::pin!(stream_requests);
-
-	handle_incoming_requests(stream_requests, app, tls_acceptor).await?;
-
-	drop(service);
+	let handle = OnionService::builder().router(app).nickname(nickname).serve().await?;
+	// Preserve the historical contract: block until the accept loop stops.
+	handle.join().await;
 	event!(Level::INFO, "Onion service exited cleanly.");
 	bail!("Onion service exited cleanly");
 }
@@ -239,9 +476,8 @@ impl AxumConnected<Self> for ConnectionInfo {
 }
 
 // Move tls_acceptor function up, before serve
-fn tls_acceptor() -> Result<TlsAcceptor> {
-	let onion_name = get_onion_name();
-	let subject_alt_names = vec![onion_name];
+fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
+	let subject_alt_names = vec![address.host().to_string()];
 	let cert = generate_simple_self_signed(subject_alt_names).unwrap();
 
 	let key_der = match PrivatePkcs8KeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()) {
@@ -263,7 +499,7 @@ fn tls_acceptor() -> Result<TlsAcceptor> {
 }
 
 // Then handle_stream_request
-async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
+async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
 	let _handling_request_trace_guard = handling_request_trace_span.enter();
 	match stream_request.request().clone() {
@@ -274,8 +510,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 		}
 		IncomingStreamRequest::Begin(begin) if begin.port() == 80 => {
 			// Handle Port 80 (Plain HTTP) - Redirect to HTTPS
-			let onion_name = get_onion_name();
-			handle_http_redirect(stream_request, onion_name).await
+			handle_http_redirect(stream_request, address.host().to_string()).await
 		}
 		_ => {
 			// Reject the incoming request
@@ -290,6 +525,75 @@ mod tests {
 	use axum::{routing::get, Router};
 
 	use super::*;
+
+	#[test]
+	fn onion_address_normalizes_bare_name() {
+		let address = OnionAddress::normalized("abcdef");
+		assert_eq!(address.as_str(), "abcdef.onion");
+		assert_eq!(address.host(), "abcdef.onion");
+	}
+
+	#[test]
+	fn onion_address_keeps_single_suffix() {
+		let address = OnionAddress::normalized("abcdef.onion");
+		assert_eq!(address.as_str(), "abcdef.onion");
+	}
+
+	#[test]
+	fn onion_address_collapses_repeated_suffix() {
+		let address = OnionAddress::normalized("abcdef.onion.onion");
+		assert_eq!(address.as_str(), "abcdef.onion");
+	}
+
+	#[test]
+	fn onion_address_display_and_into_string_match() {
+		let address = OnionAddress::normalized("abcdef");
+		assert_eq!(address.to_string(), "abcdef.onion");
+		let owned: String = address.into();
+		assert_eq!(owned, "abcdef.onion");
+	}
+
+	#[tokio::test]
+	async fn no_skin_passes_requests_through() {
+		use tower::ServiceExt as _;
+
+		let app = apply_skin(Router::new().route("/", get(|| async { "ok" })), SkinChoice::Disabled);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+	}
+
+	#[tokio::test]
+	async fn default_skin_gates_uncleared_requests() {
+		use http_body_util::BodyExt as _;
+		use tower::ServiceExt as _;
+
+		// An uncleared request must be intercepted by the gate and never reach the
+		// app. The secure-default gate answers with the PoW interstitial (a 200 HTML
+		// challenge page), so we assert on the body, not the status: the app's
+		// "secret" must not leak, and the challenge page must be served instead.
+		let app = apply_skin(Router::new().route("/", get(|| async { "secret" })), SkinChoice::Default);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		let body = String::from_utf8_lossy(&body);
+		assert!(!body.contains("secret"), "the gated app response must not leak");
+		assert!(body.contains("Checking your connection"), "the challenge interstitial should be served, got: {body}");
+	}
+
+	#[tokio::test]
+	async fn builder_rejects_missing_router() {
+		// Validation happens before any Tor bootstrap, so this needs no network.
+		let result = OnionService::builder().nickname("no_router").serve().await;
+		let err = result.err().expect("missing router should error");
+		assert!(err.to_string().contains("router not set"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn builder_rejects_missing_nickname() {
+		let app = Router::new().route("/", get(|| async { "hi" }));
+		let result = OnionService::builder().router(app).serve().await;
+		let err = result.err().expect("missing nickname should error");
+		assert!(err.to_string().contains("nickname not set"), "unexpected error: {err}");
+	}
 
 	#[tokio::test]
 	async fn test_serve() {

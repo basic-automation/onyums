@@ -197,49 +197,62 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
 *conventions and glue* that make them feel like one framework.
 
 ### A. Server-rendered MVC core (no-JS-first)
-- **Views — single-file components with a `<rust>` block, async server-rendered.** The default view
-  layer is the SFC, adapted to Rust as **four blocks: `<template>`, `<rust>`, `<style scoped>`, and
-  an optional `<script>`** (for the rare hand-written island JS). The `<rust>` block is the
-  component's logic in a Vue-Composition-API style — reactive signals, computed values, lifecycle
-  stages. Rust can do this: Leptos and Dioxus already ship reactive signals + `#[server]` functions
-  that compile one component to both SSR and hydrated WASM, so the machinery is proven. onyums'
-  contribution is the **SFC file format** plus two opinions those frameworks don't take:
+- **Views — single-file components, async server-rendered.** The default view layer is the SFC,
+  adapted to Rust as **four blocks: `<template>`, `<rust>`, `<style scoped>`, and `<script>`**. Both
+  logic blocks follow Vue's **`<script setup>`** model (top-level setup code, bindings auto-exposed
+  to the template) — there is no Options-API / legacy `<script>` mode to implement:
+  - **`<rust>` is `<script setup>`, in Rust** — its API is a faithful analog of Vue's
+    [Composition API](https://vuejs.org/guide/essentials/lifecycle): `ref` / `reactive` / `computed`
+    / `watch` / `watch_effect` plus the lifecycle hooks (`on_server_prefetch`, `on_mounted`,
+    `on_updated`, `on_before_unmount`, `on_unmounted`, …) as async Rust with the same names and
+    semantics, so a Vue developer's mental model transfers directly.
+  - **`<script>` is `<script setup>`, in JavaScript** — real Vue.js with the full Composition API and
+    runtime.
 
-  - **Lifecycle stage = compile target.** The Composition-API lifecycle is the boundary that routes
-    each part of `<rust>` to one of three targets:
-    - *setup / render* → runs server-side, produces the `<template>`'s HTML;
-    - *server action* (`#[server]`-style fn / form handler) → compiled to an **axum endpoint**,
-      reachable by a plain `<form>` POST (no JS) or `fetch` (JS);
-    - *client island* (mount / effect) → compiled to **WASM**, hydrating only where JS/WASM exists,
-      skipped entirely under Tor "Safest".
+  **The lifecycle hook — not the block — decides where code runs.** This is the crux, and it mirrors
+  how Vue SSR already works: `setup` and `on_server_prefetch` run on the **server** during SSR, while
+  the mount/update/unmount hooks run on the **client** after hydration. onyums applies that same
+  split to *both* logic blocks, so code crosses the server/client line by *hook*, never by tag:
+  - **Server-phase** (`setup`, `on_server_prefetch`) → runs on the server. `<rust>` here is native
+    async Rust (it can `.await` a Turso query, a Tor-client call, or an onyums-skin check directly);
+    `<script>` here is Vue JS executed on the server via an embedded JS engine.
+  - **Client-phase** (`on_mounted`, `on_updated`, `on_unmounted`, …) → runs on the client. `<script>`
+    here is Vue JS in the browser; `<rust>` here is compiled to **WASM**.
+  - **Server actions** (`#[server]`-style fns / form handlers) → compiled to an **axum endpoint**,
+    reached by a plain `<form>` POST (no JS) or `fetch` (JS).
 
-    No-JS-first discipline holds: a component must be fully functional from server-render +
-    server-endpoints alone; WASM islands only *enhance*. The lifecycle line that picks the compile
-    target is the same line that protects the no-JS baseline.
-  - **Async-everywhere, tokio-multithreaded.** The real departure from Leptos/Dioxus, whose reactive
-    cores are *synchronous* (component fns are `fn`, async bolted on via `Resource`/`Suspense`) and
-    often `!Send` / single-thread. In onyums the **server side — setup/render, lifecycle, server
-    actions, and the reactive runtime itself — is async-native and `Send + Sync`, running on the
-    same tokio multithreaded runtime as axum and arti.** So a component's `async` setup can `.await`
-    a Turso query, a Tor-client call, or an onyums-skin check *directly during SSR* — no
-    `Resource`/`Suspense` ceremony — and renders compose across work-stealing threads alongside the
-    rest of the stack. (Honest cost: a `Send + Sync` async reactive runtime is materially harder to
-    build than a thread-local sync one — exactly why Leptos chose `!Send` signals — so this is the
-    deep build of the phase, not a thin wrapper. The client island is necessarily single-threaded
-    browser WASM; the async-multithreaded property is the server-side model.)
+  So *some JavaScript executes on the server, and some Rust executes on the client (WASM)* —
+  determined entirely by the hook the code lives in. **No-JS-first discipline holds:** the server
+  output (server-phase hooks + `<template>`) is fully functional on its own; client-phase code (WASM
+  or Vue JS) only *enhances* and is inert under Tor "Safest". The hook that picks the run target is
+  the same line that protects the no-JS baseline.
 
-  Other Vue/Nuxt cues in the same spirit: file-based routing (a `pages/` directory → axum routes)
-  and layouts/slots. Under the hood the template can still lower onto a Rust engine (`askama`/`maud`)
-  or a purpose-built compiler, but the surface is the SFC.
+  **Async-everywhere, tokio-multithreaded** — the real departure from Leptos/Dioxus, whose reactive
+  cores are *synchronous* (component fns are `fn`; async bolted on via `Resource`/`Suspense`) and
+  often `!Send` / single-thread. In onyums the **server side — setup, lifecycle, server actions, and
+  the reactive runtime itself — is async-native and `Send + Sync` on the same tokio multithreaded
+  runtime as axum and arti**, so server-phase work composes across work-stealing threads with no
+  `Resource`/`Suspense` ceremony.
+
+  **The deep builds** (named honestly): a `Send + Sync` async reactive runtime that mirrors the
+  Composition API (materially harder than a thread-local sync one — why Leptos chose `!Send`
+  signals); a Rust→WASM compile path for client-phase `<rust>`; and a server-side JS engine to run
+  server-phase `<script>` (the pure-Rust `boa` is the on-brand option, though immature — otherwise a
+  heavier embedded engine). These are the headline bet of the phase.
+
+  Other Vue/Nuxt cues in the same spirit: file-based routing (a `pages/` directory → axum routes) and
+  layouts/slots. The `<template>` can still lower onto a Rust engine (`askama`/`maud`) or a
+  purpose-built compiler under the hood, but the surface is the SFC.
 
   ```
-  <template>      <!-- HTML, directives, slots -->
-  <rust>          // async, Send+Sync composition logic; lifecycle stage → compile target
+  <template>      <!-- HTML, directives, slots; the shared server/client contract -->
+  <rust>          // <script setup> in Rust (Composition-API analog), async + Send+Sync
   <style scoped>
-  <script>        <!-- optional, rare island JS -->
+  <script>        // <script setup> in real Vue.js
   ```
-  *Build (the SFC compiler + an async/multithreaded signal & lifecycle runtime) — the headline DX
-  bet of this phase, and the clearest "abstraction over axum" of the framework layer.*
+  Where each line of `<rust>` / `<script>` runs — server, client/WASM, or an axum endpoint — is set
+  by its lifecycle hook, not by which block it is in. *Build — the clearest "abstraction over axum"
+  of the framework layer.*
 - **Typed forms + validation** — `axum::Form` extraction + `garde` / `validator`, with
   server-rendered error re-rendering (Laravel Form Requests / Phoenix changesets). The no-JS form is
   the primary UI, not a fallback. *Reuse + glue.*

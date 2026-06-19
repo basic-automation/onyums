@@ -84,14 +84,9 @@ async fn get_and_store_onion_name(service: &Arc<RunningOnionService>) -> Result<
 	let service_name = service.onion_address().ok_or_else(|| anyhow::anyhow!("Failed to get onion service name."))?.display_unredacted().to_string();
 	event!(Level::INFO, "Onion service name: {service_name}");
 
-	// Ensure we store the name with .onion suffix, but not double .onion
-	let clean_name = if service_name.ends_with(".onion.onion") {
-		service_name.strip_suffix(".onion").unwrap_or(&service_name).to_string()
-	} else if !service_name.ends_with(".onion") {
-		format!("{service_name}.onion")
-	} else {
-		service_name
-	};
+	// Normalize to exactly one trailing `.onion` suffix (handles a bare name, a single
+	// suffix, or any accidental repetition).
+	let clean_name = format!("{}.onion", service_name.trim_end_matches(".onion"));
 
 	event!(Level::INFO, "Cleaned onion service name: {clean_name}");
 	ONION_NAME.lock().await.clone_from(&clean_name);
@@ -183,7 +178,7 @@ async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsA
 	let connect_info = ConnectionInfo { circuit_id: None, socket_addr: None };
 
 	// Accept the TLS connection, logging the specific error on failure
-	let tls_onion_service_stream = tls_acceptor.accept(onion_service_stream).await.map_err(|e| anyhow::anyhow!("failed to accept TLS stream: {:?}", e))?;
+	let tls_onion_service_stream = tls_acceptor.accept(onion_service_stream).await.map_err(|e| anyhow::anyhow!("failed to accept TLS stream: {e:?}"))?;
 
 	// Wrap the stream in a `TokioIo` to make it compatible with tokio's `AsyncRead` and `AsyncWrite`.
 	event!(Level::INFO, "Wrapping the stream for tokio compatibility...");
@@ -252,15 +247,15 @@ fn tls_acceptor() -> Result<TlsAcceptor> {
 	let key_der = match PrivatePkcs8KeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()) {
 		Ok(key_der) => PrivateKeyDer::Pkcs8(key_der),
 		Err(e) => {
-			event!(Level::ERROR, "Error converting key to der: {:?}", e);
-			bail!(format!("Error converting key to der: {:?}", e))
+			event!(Level::ERROR, "Error converting key to der: {e:?}");
+			bail!(format!("Error converting key to der: {e:?}"))
 		}
 	};
 	let server_config = match rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], key_der) {
 		Ok(server_config) => server_config,
 		Err(e) => {
-			event!(Level::ERROR, "Error creating server config: {:?}", e);
-			bail!(format!("Error creating server config: {:?}", e))
+			event!(Level::ERROR, "Error creating server config: {e:?}");
+			bail!(format!("Error creating server config: {e:?}"))
 		}
 	};
 	let acceptor = TlsAcceptor::from(Arc::new(server_config));
@@ -277,7 +272,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 			// Only handle port 443 for TLS
 			handle_tls_connection(stream_request, tls_acceptor, app).await
 		}
-		IncomingStreamRequest::Begin(_begin) if _begin.port() == 80 => {
+		IncomingStreamRequest::Begin(begin) if begin.port() == 80 => {
 			// Handle Port 80 (Plain HTTP) - Redirect to HTTPS
 			let onion_name = get_onion_name();
 			handle_http_redirect(stream_request, onion_name).await

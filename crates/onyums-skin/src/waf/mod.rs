@@ -6,11 +6,11 @@
 //! (path + query), and header values. `RegexSet` matches every pattern in a single
 //! pass and uses `aho-corasick` internally for literal prefiltering, so adding more
 //! signatures stays cheap. The starter ruleset covers the classic signature classes
-//! (SQLi / XSS / path traversal / protocol anomalies); it is **not** OWASP-CRS-complete
-//! — the 100%-Rust rule (no Coraza/ModSecurity FFI) means CRS coverage is reached by
-//! porting rules into this engine, never by linking a foreign one. Rules are
-//! operator-extensible: [`Waf::new`] takes any rule iterator, so a caller can extend
-//! [`starter_rules`] with its own.
+//! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection /
+//! protocol anomalies); it is **not** OWASP-CRS-complete — the 100%-Rust rule (no
+//! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
+//! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
+//! takes any rule iterator, so a caller can extend [`starter_rules`] with its own.
 //!
 //! Inspection runs each field **twice**: once over the raw string as received, then,
 //! if the field was percent-encoded, once more over its decoded form — so an attack
@@ -49,8 +49,10 @@ pub enum WafCategory {
 	Sqli,
 	/// Cross-site scripting.
 	Xss,
-	/// Path / directory traversal.
+	/// Path / directory traversal (and local/remote file-inclusion wrappers).
 	PathTraversal,
+	/// OS command injection (shell metacharacters chaining a command).
+	CommandInjection,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
@@ -63,6 +65,7 @@ impl WafCategory {
 			Self::Sqli => "sqli",
 			Self::Xss => "xss",
 			Self::PathTraversal => "path_traversal",
+			Self::CommandInjection => "command_injection",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -321,17 +324,27 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_or_tautology", category: WafCategory::Sqli, pattern: r#"(?i)\bor\b\s+['"]?\s*\d+\s*=\s*\d+"# },
 		Rule { id: "sqli_stacked_query", category: WafCategory::Sqli, pattern: r"(?i);\s*(drop|delete|update|insert|truncate)\b" },
 		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r"(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)" },
+		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
+		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
-		Rule { id: "xss_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(error|load|click|mouseover)\s*=" },
-		// --- Path / directory traversal ---
+		Rule { id: "xss_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(error|load|click|mouseover|focus|toggle)\s*=" },
+		Rule { id: "xss_iframe_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*iframe\b" },
+		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
+		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
 		Rule { id: "traversal_sensitive_file", category: WafCategory::PathTraversal, pattern: r"(?i)(/etc/passwd|/etc/shadow|boot\.ini|win\.ini)" },
+		Rule { id: "traversal_proc_self", category: WafCategory::PathTraversal, pattern: r"(?i)/proc/self/(environ|cmdline|fd|maps)" },
+		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
+		// --- OS command injection ---
+		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
+		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
+		Rule { id: "anomaly_shellshock", category: WafCategory::ProtocolAnomaly, pattern: r"\(\)\s*\{" },
 	]
 }
 
@@ -437,6 +450,55 @@ mod tests {
 	fn category_names_are_stable() {
 		assert_eq!(WafCategory::Sqli.name(), "sqli");
 		assert_eq!(WafCategory::PathTraversal.name(), "path_traversal");
+		assert_eq!(WafCategory::CommandInjection.name(), "command_injection");
+		assert_eq!(WafCategory::ProtocolAnomaly.name(), "protocol_anomaly");
+	}
+
+	#[test]
+	fn extended_sqli_rules_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 AND SLEEP(5)", "target").unwrap().rule_id, "sqli_time_based");
+		assert_eq!(waf.inspect_str("UNION SELECT table_name FROM information_schema.tables", "target").map(|m| m.category), Some(WafCategory::Sqli));
+	}
+
+	#[test]
+	fn extended_xss_rules_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("<iframe src=//evil", "target").unwrap().rule_id, "xss_iframe_tag");
+		assert_eq!(waf.inspect_str("href=data:text/html;base64,PHN2Zz4=", "target").unwrap().rule_id, "xss_data_html_uri");
+	}
+
+	#[test]
+	fn file_inclusion_wrappers_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("page=php://filter/convert.base64-encode/resource=x", "target").unwrap().category, WafCategory::PathTraversal);
+		assert_eq!(waf.inspect_str("file=/proc/self/environ", "target").unwrap().rule_id, "traversal_proc_self");
+	}
+
+	#[test]
+	fn command_injection_rules_match() {
+		let waf = Waf::starter();
+		let m = waf.inspect_str("q=test;cat /etc/hosts", "target").unwrap();
+		assert_eq!(m.category, WafCategory::CommandInjection);
+		assert_eq!(m.rule_id, "cmdi_shell_command");
+		assert_eq!(waf.inspect_str("cmd=/bin/sh -c whoami", "target").unwrap().rule_id, "cmdi_path_bin");
+	}
+
+	#[test]
+	fn shellshock_signature_matches() {
+		let waf = Waf::starter();
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "() { :; }; echo vuln".parse().unwrap());
+		assert_eq!(blocked(&waf.inspect(&p)).rule_id, "anomaly_shellshock");
+	}
+
+	#[test]
+	fn extended_rules_keep_false_positives_low() {
+		// A handful of benign requests that brush near the new rules must still pass.
+		let waf = Waf::starter();
+		for uri in ["/blog/data-structures-101", "/shop/cats-and-dogs", "/docs/php-vs-python", "/files/binary-data"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

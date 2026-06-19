@@ -191,6 +191,15 @@ onion service *better* than it fits the clearnet:
    avoid external services (Redis, S3, SMTP) for anonymity and operational simplicity. Rails 8's
    "Solid" direction — DB-backed queue/cache/cable, SQLite in production, no Redis — maps onto that
    exactly. **The organizing rule for this phase: every battery must run with no external daemon.**
+3. **Spend the Tor latency budget wisely.** A Tor round-trip is expensive — multi-hop plus
+   rendezvous, often hundreds of milliseconds — and that single constraint shapes the whole
+   framework layer more than any other. It is, again, an argument *for* server-rendered MVC: one
+   round-trip returns a whole page, where a chatty SPA pays the RTT on every API call. Concretely it
+   means: prefer a full server render over many small client→server fetches; **parallelize the
+   `on_server_prefetch` `.await`s** (the async runtime makes this free) so SSR data-loading is one
+   fan-out, not a sequential waterfall; keep reactive/live updates **coarse-grained and batched**,
+   never per-keystroke; and lean on **optimistic UI in the client islands** to hide the RTT where an
+   action is going to succeed anyway. Design every feature in this phase against that budget.
 
 Consistent with onyums' frontier posture, these ship wired-up and convention-first, not as a bag of
 optional parts. Where a mature pure-Rust crate exists we **reuse**; the value onyums adds is the

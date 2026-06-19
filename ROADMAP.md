@@ -256,6 +256,13 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   layouts/slots. The `<template>` can still lower onto a Rust engine (`askama`/`maud`) or a
   purpose-built compiler under the hood, but the surface is the SFC.
 
+  **Platform primitives where they fit.** `<style scoped>` can compile to **Declarative Shadow DOM**
+  (`<template shadowrootmode>`) — real style encapsulation rendered *server-side* with no JS and no
+  build-time attribute rewriting. And a **custom element** is the natural island/hydration boundary:
+  the server emits `<onyums-…>baseline</onyums-…>` (graceful, un-upgraded HTML that works with JS
+  off) and the `<rust>`→WASM / Vue `<script>` island *upgrades* it where JS exists. (DSD needs a
+  recent Firefox ESR, so confirm the current Tor Browser ESR baseline supports it.)
+
   ```
   <template>      <!-- HTML, directives, slots; the shared server/client contract -->
   <rust>          // <script setup> in Rust (Composition-API analog), async + Send+Sync
@@ -290,18 +297,27 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
 - **Flash messages + CSRF** — signed/encrypted-cookie flash and per-form CSRF tokens, on by default
   for state-changing requests (Rails/Laravel parity). `axum-extra` cookies + a CSRF layer.
   *Reuse + small build.*
-- **Live / reactive enhancement (WS- or SSE-over-Tor, enhancement-only)** — server-authoritative
-  reactive state: the server owns the state and pushes diffs/patches over a WebSocket (or SSE for
-  one-way streams) over Tor — onyums already ships WS-over-Tor — to a client island (`<rust>`→WASM
-  or the Vue `<script>`) that applies them. This is the Phoenix-LiveView idea, bound by the
-  no-JS-first discipline: it is **strictly an enhancement**. Every interaction must also keep a
-  plain server path (a `<form>` POST / link), so a no-JS client gets the full server-rendered
-  baseline and simply no live updates — a naive LiveView clone, where the primary UX *only* works
-  through the socket, is the thing we don't build. Tor-aware by construction: Tor's RTT is high, so
-  updates are **coarse-grained and batched** (not per-keystroke diffs); the island reconnects and
-  resyncs state when a rendezvous circuit drops; and the per-connection cost (an open circuit +
-  server-side state per client) sits behind the onyums-skin gate. SSE is the lighter default for
-  server→client-only streams. *Build — the live counterpart of the SFC islands.*
+- **Live / reactive enhancement (transport-tiered, server-authoritative).** The server owns the
+  reactive state and *projects* it onto whichever push channel the client can consume — one state,
+  three tiers that degrade gracefully:
+  - **Tier 1 — JS / WASM:** a **WebSocket** (or SSE for one-way) over Tor — onyums already ships
+    WS-over-Tor — feeding a client island (`<rust>`→WASM or Vue `<script>`) that applies fine-grained
+    diffs. Bidirectional, lowest-latency.
+  - **Tier 2 — no JS, streaming-capable:** a **chunked-HTML stream** or **`multipart/x-mixed-replace`**
+    delivered into an **`<iframe>` live-region** — the server pushes coarse fragment updates with
+    *zero script*. This is the part LiveView/Hotwire don't attempt: live updates that survive JS
+    being off.
+  - **Tier 3 — floor:** `<meta http-equiv="refresh">` polling — whole-page reload, holds no
+    connection, and is the only **drop-resilient** tier (each poll is a fresh request), which over
+    Tor's flaky circuits is a feature, not a bug.
+
+  Still the Phoenix-LiveView idea, but bound by no-JS-first: **strictly an enhancement over a
+  baseline that already works** — every interaction also keeps a plain server path (`<form>` POST /
+  link), and a naive LiveView clone whose primary UX *only* works through the socket is the thing we
+  don't build. Tor-aware by construction: high RTT → updates are **coarse-grained and batched**
+  (never per-keystroke); tiers 1–2 hold an open circuit + server-side state per client (skin-gated)
+  and can't self-reconnect without script, so a dropped circuit stalls them until reload — tier 3 is
+  the robust fallback. *Build — the live counterpart of the SFC islands.*
 
   > **Experiment (near-term, ahead of the rest of this phase).** WS-over-Tor already works, so the
   > riskiest assumption here — that Tor's latency budget permits a *usable* server-driven reactive
@@ -309,7 +325,11 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   > prototype (server-authoritative state → diff pushed over a Tor WebSocket → a tiny client island
   > applies it) and measure on the live network: the real round-trip latency of one state update;
   > how long a rendezvous-circuit-backed WS stays up and how often it drops; the reconnect +
-  > state-resync cost; and how coarse the update granularity must be to feel acceptable. The output
+  > state-resync cost; and how coarse the update granularity must be to feel acceptable. Also
+  > exercise the **no-JS tiers** — a chunked-HTML / `multipart/x-mixed-replace` stream into an
+  > `<iframe>` live-region, plus `<meta refresh>` polling — measuring their update latency and how
+  > they behave when a circuit drops, and **confirm the current Tor Browser ESR supports Declarative
+  > Shadow DOM** (the baseline for `<style scoped>`). The output
   > is an empirical finding that confirms or refutes the "coarse, batched, optimistic-UI" design
   > above and sets concrete update-granularity guidance for the full build — a cheap way to de-risk
   > Phase 5's most uncertain piece early.

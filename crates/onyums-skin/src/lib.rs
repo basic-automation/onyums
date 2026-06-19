@@ -29,7 +29,9 @@ pub mod ratelimit;
 pub use challenge::{
 	Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
 };
-pub use circuit::{AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, StreamTarget};
+pub use circuit::{
+	AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock
+};
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use ratelimit::{Quota, SkinRateLimit};

@@ -237,8 +237,11 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   **The deep builds** (named honestly): a `Send + Sync` async reactive runtime that mirrors the
   Composition API (materially harder than a thread-local sync one — why Leptos chose `!Send`
   signals); a Rust→WASM compile path for client-phase `<rust>`; and a server-side JS engine to run
-  server-phase `<script>` (the pure-Rust `boa` is the on-brand option, though immature — otherwise a
-  heavier embedded engine). These are the headline bet of the phase.
+  server-phase `<script>`. Engine options (early 2026): the pure-Rust **`boa`** is on-brand but must
+  be proven able to host Vue's SSR runtime (still maturing); **`rquickjs`** (QuickJS) is the
+  pragmatic middle — far more complete, but C FFI; **`deno_core`/`rusty_v8`** (V8) is fast and
+  fully-spec, at the cost of a C++ FFI build; the pure-Rust newcomers **`Nova`** and **`Kiesel`** are
+  worth tracking but not yet ready. These are the headline bet of the phase.
 
   Other Vue/Nuxt cues in the same spirit: file-based routing (a `pages/` directory → axum routes) and
   layouts/slots. The `<template>` can still lower onto a Rust engine (`askama`/`maud`) or a
@@ -253,6 +256,25 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   Where each line of `<rust>` / `<script>` runs — server, client/WASM, or an axum endpoint — is set
   by its lifecycle hook, not by which block it is in. *Build — the clearest "abstraction over axum"
   of the framework layer.*
+
+  **Worked examples** (aspirational `.onyx` targets, not yet compilable):
+  - [`examples/guestbook.onyx`](examples/guestbook.onyx) — a full page using all five blocks: a
+    server `<rust>` `on_server_prefetch` + `#[server]` actions, a no-JS `<form>` POST, a client-phase
+    WASM auto-refresh island, and a Vue `<script>` live counter.
+  - [`examples/components/Disclosure.onyx`](examples/components/Disclosure.onyx) — a reusable child
+    with typed props, named + default **slots**, and a **`<rust>`-only WASM island** (ships zero JS;
+    no-JS baseline is a native `<details>`).
+  - [`examples/components/Markdown.onyx`](examples/components/Markdown.onyx) — **server-rendered
+    JavaScript**: a Vue `<script>` whose `onServerPrefetch` (a server-phase hook) runs `marked` in
+    the embedded JS engine during SSR, so the HTML is in the server response and shows with client JS
+    disabled. The mirror image of Disclosure's Rust-on-the-client: here it's JS-on-the-server, and
+    the lifecycle hook is what decides:
+
+    ```js
+    // <script> (real Vue.js) — onServerPrefetch runs on the SERVER via the embedded engine
+    import { marked } from 'marked'
+    onServerPrefetch(() => { html.value = sanitize(marked.parse(props.source)) })
+    ```
 - **Typed forms + validation** — `axum::Form` extraction + `garde` / `validator`, with
   server-rendered error re-rendering (Laravel Form Requests / Phoenix changesets). The no-JS form is
   the primary UI, not a fallback. *Reuse + glue.*

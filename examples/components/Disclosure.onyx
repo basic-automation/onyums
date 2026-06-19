@@ -1,0 +1,65 @@
+<!--
+  examples/components/Disclosure.onyx — ASPIRATIONAL onyums SFC (Phase-5 target; not compilable yet).
+
+  A small, REUSABLE child component. Demonstrates:
+    • typed props (`title`, `open`)
+    • slots: a named `summary` slot (falling back to the `title` prop) + a default content slot
+    • a <rust>-ONLY client island — the only enhancement is Rust→WASM, so this component ships
+      ZERO JavaScript (no <script> block at all)
+    • no-JS baseline for free: it renders a native <details>/<summary>, which is collapsible
+      with JavaScript fully disabled (Tor "Safest"); the WASM island only *adds* state persistence.
+
+  Usage from a parent component:
+    <Disclosure title="Connection details">
+      <template #summary><strong>Connection details</strong></template>
+      <p>This service is reachable only over Tor.</p>
+    </Disclosure>
+-->
+
+<template>
+  <details class="disclosure" :open="open">
+    <summary>
+      <!-- named slot, defaults to the `title` prop when the parent supplies nothing -->
+      <slot name="summary">{{ title }}</slot>
+    </summary>
+    <div class="disclosure-body">
+      <slot /> <!-- default slot: the collapsible content -->
+    </div>
+  </details>
+</template>
+
+<rust>
+// `<rust>` == `<script setup>`, in Rust. No <script> block — this component's only
+// enhancement is a Rust→WASM island, so nothing JS is shipped for it.
+use onyums::prelude::*;
+
+#[derive(Props)]
+struct Props {
+    title: String,
+    #[prop(default = false)]
+    open: bool,
+}
+let props = define_props::<Props>();
+
+// Reactive mirror of the prop so the island can drive the `:open` binding.
+let open = ref(props.open);
+
+// CLIENT-PHASE (WASM): persist the open/closed state across visits in localStorage.
+// The no-JS baseline already works (native <details>); this only remembers the choice.
+on_mounted(|| {
+    let key = format!("disclosure:{}", props.title);
+    if let Some(saved) = local_storage().get(&key) {
+        open.set(saved == "open");
+    }
+    // `watch` is the Composition-API analog: re-run when `open` changes.
+    watch(open, move |is_open| {
+        local_storage().set(&key, if *is_open { "open" } else { "closed" });
+    });
+});
+</rust>
+
+<style scoped>
+.disclosure { border: 1px solid var(--muted); border-radius: .375rem; padding: .5rem .75rem; }
+.disclosure > summary { cursor: pointer; font-weight: 600; }
+.disclosure-body { margin-block-start: .5rem; }
+</style>

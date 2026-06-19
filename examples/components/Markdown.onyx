@@ -1,0 +1,46 @@
+<!--
+  examples/components/Markdown.onyx — ASPIRATIONAL onyums SFC (Phase-5 target; not compilable yet).
+
+  THE POINT OF THIS EXAMPLE: server-rendered JavaScript.
+
+  This component has NO <rust> block — it is authored entirely in Vue's <script>. But because
+  `onServerPrefetch` is a SERVER-PHASE lifecycle hook, that JavaScript runs in onyums' embedded
+  JS engine (boa / rquickjs / V8) DURING SSR — not in the browser. So a mature JS library
+  (`marked` + `DOMPurify`) renders Markdown → sanitized HTML at render time, the result lands in
+  the server response, and it is visible with client JS fully disabled (Tor "Safest").
+
+  This is the flip side of Disclosure.onyx (Rust running on the client as WASM): here JavaScript
+  runs on the server. The compile/run target is set by the lifecycle hook, never by the block —
+  reusing the JS ecosystem's rendering libraries at SSR time is exactly why server-phase <script>
+  exists.
+
+  Usage:  <Markdown :source="post.body" />
+-->
+
+<template>
+  <!-- `html` was produced on the server by the <script> below; v-html injects it. -->
+  <article class="md" v-html="html"></article>
+</template>
+
+<script>
+// Real Vue.js <script setup>, in JavaScript.
+import { ref, onServerPrefetch } from 'vue'
+import { marked } from 'marked'
+import DOMPurify from 'dompurify'
+
+const props = defineProps({ source: { type: String, required: true } })
+const html = ref('')
+
+// SERVER-PHASE hook → executes in the embedded JS engine during SSR (NOT the browser).
+// The rendered, sanitized HTML is baked into the server response, so no client JS is
+// needed to see the formatted Markdown.
+onServerPrefetch(() => {
+  html.value = DOMPurify.sanitize(marked.parse(props.source))
+})
+</script>
+
+<style scoped>
+.md :is(h1, h2, h3) { line-height: 1.2; }
+.md pre { overflow-x: auto; padding: .75rem; border-radius: .375rem; background: var(--accent-soft); }
+.md code { font-family: ui-monospace, monospace; }
+</style>

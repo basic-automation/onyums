@@ -9,6 +9,7 @@ use axum::{http::request::Parts, response::Response};
 
 use crate::clearance::ClearanceLevel;
 
+pub mod patience;
 pub mod pow;
 
 /// Outcome of presenting/evaluating a gate.

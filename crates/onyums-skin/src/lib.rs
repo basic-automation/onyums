@@ -26,6 +26,7 @@ pub mod clearance;
 pub mod difficulty;
 pub mod layer;
 pub mod ratelimit;
+pub mod waf;
 
 pub use challenge::{
 	Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
@@ -37,3 +38,4 @@ pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStor
 pub use difficulty::AdaptiveDifficulty;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use ratelimit::{Quota, SkinRateLimit};
+pub use waf::{Rule, Verdict, Waf, WafCategory, WafMatch};

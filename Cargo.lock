@@ -2877,6 +2877,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "rand 0.9.4",
+ "regex",
  "sha2",
  "tokio",
  "tower-layer",

@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-19 (run 2) — onyums-skin Phase 3 WAF: normalization, body inspection, ruleset (4 increments)
 
-Branch `routine/onyums-2026-06-19-2` → PR (base `master`). Same-day rerun: the
+Branch `routine/onyums-2026-06-19-2` → PR [#8](https://github.com/basic-automation/onyums/pull/8)
+(base `master`). Same-day rerun: the
 morning's run finished onyums-skin Phase 2 and opened Phase 3, merged as PR #7
 (`master` head `d13db24`); this run branched fresh off updated `master`. The
 onyums-side Phase 2 `CircuitPolicy` wiring is still **blocked** on a live-Tor

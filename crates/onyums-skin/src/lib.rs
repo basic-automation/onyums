@@ -15,6 +15,7 @@
 pub mod challenge;
 pub mod circuit;
 pub mod clearance;
+pub mod layer;
 pub mod ratelimit;
 
 pub use challenge::{
@@ -22,4 +23,5 @@ pub use challenge::{
 };
 pub use circuit::{CircuitAction, CircuitId, CircuitPolicy, StreamTarget};
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
+pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use ratelimit::{Quota, SkinRateLimit};

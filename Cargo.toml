@@ -18,6 +18,7 @@ tor-cert = "0.43.0"
 tokio = { version = "1.52.3", features = ["full"] }
 axum = { version = "0.8.9", features = ["http2"] }
 tower-service = "0.3.3"
+tower-layer = "0.3.3"
 tracing = "0.1.44"
 rcgen = "0.14.8"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }

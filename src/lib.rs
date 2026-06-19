@@ -25,7 +25,9 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http_body_util::Empty;
 use hyper::{body::Incoming, Request, Response, StatusCode};
-use hyper_util::rt::{TokioExecutor, TokioIo};
+use hyper_util::{
+	rt::{TokioExecutor, TokioIo}, service::TowerToHyperService
+};
 use tokio::sync::Mutex;
 use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, RendRequest, RunningOnionService, StreamRequest};
@@ -187,25 +189,19 @@ async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsA
 	event!(Level::INFO, "Wrapping the stream for tokio compatibility...");
 	let stream = TokioIo::new(tls_onion_service_stream);
 
-	// Hyper also has its own `Service` trait and doesn't use tower. We can use `hyper::service::service_fn` to create a hyper `Service` that calls our app through `tower::Service::call`.
-	let hyper_service = hyper::service::service_fn(move |request: Request<Incoming>| {
-		// We have to clone `tower_service` because hyper's `Service` uses `&self` whereas tower's `Service` requires `&mut self`.
-		// We don't need to call `poll_ready` since `Router` is always ready.
-		let connect_info = connect_info.clone();
-		let app = app.clone();
-		std::thread::spawn(move || {
-			event!(Level::INFO, "Creating tokio runtime...");
-			let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+	// Build the per-connection axum service once, on the current tokio runtime. The
+	// previous implementation spawned a fresh OS thread *and* a new current-thread
+	// runtime for every hyper request just to drive this `async` setup, joining the
+	// thread before returning the response future — a correctness and throughput
+	// landmine. `IntoMakeServiceWithConnectInfo` is always ready, so we can await it
+	// directly here and reuse the resulting tower service across every request on this
+	// connection (keep-alive included).
+	let mut make_service = app.into_make_service_with_connect_info::<ConnectionInfo>();
+	let tower_service = make_service.call(connect_info).await.expect("IntoMakeServiceWithConnectInfo is infallible");
 
-			#[allow(clippy::async_yields_async)]
-			runtime.block_on(async {
-				event!(Level::INFO, "Serving connection...");
-				app.clone().into_make_service_with_connect_info::<ConnectionInfo>().call(connect_info.clone()).await.unwrap().call(request)
-			})
-		})
-		.join()
-		.unwrap()
-	});
+	// Bridge the tower service into hyper's own `Service` trait without any thread or
+	// runtime juggling.
+	let hyper_service = TowerToHyperService::new(tower_service);
 
 	// Serve the connection with hyper's `auto::Builder`.
 	event!(Level::INFO, "Serving the connection with hyper...");

@@ -23,6 +23,7 @@
 pub mod challenge;
 pub mod circuit;
 pub mod clearance;
+pub mod difficulty;
 pub mod layer;
 pub mod ratelimit;
 
@@ -33,5 +34,6 @@ pub use circuit::{
 	AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock
 };
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
+pub use difficulty::AdaptiveDifficulty;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use ratelimit::{Quota, SkinRateLimit};

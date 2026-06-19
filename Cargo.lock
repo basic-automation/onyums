@@ -2854,6 +2854,7 @@ dependencies = [
  "safelog",
  "tokio",
  "tokio-rustls",
+ "tokio-util",
  "tor-cell",
  "tor-cert",
  "tor-hsservice",

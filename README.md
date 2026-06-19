@@ -13,27 +13,43 @@ Onyums is a simple axum wrapper for serving tor onion services. It provides the 
 
 
 ## Hello world example
+
+The one-line `serve()` entry point still works and blocks until the service stops:
+
 ```rust
 use onyums::{serve, routing::get, Router};
 
 #[tokio::main]
 async fn main() {
-	// spawn an onyums server on a new thread and return the onion address
-	tokio::spawn(async {
-		let app = Router::new().route("/", axum_get(|| async { "Hello, World!" }));
-		serve(app, "my_onion").await.unwrap();
-	});
+	let app = Router::new().route("/", get(|| async { "Hello, World!" }));
+	serve(app, "my_onion").await.unwrap();
+}
+```
 
-        // wait until `get_onion_name()` returns a non-empty String
-        // then the server is ready
-        let mut onion_name = String::new();
-        while onion_name.is_empty() {
-		onion_name = get_onion_name();
+For the address and a real readiness signal, use the builder. It returns an
+`OnionServiceHandle` once the address is known; `ready()` resolves when the
+descriptor is published and the service is actually reachable (no more polling a
+global), and `shutdown()` stops it gracefully:
 
-                // wait for 200 milliseconds before checking again
-                tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-	}
-	println!("Onion Address: {onion_name}");
+```rust
+use onyums::{OnionService, routing::get, Router};
+
+#[tokio::main]
+async fn main() {
+	let app = Router::new().route("/", get(|| async { "Hello, World!" }));
+
+	let handle = OnionService::builder()
+		.router(app)
+		.nickname("my_onion")
+		.serve()
+		.await
+		.unwrap();
+
+	handle.ready().await; // descriptor published, reachable
+	println!("Onion Address: {}", handle.onion_address());
+
+	// ... serve for a while ...
+	handle.shutdown().await; // graceful stop
 }
 ```
 ****

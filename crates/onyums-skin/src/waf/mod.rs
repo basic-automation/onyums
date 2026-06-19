@@ -6,17 +6,23 @@
 //! (path + query), and header values. `RegexSet` matches every pattern in a single
 //! pass and uses `aho-corasick` internally for literal prefiltering, so adding more
 //! signatures stays cheap. The starter ruleset covers the classic signature classes
-//! (SQLi / XSS / path traversal / protocol anomalies); it is **not** OWASP-CRS-complete
-//! — the 100%-Rust rule (no Coraza/ModSecurity FFI) means CRS coverage is reached by
-//! porting rules into this engine, never by linking a foreign one. Rules are
-//! operator-extensible: [`Waf::new`] takes any rule iterator, so a caller can extend
-//! [`starter_rules`] with its own.
+//! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection /
+//! protocol anomalies); it is **not** OWASP-CRS-complete — the 100%-Rust rule (no
+//! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
+//! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
+//! takes any rule iterator, so a caller can extend [`starter_rules`] with its own.
 //!
-//! Inspection is over the **raw** request strings (the target as received, header
-//! values as received); it does not percent- or otherwise decode first, so an attack
-//! hidden behind encoding (`%3Cscript%3E`) is not yet caught. Normalization /
-//! decode-before-match is a deliberate later slice — encoded-payload coverage and the
-//! double-decoding evasion it invites deserve their own treatment.
+//! Inspection runs each field **twice**: once over the raw string as received, then,
+//! if the field was percent-encoded, once more over its decoded form — so an attack
+//! hidden behind a single encoding layer (`%3Cscript%3E`, `..%2f`) is caught by the
+//! same rules as its plaintext twin. Decoding iterates to a fixed point (capped at
+//! [`MAX_DECODE_PASSES`]); input that needs **more than one** pass to settle is
+//! *multiply* percent-encoded — a classic evasion tell (`%252e%252e%252f`) with no
+//! legitimate use over an onion service — and is blocked outright as a protocol anomaly
+//! (rule id [`MULTI_ENCODING_RULE_ID`]). That guard is on by default and can be relaxed
+//! with [`Waf::block_multi_encoded`]; with it off, the fully-decoded form is still
+//! matched against the ruleset, so the payload is usually caught anyway, just attributed
+//! to its specific rule rather than to the evasion attempt.
 //!
 //! The engine is wired ahead of the gate in the [`SkinLayer`](crate::layer) layer
 //! order (WAF → clearance → challenge → rate-limit); it is off unless a [`Waf`] is
@@ -26,6 +32,16 @@
 use axum::http::request::Parts;
 use regex::RegexSet;
 
+/// Maximum number of percent-decode passes [`normalize`] performs before giving up.
+/// One pass peels a single encoding layer; reaching this cap means the input was
+/// multiply encoded (or maliciously deep) and is treated as evasive regardless.
+pub const MAX_DECODE_PASSES: usize = 4;
+
+/// The synthetic rule id reported when input is blocked for being multiply
+/// percent-encoded (see [`Waf::block_multi_encoded`]). It is not part of
+/// [`starter_rules`] — the engine emits it directly.
+pub const MULTI_ENCODING_RULE_ID: &str = "anomaly_multiple_encoding";
+
 /// The signature class a rule belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WafCategory {
@@ -33,8 +49,10 @@ pub enum WafCategory {
 	Sqli,
 	/// Cross-site scripting.
 	Xss,
-	/// Path / directory traversal.
+	/// Path / directory traversal (and local/remote file-inclusion wrappers).
 	PathTraversal,
+	/// OS command injection (shell metacharacters chaining a command).
+	CommandInjection,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
@@ -47,6 +65,7 @@ impl WafCategory {
 			Self::Sqli => "sqli",
 			Self::Xss => "xss",
 			Self::PathTraversal => "path_traversal",
+			Self::CommandInjection => "command_injection",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -90,6 +109,13 @@ pub struct Waf {
 	set: RegexSet,
 	/// Metadata for each pattern, in the same order passed to the [`RegexSet`].
 	meta: Vec<(&'static str, WafCategory)>,
+	/// When true (default), input requiring more than one percent-decode pass to reach a
+	/// fixed point is blocked outright as a [`WafCategory::ProtocolAnomaly`].
+	block_multi_encoded: bool,
+	/// When `Some(cap)`, request bodies are inspected up to `cap` bytes (the host layer
+	/// buffers that much before forwarding). `None` (default) leaves bodies uninspected —
+	/// body inspection means buffering, a request-handling cost the operator opts into.
+	body_inspection: Option<usize>,
 }
 
 impl Waf {
@@ -102,7 +128,47 @@ impl Waf {
 		let rules: Vec<Rule> = rules.into_iter().collect();
 		let set = RegexSet::new(rules.iter().map(|r| r.pattern))?;
 		let meta = rules.iter().map(|r| (r.id, r.category)).collect();
-		Ok(Self { set, meta })
+		Ok(Self { set, meta, block_multi_encoded: true, body_inspection: None })
+	}
+
+	/// Set whether multiply percent-encoded input is blocked outright as a protocol
+	/// anomaly (default `true`). With it `false`, the engine still matches the
+	/// fully-decoded form against the ruleset — so the payload is usually caught anyway,
+	/// just attributed to its specific rule rather than to the evasion attempt.
+	#[must_use]
+	pub fn block_multi_encoded(mut self, block: bool) -> Self {
+		self.block_multi_encoded = block;
+		self
+	}
+
+	/// Enable request-**body** inspection, buffering and scanning up to `max_bytes` of the
+	/// body (default: off). The host [`SkinLayer`](crate::layer) buffers at most this many
+	/// bytes of a forwarded request's body before passing it on; a body that exceeds the
+	/// cap is refused (`413`). Off by default because buffering is a per-request cost and a
+	/// hard size cap is a behaviour change the operator should choose explicitly.
+	#[must_use]
+	pub fn inspect_body_up_to(mut self, max_bytes: usize) -> Self {
+		self.body_inspection = Some(max_bytes);
+		self
+	}
+
+	/// The configured body-inspection byte cap, or `None` if body inspection is off.
+	#[must_use]
+	pub fn body_cap(&self) -> Option<usize> {
+		self.body_inspection
+	}
+
+	/// Inspect a request body's bytes with the same rules and normalization as every
+	/// other field. The bytes are interpreted as UTF-8 lossily (so a binary body still
+	/// scans for embedded ASCII signatures). The caller is responsible for honoring
+	/// [`body_cap`](Self::body_cap); this scans exactly the slice it is given.
+	#[must_use]
+	pub fn inspect_body(&self, body: &[u8]) -> Verdict {
+		let text = String::from_utf8_lossy(body);
+		match self.inspect_str(&text, "body") {
+			Some(m) => Verdict::Block(m),
+			None => Verdict::Allow,
+		}
 	}
 
 	/// The default WAF over [`starter_rules`]. The starter patterns are known-good and
@@ -118,32 +184,72 @@ impl Waf {
 		self.meta.len()
 	}
 
-	/// Inspect one string; return the first rule that matches it, if any. `location`
-	/// labels where the string came from for the returned [`WafMatch`].
-	fn inspect_str(&self, haystack: &str, location: &str) -> Option<WafMatch> {
-		// `matches` finds every hit in one pass; take the lowest rule index for a
-		// stable, deterministic result.
+	/// Match the ruleset against one literal string in a single pass; take the lowest
+	/// rule index for a stable, deterministic result. `location` labels where the string
+	/// came from for the returned [`WafMatch`].
+	fn match_raw(&self, haystack: &str, location: &str) -> Option<WafMatch> {
 		self.set.matches(haystack).iter().min().map(|idx| {
 			let (rule_id, category) = self.meta[idx];
 			WafMatch { rule_id, category, location: location.to_owned() }
 		})
 	}
 
-	/// Inspect a request's method, target (path + query), and header values. Returns
-	/// [`Verdict::Block`] on the first matching signature, else [`Verdict::Allow`].
+	/// Inspect one field whose encoding follows path/header rules (`%XX` only, `+` is a
+	/// literal). Body inspection and the tests use this; query strings use
+	/// [`inspect_field`](Self::inspect_field) with `plus_is_space = true`.
+	fn inspect_str(&self, raw: &str, location: &str) -> Option<WafMatch> {
+		self.inspect_field(raw, location, false)
+	}
+
+	/// Inspect one field: match the raw string, then — if normalization changes it — its
+	/// decoded form, applying the multiple-encoding guard. With `plus_is_space`, a `+` is
+	/// first folded to a space (`application/x-www-form-urlencoded` semantics), so a
+	/// `+`-spaced payload (`a+OR+1=1`) trips the same rules as its space form. `location`
+	/// labels where the string came from for the returned [`WafMatch`].
+	fn inspect_field(&self, raw: &str, location: &str, plus_is_space: bool) -> Option<WafMatch> {
+		// 1. The raw string exactly as received.
+		if let Some(m) = self.match_raw(raw, location) {
+			return Some(m);
+		}
+		// 2. Normalize: optional '+'→space, then percent-decode to a fixed point.
+		let norm = normalize(raw, plus_is_space);
+		// 3. Multiply percent-encoded input is itself the signal: block it as an anomaly.
+		//    With the guard off, fall through and let the decoded form match a specific rule.
+		if self.block_multi_encoded && norm.decode_passes >= 2 {
+			return Some(WafMatch {
+				rule_id: MULTI_ENCODING_RULE_ID,
+				category: WafCategory::ProtocolAnomaly,
+				location: location.to_owned(),
+			});
+		}
+		// 4. Match the decoded form, but only when normalization actually changed it
+		//    (nothing encoded → raw was the whole story, already checked).
+		if norm.decoded != raw {
+			return self.match_raw(&norm.decoded, location);
+		}
+		None
+	}
+
+	/// Inspect a request's method, path, query string, and header values. The query is
+	/// scanned with `+`→space form-decoding; the path and headers are not (a `+` is
+	/// literal there). Returns [`Verdict::Block`] on the first matching signature, else
+	/// [`Verdict::Allow`].
 	#[must_use]
 	pub fn inspect(&self, parts: &Parts) -> Verdict {
-		if let Some(m) = self.inspect_str(parts.method.as_str(), "method") {
+		if let Some(m) = self.inspect_field(parts.method.as_str(), "method", false) {
 			return Verdict::Block(m);
 		}
-		if let Some(pq) = parts.uri.path_and_query()
-			&& let Some(m) = self.inspect_str(pq.as_str(), "target")
+		if let Some(m) = self.inspect_field(parts.uri.path(), "target", false) {
+			return Verdict::Block(m);
+		}
+		if let Some(query) = parts.uri.query()
+			&& let Some(m) = self.inspect_field(query, "query", true)
 		{
 			return Verdict::Block(m);
 		}
 		for (name, value) in &parts.headers {
 			if let Ok(s) = value.to_str()
-				&& let Some(m) = self.inspect_str(s, &format!("header:{name}"))
+				&& let Some(m) = self.inspect_field(s, &format!("header:{name}"), false)
 			{
 				return Verdict::Block(m);
 			}
@@ -155,6 +261,69 @@ impl Waf {
 impl Default for Waf {
 	fn default() -> Self {
 		Self::starter()
+	}
+}
+
+/// The result of [`normalize`]: the fully percent-decoded string and how many decode
+/// passes it took to settle (`0` = nothing was encoded).
+struct Normalized {
+	decoded: String,
+	decode_passes: usize,
+}
+
+/// Normalize `input` for matching: when `plus_is_space`, first fold `+` to a space
+/// (`application/x-www-form-urlencoded` semantics), then iteratively percent-decode
+/// until it stops changing or [`MAX_DECODE_PASSES`] is reached. `decode_passes` counts
+/// only the percent-decode passes (the `+` fold is not multi-encoding), distinguishing
+/// un-encoded (`0`), singly-encoded (`1`), and the evasive multiply-encoded (`>= 2`)
+/// cases. `decoded` may differ from `input` through the `+` fold alone.
+fn normalize(input: &str, plus_is_space: bool) -> Normalized {
+	let mut cur = if plus_is_space { input.replace('+', " ") } else { input.to_owned() };
+	let mut passes = 0;
+	while passes < MAX_DECODE_PASSES {
+		let (next, changed) = percent_decode_once(&cur);
+		if !changed {
+			break;
+		}
+		cur = next;
+		passes += 1;
+	}
+	Normalized { decoded: cur, decode_passes: passes }
+}
+
+/// Percent-decode `input` once: each well-formed `%XX` (two hex digits) becomes its
+/// byte; a malformed `%` (truncated or non-hex) is left verbatim. Returns the decoded
+/// string and whether any `%XX` was replaced. Decoding works on raw bytes and finishes
+/// with [`String::from_utf8_lossy`], so multi-byte UTF-8 already in `input` survives and
+/// the output is always valid UTF-8 for matching.
+fn percent_decode_once(input: &str) -> (String, bool) {
+	let bytes = input.as_bytes();
+	let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+	let mut changed = false;
+	let mut i = 0;
+	while i < bytes.len() {
+		if bytes[i] == b'%'
+			&& i + 2 < bytes.len()
+			&& let (Some(h), Some(l)) = (hex_val(bytes[i + 1]), hex_val(bytes[i + 2]))
+		{
+			out.push((h << 4) | l);
+			changed = true;
+			i += 3;
+			continue;
+		}
+		out.push(bytes[i]);
+		i += 1;
+	}
+	(String::from_utf8_lossy(&out).into_owned(), changed)
+}
+
+/// The numeric value of a single hex digit, or `None` if `b` is not `[0-9A-Fa-f]`.
+const fn hex_val(b: u8) -> Option<u8> {
+	match b {
+		b'0'..=b'9' => Some(b - b'0'),
+		b'a'..=b'f' => Some(b - b'a' + 10),
+		b'A'..=b'F' => Some(b - b'A' + 10),
+		_ => None,
 	}
 }
 
@@ -170,17 +339,27 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_or_tautology", category: WafCategory::Sqli, pattern: r#"(?i)\bor\b\s+['"]?\s*\d+\s*=\s*\d+"# },
 		Rule { id: "sqli_stacked_query", category: WafCategory::Sqli, pattern: r"(?i);\s*(drop|delete|update|insert|truncate)\b" },
 		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r"(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)" },
+		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
+		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
-		Rule { id: "xss_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(error|load|click|mouseover)\s*=" },
-		// --- Path / directory traversal ---
+		Rule { id: "xss_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(error|load|click|mouseover|focus|toggle)\s*=" },
+		Rule { id: "xss_iframe_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*iframe\b" },
+		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
+		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
 		Rule { id: "traversal_sensitive_file", category: WafCategory::PathTraversal, pattern: r"(?i)(/etc/passwd|/etc/shadow|boot\.ini|win\.ini)" },
+		Rule { id: "traversal_proc_self", category: WafCategory::PathTraversal, pattern: r"(?i)/proc/self/(environ|cmdline|fd|maps)" },
+		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
+		// --- OS command injection ---
+		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
+		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
+		Rule { id: "anomaly_shellshock", category: WafCategory::ProtocolAnomaly, pattern: r"\(\)\s*\{" },
 	]
 }
 
@@ -286,5 +465,181 @@ mod tests {
 	fn category_names_are_stable() {
 		assert_eq!(WafCategory::Sqli.name(), "sqli");
 		assert_eq!(WafCategory::PathTraversal.name(), "path_traversal");
+		assert_eq!(WafCategory::CommandInjection.name(), "command_injection");
+		assert_eq!(WafCategory::ProtocolAnomaly.name(), "protocol_anomaly");
+	}
+
+	#[test]
+	fn extended_sqli_rules_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 AND SLEEP(5)", "target").unwrap().rule_id, "sqli_time_based");
+		assert_eq!(waf.inspect_str("UNION SELECT table_name FROM information_schema.tables", "target").map(|m| m.category), Some(WafCategory::Sqli));
+	}
+
+	#[test]
+	fn extended_xss_rules_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("<iframe src=//evil", "target").unwrap().rule_id, "xss_iframe_tag");
+		assert_eq!(waf.inspect_str("href=data:text/html;base64,PHN2Zz4=", "target").unwrap().rule_id, "xss_data_html_uri");
+	}
+
+	#[test]
+	fn file_inclusion_wrappers_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("page=php://filter/convert.base64-encode/resource=x", "target").unwrap().category, WafCategory::PathTraversal);
+		assert_eq!(waf.inspect_str("file=/proc/self/environ", "target").unwrap().rule_id, "traversal_proc_self");
+	}
+
+	#[test]
+	fn command_injection_rules_match() {
+		let waf = Waf::starter();
+		let m = waf.inspect_str("q=test;cat /etc/hosts", "target").unwrap();
+		assert_eq!(m.category, WafCategory::CommandInjection);
+		assert_eq!(m.rule_id, "cmdi_shell_command");
+		assert_eq!(waf.inspect_str("cmd=/bin/sh -c whoami", "target").unwrap().rule_id, "cmdi_path_bin");
+	}
+
+	#[test]
+	fn shellshock_signature_matches() {
+		let waf = Waf::starter();
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "() { :; }; echo vuln".parse().unwrap());
+		assert_eq!(blocked(&waf.inspect(&p)).rule_id, "anomaly_shellshock");
+	}
+
+	#[test]
+	fn extended_rules_keep_false_positives_low() {
+		// A handful of benign requests that brush near the new rules must still pass.
+		let waf = Waf::starter();
+		for uri in ["/blog/data-structures-101", "/shop/cats-and-dogs", "/docs/php-vs-python", "/files/binary-data"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn single_encoded_xss_is_decoded_and_blocked() {
+		// `<script>` hidden as %3Cscript%3E is caught after one decode pass.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("%3Cscript%3Ealert(1)%3C/script%3E", "target").unwrap();
+		assert_eq!(m.rule_id, "xss_script_tag");
+	}
+
+	#[test]
+	fn single_encoded_traversal_is_decoded_and_blocked() {
+		// `..%2f` decodes to `../`, matching the plaintext traversal rule.
+		let waf = Waf::starter();
+		let v = waf.inspect(&parts("GET", "/files/..%2f..%2fetc/passwd"));
+		assert_eq!(blocked(&v).category, WafCategory::PathTraversal);
+	}
+
+	#[test]
+	fn double_encoded_input_is_blocked_as_anomaly() {
+		// `%252e%252e%252f` -> `%2e%2e%2f` -> `../`: two passes, the evasion guard fires.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("a%252e%252e%252fb", "target").unwrap();
+		assert_eq!(m.rule_id, MULTI_ENCODING_RULE_ID);
+		assert_eq!(m.category, WafCategory::ProtocolAnomaly);
+	}
+
+	#[test]
+	fn multi_encoding_guard_can_be_relaxed_and_still_catches_payload() {
+		// With the anomaly guard off, the fully-decoded payload still matches its rule.
+		// `' OR 1=1` double-encoded: %2527%2520OR%25201%253D1 -> %27%20OR%201%3D1 -> ' OR 1=1
+		let waf = Waf::starter().block_multi_encoded(false);
+		let m = waf.inspect_str("%2527%2520OR%25201%253D1", "target").unwrap();
+		assert_eq!(m.category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn benign_encoded_input_still_passes() {
+		// A legitimately percent-encoded space in a title is decoded but matches nothing.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect(&parts("GET", "/search?q=hello%20world")), Verdict::Allow);
+	}
+
+	#[test]
+	fn malformed_percent_is_left_verbatim() {
+		// A stray `%` and a truncated `%2` are not decodable; nothing should fire.
+		let (decoded, changed) = percent_decode_once("100%25 done %2");
+		assert!(changed); // the %25 -> %
+		assert_eq!(decoded, "100% done %2");
+		let (decoded2, changed2) = percent_decode_once("bare % and %zz");
+		assert!(!changed2);
+		assert_eq!(decoded2, "bare % and %zz");
+	}
+
+	#[test]
+	fn body_inspection_is_off_by_default() {
+		let waf = Waf::starter();
+		assert_eq!(waf.body_cap(), None);
+	}
+
+	#[test]
+	fn inspect_body_blocks_signature_payload() {
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.body_cap(), Some(4096));
+		let v = waf.inspect_body(b"comment=<script>steal()</script>");
+		assert_eq!(blocked(&v).category, WafCategory::Xss);
+		assert_eq!(blocked(&v).location, "body");
+	}
+
+	#[test]
+	fn inspect_body_decodes_encoded_payload() {
+		// A form-encoded SQLi body trips the rule after normalization, like any field.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		let v = waf.inspect_body(b"q=1%20UNION%20SELECT%20pw%20FROM%20users");
+		assert_eq!(blocked(&v).category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn inspect_body_allows_benign_payload() {
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.inspect_body(b"name=Ada&message=hello there"), Verdict::Allow);
+	}
+
+	#[test]
+	fn inspect_body_handles_binary_bytes() {
+		// Non-UTF-8 bytes must not panic; the lossy decode still scans embedded ASCII.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		let mut body = vec![0xff, 0xfe, 0x00];
+		body.extend_from_slice(b"<script>");
+		assert_eq!(waf.inspect_body(&body), Verdict::Block(WafMatch { rule_id: "xss_script_tag", category: WafCategory::Xss, location: "body".to_owned() }));
+	}
+
+	#[test]
+	fn normalize_counts_decode_passes() {
+		assert_eq!(normalize("plain/path", false).decode_passes, 0);
+		assert_eq!(normalize("%2e%2e", false).decode_passes, 1);
+		assert_eq!(normalize("%252e", false).decode_passes, 2);
+		// Decoding stops at the cap even if more layers remain.
+		assert!(normalize("%25252525252e", false).decode_passes <= MAX_DECODE_PASSES);
+	}
+
+	#[test]
+	fn plus_folds_to_space_only_when_requested() {
+		// '+' is a literal in a path/header, a space in a query/form field.
+		let n_path = normalize("a+b", false);
+		assert_eq!(n_path.decoded, "a+b");
+		assert_eq!(n_path.decode_passes, 0);
+		let n_query = normalize("a+b", true);
+		assert_eq!(n_query.decoded, "a b");
+	}
+
+	#[test]
+	fn plus_encoded_sqli_in_query_is_caught() {
+		// `a+OR+1=1` evades the whitespace-requiring tautology rule on the raw string but
+		// trips it once '+' folds to a space in the query field.
+		let waf = Waf::starter();
+		let v = waf.inspect(&parts("GET", "/login?user=a+OR+1=1"));
+		let m = blocked(&v);
+		assert_eq!(m.category, WafCategory::Sqli);
+		assert_eq!(m.location, "query");
+	}
+
+	#[test]
+	fn plus_in_path_is_not_treated_as_space() {
+		// A literal '+' in a path segment must not be folded — no false "query" decoding.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect(&parts("GET", "/c++/reference")), Verdict::Allow);
 	}
 }

@@ -7,6 +7,119 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-19 (run 2) — onyums-skin Phase 3 WAF: normalization, body inspection, ruleset (4 increments)
+
+Branch `routine/onyums-2026-06-19-2` → PR [#8](https://github.com/basic-automation/onyums/pull/8)
+(base `master`). Same-day rerun: the
+morning's run finished onyums-skin Phase 2 and opened Phase 3, merged as PR #7
+(`master` head `d13db24`); this run branched fresh off updated `master`. The
+onyums-side Phase 2 `CircuitPolicy` wiring is still **blocked** on a live-Tor
+per-circuit-id prerequisite, so this run continued the tractable no-Tor queue:
+it advanced **onyums-skin ROADMAP Phase 3 (WAF, v0.3)** along exactly the line
+the previous run's NEXT STEP set out — input normalization, request-body
+inspection, a broader ruleset — plus a normalization-hardening follow-on.
+Workspace stayed green and clippy-clean after every increment; pure-Rust,
+no-FFI posture held (the one promoted dep, `http-body-util`, is MIT, pure Rust).
+
+**Increment 1 — WAF input normalization + double-encoding guard.** *onyums-skin
+Phase 3, the previous run's documented next slice.* Files:
+`crates/onyums-skin/src/waf/mod.rs`. Each WAF field is now scanned twice: the raw
+string, then — if percent-encoded — its decoded form, so a single encoding layer
+(`%3Cscript%3E`, `..%2f`) trips the same rules as plaintext. Decoding iterates to
+a fixed point capped at `MAX_DECODE_PASSES`; input needing **more than one** pass
+is multiply-encoded (`%252e%252e%252f`) — a classic evasion — and is blocked
+outright as a protocol anomaly (`anomaly_multiple_encoding`). The guard is on by
+default, relaxable via `Waf::block_multi_encoded(false)` (decoded form still
+matched). `percent_decode_once` works on raw bytes + `from_utf8_lossy` so
+multi-byte UTF-8 survives; malformed `%` is left verbatim. **+7 unit tests.**
+
+**Increment 2 — WAF request-body inspection behind a size cap.** *onyums-skin
+Phase 3, request-body inspection.* Files: `crates/onyums-skin/src/waf/mod.rs`,
+`src/layer.rs`, `crates/onyums-skin/Cargo.toml`. `Waf::inspect_body_up_to(cap)`
+enables body scanning; `inspect_body()` scans the bytes (lossy UTF-8, so embedded
+ASCII signatures in a binary body still match) with the same rules/normalization,
+location `"body"`. `SkinLayer` wires it **after** the gate — only a request that
+clears the gate carries a body to the app, so gated/challenged traffic never pays
+the buffering cost and an attacker cannot force buffering by flooding uncleared
+requests. A forwarded body is buffered with `http_body_util::Limited` up to the
+cap, scanned, reconstructed, and passed on; an over-cap body is refused `413`.
+Deliberately **OFF in `secure_default`**: buffering + a hard body-size cap is a
+request-handling behaviour change, so the operator opts in explicitly rather than
+have every existing `secure_default()` deployment (onyums uses it) silently start
+capping body size. Promoted `http-body-util` (pure-Rust, MIT) from dev- to
+regular dependency. **+9 unit tests** (engine + layer 403/benign/413/disabled).
+
+**Increment 3 — broaden the starter ruleset toward OWASP-CRS.** *onyums-skin
+Phase 3, broader ruleset (pure-Rust rule-porting, never a Coraza/ModSecurity
+FFI).* Files: `crates/onyums-skin/src/waf/mod.rs`. Grew `starter_rules()` from 12
+to 21 patterns and added a `CommandInjection` category: SQLi time-based
+(`sleep`/`benchmark`/`pg_sleep`/`waitfor delay`) + `information_schema`; XSS
+`<iframe>` + `data:text/html` + `onfocus`/`ontoggle`; path `/proc/self/*` +
+PHP/phar/expect/zip/glob stream wrappers (LFI/RFI); command injection
+(shell-metachar + known-binary, `/bin/{sh,bash,…}`); Shellshock `() {`. New rules
+append within their category groups so the lowest-index-wins determinism is
+preserved. A false-positive guard test confirms benign near-misses
+(`cats-and-dogs`, `php-vs-python`, `data-structures`) still pass. **+6 unit
+tests.**
+
+**Increment 4 — fold `+` to space in query/body normalization.** *onyums-skin
+Phase 3, normalization hardening.* Files: `crates/onyums-skin/src/waf/mod.rs`. A
+form-encoding evasion gap remained: `a+OR+1=1` slipped past the
+whitespace-requiring SQLi tautology rule (no `%` to decode). `normalize` now
+takes a `plus_is_space` flag folding `+`→space before percent-decoding; `inspect`
+scans the path and query **separately**, applying the fold only to the query (and
+to bodies), never the path/headers where `+` is literal — so `/c++/reference` is
+not mis-decoded. `decode_passes` still counts only percent passes, leaving the
+multi-encoding guard unaffected. Query matches now report location `"query"`,
+sharpening event attribution. **+3 unit tests.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **107 passed; 0 failed; 0 ignored** + **1 doc test
+  passed** (up from 82+1 at run start; +25 across the four increments).
+- `cargo test -p onyums --lib -- --skip test_serve`: **8 passed; 0 failed** (1
+  filtered) — confirms the WAF changes (incl. the internal `inspect` refactor and the
+  promoted dep) did not regress onyums' no-Tor integration tests.
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** throughout (no `#[allow]`
+  added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open (onyums-skin Phase 3 — WAF)
+- **DONE this run:** input normalization with the double-decoding guard; request-body
+  inspection behind a size cap (opt-in); a broadened starter ruleset (21 rules, 5
+  categories) toward OWASP-CRS; `+`→space query/body normalization. The Phase-3 "Done
+  when" (signature attacks blocked with no IP dependency, operator-extensible rules,
+  engine ahead of the gate) holds, now with encoded-payload coverage.
+- **OPEN (Phase 3):** a `wirefilter` rule-expression language (so operators write rules
+  as expressions, not raw regex); a still-broader ruleset toward true OWASP-CRS parity;
+  per-rule/category enable-disable ergonomics.
+- **BLOCKED:** onyums Phase 2 `CircuitPolicy` wiring (live-Tor per-circuit id); skin
+  Phase 1 `CaptchaChallenge` (the `captcha` crate license audit — an open ROADMAP
+  question).
+- **NOT STARTED:** onyums Phase 1 (identity), Phase 3 (TLS-first/strict), Phase 4
+  (observability); skin Phase 4 (observability — structured security events; the WAF
+  block/rate-limit trip are the natural first event sources), Phase 5 (frontier).
+
+**STOP REASON:** Landed 4 verifiable increments (top of the 2–4 bar), a coherent arc
+completing onyums-skin Phase 3's normalization + body-inspection + ruleset-breadth work
+exactly as the prior run's NEXT STEP specified. The remaining Phase-3 items (a
+`wirefilter` expression language) and the natural next phase (skin Phase 4 structured
+security events) are larger standalone designs better as their own focused increments
+than a rushed fifth. This is an off-schedule daytime run; everything is green,
+clippy-clean, and fully unit-tested where no live Tor is required; nothing is
+half-landed.
+
+**NEXT STEP:** Begin onyums-skin **Phase 4 observability** with a typed
+`SecurityEvent` + `SecurityEventSink` trait (a `TracingSink` default), wiring the WAF
+block and rate-limit trip as the first event sources so operators can see *what* is
+blocked and *why* (the WAF already carries `rule_id`/`category`/`location` for this).
+In parallel no-Tor work: a `wirefilter` rule-expression front-end over the regex engine,
+and a broader ruleset. Still blocked until onyums extracts a real per-circuit id: driving
+`AccountingCircuitPolicy` + `AdaptiveDifficulty` from `handle_stream_request`.
+
+---
+
 ## 2026-06-19 — finish onyums-skin Phase 2 accounting/difficulty; start Phase 3 WAF (6 increments)
 
 Branch `routine/onyums-2026-06-19` → PR (base `master`). Run 3's PR #6 had merged

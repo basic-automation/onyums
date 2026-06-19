@@ -24,6 +24,7 @@ use std::{
 use axum::{
 	body::Body, http::{HeaderValue, StatusCode, header, request::Parts}, response::{IntoResponse, Response}
 };
+use http_body_util::{BodyExt, Limited};
 use rand::RngCore;
 use tower_layer::Layer;
 use tower_service::Service;
@@ -145,11 +146,14 @@ impl Skin {
 	/// async machinery so it is directly unit-testable.
 	fn decide(&self, parts: &Parts) -> Decision {
 		// 0. WAF inspection runs first and unconditionally: a signature attack is
-		//    refused before any clearance or gate work, even on a cleared circuit.
+		//    refused before any clearance or gate work, even on a cleared circuit. (The
+		//    request *body*, when body inspection is enabled, is scanned later in `call`,
+		//    after the gate clears the request — only forwarded traffic carries a body to
+		//    the app, so gated traffic never pays the buffering cost.)
 		if let Some(waf) = &self.waf
 			&& let Verdict::Block(m) = waf.inspect(parts)
 		{
-			return Decision::Respond((StatusCode::FORBIDDEN, format!("Blocked by WAF rule {} ({}).", m.rule_id, m.category.name())).into_response());
+			return Decision::Respond(waf_block_response(&m));
 		}
 
 		// 1. Already cleared? Rate-limit on the token id, then forward.
@@ -178,6 +182,11 @@ impl Skin {
 		// 3. No clearance: gate the request.
 		Decision::Respond(self.present_challenge(parts))
 	}
+}
+
+/// The `403` served when a [`Waf`] rule fires (on a request field or its body).
+fn waf_block_response(m: &crate::waf::WafMatch) -> Response {
+	(StatusCode::FORBIDDEN, format!("Blocked by WAF rule {} ({}).", m.rule_id, m.category.name())).into_response()
 }
 
 /// Outcome of [`Skin::decide`]: either serve a Skin response directly, or let the
@@ -235,7 +244,27 @@ where
 			let (parts, body) = req.into_parts();
 			match skin.decide(&parts) {
 				Decision::Respond(resp) => Ok(resp),
-				Decision::Forward => inner.call(axum::extract::Request::from_parts(parts, body)).await,
+				Decision::Forward => {
+					// The request cleared the gate. If body inspection is enabled, buffer
+					// up to the cap and scan it before it reaches the app — a body over the
+					// cap is refused rather than forwarded uninspected.
+					let body = match skin.waf.as_ref().and_then(Waf::body_cap) {
+						Some(cap) => match Limited::new(body, cap).collect().await {
+							Ok(collected) => {
+								let bytes = collected.to_bytes();
+								if let Some(waf) = &skin.waf
+									&& let Verdict::Block(m) = waf.inspect_body(&bytes)
+								{
+									return Ok(waf_block_response(&m));
+								}
+								Body::from(bytes)
+							}
+							Err(_) => return Ok((StatusCode::PAYLOAD_TOO_LARGE, "Request body exceeds the WAF inspection limit.").into_response()),
+						},
+						None => body,
+					};
+					inner.call(axum::extract::Request::from_parts(parts, body)).await
+				}
 			}
 		})
 	}
@@ -572,6 +601,71 @@ mod tests {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::OK), // PoW interstitial
 			Decision::Forward => panic!("an uncleared benign request is challenged"),
 		}
+	}
+
+	/// A gate whose WAF also inspects request bodies up to `cap` bytes, over a known store.
+	fn waf_body_gate(cap: usize) -> (Skin, Arc<HmacClearanceStore>) {
+		let store = Arc::new(HmacClearanceStore::new(b"waf-body-secret".to_vec()));
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter().inspect_body_up_to(cap))
+			.build();
+		(skin, store)
+	}
+
+	#[tokio::test]
+	async fn waf_blocks_signature_in_cleared_request_body() {
+		// A cleared client cannot smuggle an attack through the request body either.
+		let (skin, store) = waf_body_gate(64 * 1024);
+		let app = Router::new().route("/post", get(|| async { "app" }));
+		let mut svc = skin.into_layer().layer(app);
+
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let req = Request::builder().uri("/post").header(header::COOKIE, format!("{DEFAULT_COOKIE}={token}")).body(Body::from("comment=<script>steal()</script>")).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+	}
+
+	#[tokio::test]
+	async fn waf_lets_benign_cleared_body_reach_the_app() {
+		let (skin, store) = waf_body_gate(64 * 1024);
+		let app = Router::new().route("/post", get(|| async { "app saw it" }));
+		let mut svc = skin.into_layer().layer(app);
+
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let req = Request::builder().uri("/post").header(header::COOKIE, format!("{DEFAULT_COOKIE}={token}")).body(Body::from("name=Ada&message=hello")).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::OK);
+		let body = resp.into_body().collect().await.unwrap().to_bytes();
+		assert_eq!(&body[..], b"app saw it");
+	}
+
+	#[tokio::test]
+	async fn oversize_body_is_refused_with_413() {
+		// A body larger than the inspection cap is refused, not forwarded uninspected.
+		let (skin, store) = waf_body_gate(16);
+		let app = Router::new().route("/post", get(|| async { "app" }));
+		let mut svc = skin.into_layer().layer(app);
+
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let req = Request::builder().uri("/post").header(header::COOKIE, format!("{DEFAULT_COOKIE}={token}")).body(Body::from("x".repeat(1024))).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::PAYLOAD_TOO_LARGE);
+	}
+
+	#[tokio::test]
+	async fn body_not_inspected_when_disabled() {
+		// The default gate (no body inspection) forwards an attack-laden body untouched —
+		// proving body inspection is genuinely opt-in.
+		let (skin, store) = pow_gate();
+		let app = Router::new().route("/post", get(|| async { "app" }));
+		let mut svc = skin.into_layer().layer(app);
+
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let req = Request::builder().uri("/post").header(header::COOKIE, format!("{DEFAULT_COOKIE}={token}")).body(Body::from("<script>x</script>")).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::OK); // reached the app, not 403
 	}
 
 	#[test]

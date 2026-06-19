@@ -109,6 +109,10 @@ pub struct Waf {
 	/// When true (default), input requiring more than one percent-decode pass to reach a
 	/// fixed point is blocked outright as a [`WafCategory::ProtocolAnomaly`].
 	block_multi_encoded: bool,
+	/// When `Some(cap)`, request bodies are inspected up to `cap` bytes (the host layer
+	/// buffers that much before forwarding). `None` (default) leaves bodies uninspected —
+	/// body inspection means buffering, a request-handling cost the operator opts into.
+	body_inspection: Option<usize>,
 }
 
 impl Waf {
@@ -121,7 +125,7 @@ impl Waf {
 		let rules: Vec<Rule> = rules.into_iter().collect();
 		let set = RegexSet::new(rules.iter().map(|r| r.pattern))?;
 		let meta = rules.iter().map(|r| (r.id, r.category)).collect();
-		Ok(Self { set, meta, block_multi_encoded: true })
+		Ok(Self { set, meta, block_multi_encoded: true, body_inspection: None })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -132,6 +136,36 @@ impl Waf {
 	pub fn block_multi_encoded(mut self, block: bool) -> Self {
 		self.block_multi_encoded = block;
 		self
+	}
+
+	/// Enable request-**body** inspection, buffering and scanning up to `max_bytes` of the
+	/// body (default: off). The host [`SkinLayer`](crate::layer) buffers at most this many
+	/// bytes of a forwarded request's body before passing it on; a body that exceeds the
+	/// cap is refused (`413`). Off by default because buffering is a per-request cost and a
+	/// hard size cap is a behaviour change the operator should choose explicitly.
+	#[must_use]
+	pub fn inspect_body_up_to(mut self, max_bytes: usize) -> Self {
+		self.body_inspection = Some(max_bytes);
+		self
+	}
+
+	/// The configured body-inspection byte cap, or `None` if body inspection is off.
+	#[must_use]
+	pub fn body_cap(&self) -> Option<usize> {
+		self.body_inspection
+	}
+
+	/// Inspect a request body's bytes with the same rules and normalization as every
+	/// other field. The bytes are interpreted as UTF-8 lossily (so a binary body still
+	/// scans for embedded ASCII signatures). The caller is responsible for honoring
+	/// [`body_cap`](Self::body_cap); this scans exactly the slice it is given.
+	#[must_use]
+	pub fn inspect_body(&self, body: &[u8]) -> Verdict {
+		let text = String::from_utf8_lossy(body);
+		match self.inspect_str(&text, "body") {
+			Some(m) => Verdict::Block(m),
+			None => Verdict::Allow,
+		}
 	}
 
 	/// The default WAF over [`starter_rules`]. The starter patterns are known-good and
@@ -455,6 +489,44 @@ mod tests {
 		let (decoded2, changed2) = percent_decode_once("bare % and %zz");
 		assert!(!changed2);
 		assert_eq!(decoded2, "bare % and %zz");
+	}
+
+	#[test]
+	fn body_inspection_is_off_by_default() {
+		let waf = Waf::starter();
+		assert_eq!(waf.body_cap(), None);
+	}
+
+	#[test]
+	fn inspect_body_blocks_signature_payload() {
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.body_cap(), Some(4096));
+		let v = waf.inspect_body(b"comment=<script>steal()</script>");
+		assert_eq!(blocked(&v).category, WafCategory::Xss);
+		assert_eq!(blocked(&v).location, "body");
+	}
+
+	#[test]
+	fn inspect_body_decodes_encoded_payload() {
+		// A form-encoded SQLi body trips the rule after normalization, like any field.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		let v = waf.inspect_body(b"q=1%20UNION%20SELECT%20pw%20FROM%20users");
+		assert_eq!(blocked(&v).category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn inspect_body_allows_benign_payload() {
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.inspect_body(b"name=Ada&message=hello there"), Verdict::Allow);
+	}
+
+	#[test]
+	fn inspect_body_handles_binary_bytes() {
+		// Non-UTF-8 bytes must not panic; the lossy decode still scans embedded ASCII.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		let mut body = vec![0xff, 0xfe, 0x00];
+		body.extend_from_slice(b"<script>");
+		assert_eq!(waf.inspect_body(&body), Verdict::Block(WafMatch { rule_id: "xss_script_tag", category: WafCategory::Xss, location: "body".to_owned() }));
 	}
 
 	#[test]

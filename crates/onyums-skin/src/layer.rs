@@ -7,9 +7,11 @@
 //! [`Clearance`], and redirects the client back — after which the clearance cookie
 //! carries the synthetic identity that the [`SkinRateLimit`] counts on.
 //!
-//! The layer order is the one in the crate `ROADMAP.md`'s request lifecycle, minus the
-//! WAF (Phase 3): clearance-check → (submission verify) → challenge → rate-limit. The
-//! WAF inspection step slots in ahead of the clearance check when it lands.
+//! The layer order is the one in the crate `ROADMAP.md`'s request lifecycle: WAF
+//! inspect → clearance-check → (submission verify) → challenge → rate-limit. The WAF
+//! is optional (off unless a [`Waf`] is configured) and, when present, runs first and
+//! unconditionally — a signature attack is refused before any clearance or gate work,
+//! even on an already-cleared circuit.
 //!
 //! The middleware is framework-agnostic: it is a plain [`tower_layer::Layer`] over any
 //! axum service, so a non-Tor app gets the gate by `Router::layer`-ing it on. The
@@ -27,7 +29,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{
-	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, ratelimit::SkinRateLimit
+	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, ratelimit::SkinRateLimit, waf::{Verdict, Waf}
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -54,6 +56,7 @@ pub struct Skin {
 	store: Arc<dyn ClearanceStore>,
 	challenge: ChallengeChain,
 	ratelimit: Option<SkinRateLimit>,
+	waf: Option<Waf>,
 	cookie_name: String,
 	submit_path: String,
 	return_path: String,
@@ -98,6 +101,7 @@ impl Skin {
 			.challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY)))
 			.challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY)))
 			.rate_limit(rate)
+			.waf(Waf::starter())
 			.build()
 	}
 
@@ -140,6 +144,14 @@ impl Skin {
 	/// The core, synchronous gate decision for one request. Kept free of any tower /
 	/// async machinery so it is directly unit-testable.
 	fn decide(&self, parts: &Parts) -> Decision {
+		// 0. WAF inspection runs first and unconditionally: a signature attack is
+		//    refused before any clearance or gate work, even on a cleared circuit.
+		if let Some(waf) = &self.waf
+			&& let Verdict::Block(m) = waf.inspect(parts)
+		{
+			return Decision::Respond((StatusCode::FORBIDDEN, format!("Blocked by WAF rule {} ({}).", m.rule_id, m.category.name())).into_response());
+		}
+
 		// 1. Already cleared? Rate-limit on the token id, then forward.
 		if let Some(clearance) = self.read_clearance(parts) {
 			if let Some(rl) = &self.ratelimit
@@ -236,6 +248,7 @@ pub struct SkinBuilder {
 	store: Option<Arc<dyn ClearanceStore>>,
 	challenges: Vec<Box<dyn Challenge>>,
 	ratelimit: Option<SkinRateLimit>,
+	waf: Option<Waf>,
 	cookie_name: String,
 	submit_path: String,
 	return_path: String,
@@ -245,7 +258,7 @@ pub struct SkinBuilder {
 
 impl Default for SkinBuilder {
 	fn default() -> Self {
-		Self { store: None, challenges: Vec::new(), ratelimit: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
+		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
 	}
 }
 
@@ -270,6 +283,16 @@ impl SkinBuilder {
 	#[must_use]
 	pub fn rate_limit(mut self, limiter: SkinRateLimit) -> Self {
 		self.ratelimit = Some(limiter);
+		self
+	}
+
+	/// Inspect requests with a [`Waf`] ahead of the gate (off by default). A blocked
+	/// request gets a `403` and never reaches the clearance check, the challenge, or
+	/// the app. Use [`Waf::starter`] for the built-in ruleset (as
+	/// [`Skin::secure_default`] does) or a custom [`Waf`].
+	#[must_use]
+	pub fn waf(mut self, waf: Waf) -> Self {
+		self.waf = Some(waf);
 		self
 	}
 
@@ -314,7 +337,7 @@ impl SkinBuilder {
 	/// Finish building the gate.
 	#[must_use]
 	pub fn build(self) -> Skin {
-		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
+		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
 	}
 }
 
@@ -503,5 +526,62 @@ mod tests {
 		assert_eq!(resp.status(), StatusCode::OK);
 		let body = resp.into_body().collect().await.unwrap().to_bytes();
 		assert!(!body.windows(6).any(|w| w == b"SECRET"), "the protected app body must not leak to an uncleared client");
+	}
+
+	/// A gate with the starter WAF and a PoW challenge over a known store.
+	fn waf_gate() -> (Skin, Arc<HmacClearanceStore>) {
+		let store = Arc::new(HmacClearanceStore::new(b"waf-test-secret".to_vec()));
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter())
+			.build();
+		(skin, store)
+	}
+
+	#[test]
+	fn waf_blocks_signature_attack_with_403() {
+		let (skin, _store) = waf_gate();
+		// An XSS payload in a header value is a hard 403, not the PoW interstitial (200).
+		// (The WAF inspects raw request strings; this is the un-encoded literal form.)
+		let parts = Request::builder().uri("/").header("user-agent", "<script>alert(1)</script>").body(()).unwrap().into_parts().0;
+		match skin.decide(&parts) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+			Decision::Forward => panic!("a signature attack must be blocked, not forwarded"),
+		}
+	}
+
+	#[test]
+	fn waf_runs_ahead_of_clearance() {
+		// Even a validly-cleared client cannot smuggle a signature attack through: the
+		// WAF refuses it before the clearance check forwards.
+		let (skin, store) = waf_gate();
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let parts = parts_with_cookie("/files/../../etc/passwd", &format!("{DEFAULT_COOKIE}={token}"));
+		match skin.decide(&parts) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+			Decision::Forward => panic!("the WAF must block a cleared client's attack ahead of forwarding"),
+		}
+	}
+
+	#[test]
+	fn waf_lets_benign_uncleared_request_through_to_the_gate() {
+		// A clean request still reaches the normal gate (challenged, not 403).
+		let (skin, _store) = waf_gate();
+		match skin.decide(&bare_parts("/articles/hello-world")) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::OK), // PoW interstitial
+			Decision::Forward => panic!("an uncleared benign request is challenged"),
+		}
+	}
+
+	#[test]
+	fn no_waf_by_default_leaves_gate_behaviour_unchanged() {
+		// Without a configured WAF, a payload that the starter ruleset would block is
+		// merely challenged like any other uncleared request (no 403).
+		let (skin, _store) = pow_gate();
+		match skin.decide(&bare_parts("/files/../../etc/passwd")) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::OK),
+			Decision::Forward => panic!("uncleared request is challenged"),
+		}
 	}
 }

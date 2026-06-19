@@ -37,6 +37,9 @@ rand = "0.9.2"
 hmac = "0.12.1"
 base64 = "0.22.1"
 governor = "0.10.1"
+# onyums-skin WAF (Phase 3) — pure Rust signature matching. `regex` pulls in
+# `aho-corasick` internally for literal prefiltering (both MIT/Apache, no FFI).
+regex = "1.11.1"
 
 [package]
 name = "onyums"

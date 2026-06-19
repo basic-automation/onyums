@@ -17,6 +17,7 @@ rand = { workspace = true }
 hmac = { workspace = true }
 base64 = { workspace = true }
 governor = { workspace = true }
+regex = { workspace = true }
 tower-service = { workspace = true }
 tower-layer = { workspace = true }
 

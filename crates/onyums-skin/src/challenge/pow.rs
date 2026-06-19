@@ -6,7 +6,9 @@
 //! default. See `ROADMAP.md` §4.3 for the rationale, including why RandomX-WASM
 //! mine-to-enter was rejected.
 
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::{
+	collections::HashMap, sync::Mutex, time::{Duration, SystemTime, UNIX_EPOCH}
+};
 
 use axum::{
 	http::{StatusCode, request::Parts}, response::{Html, IntoResponse, Response}
@@ -128,13 +130,30 @@ pub struct PowChallenge<P: Pow> {
 	difficulty: u32,
 	ttl: Duration,
 	submit_path: String,
+	/// Seeds of puzzles already redeemed, with the instant their entry can be pruned
+	/// (the puzzle's own expiry). Enforces single-use so one solve mints one clearance.
+	consumed: Mutex<HashMap<[u8; 32], SystemTime>>,
 }
 
 impl<P: Pow> PowChallenge<P> {
 	/// Build a challenge over `pow` (typically [`Hashcash`]) signing puzzles with
 	/// `secret` at the given leading-zero-bit `difficulty`.
 	pub fn new(pow: P, secret: impl Into<Vec<u8>>, difficulty: u32) -> Self {
-		Self { pow, secret: secret.into(), difficulty, ttl: DEFAULT_PUZZLE_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned() }
+		Self { pow, secret: secret.into(), difficulty, ttl: DEFAULT_PUZZLE_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
+	}
+
+	/// Record `seed` as redeemed, returning `false` if it was already redeemed (a
+	/// replay). Expired entries are pruned opportunistically so the map stays bounded by
+	/// the number of puzzles outstanding within one TTL window.
+	fn consume(&self, seed: [u8; 32], expires: SystemTime) -> bool {
+		let mut consumed = self.consumed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		let now = SystemTime::now();
+		consumed.retain(|_, exp| *exp > now);
+		if consumed.contains_key(&seed) {
+			return false;
+		}
+		consumed.insert(seed, expires);
+		true
 	}
 
 	/// Override how long an issued puzzle stays valid (default 5 minutes).
@@ -172,9 +191,9 @@ impl<P: Pow> PowChallenge<P> {
 		(puzzle, envelope)
 	}
 
-	/// Recover the [`Puzzle`] from a signed envelope, or `None` if the signature is
-	/// wrong, the format is malformed, or the puzzle has expired.
-	fn open_puzzle(&self, envelope: &str) -> Option<Puzzle> {
+	/// Recover the [`Puzzle`] and its expiry from a signed envelope, or `None` if the
+	/// signature is wrong, the format is malformed, or the puzzle has expired.
+	fn open_puzzle(&self, envelope: &str) -> Option<(Puzzle, SystemTime)> {
 		let (payload_b64, tag_b64) = envelope.split_once('.')?;
 		let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
 		let tag = URL_SAFE_NO_PAD.decode(tag_b64).ok()?;
@@ -194,7 +213,7 @@ impl<P: Pow> PowChallenge<P> {
 		if expires <= SystemTime::now() {
 			return None;
 		}
-		Some(Puzzle { seed, difficulty })
+		Some((Puzzle { seed, difficulty }, expires))
 	}
 
 	/// Render the JS interstitial that solves `puzzle` and submits the nonce.
@@ -226,13 +245,20 @@ impl<P: Pow> Challenge for PowChallenge<P> {
 		let (Some(envelope), Some(nonce_b64)) = (envelope, nonce_b64) else {
 			return false;
 		};
-		let Some(puzzle) = self.open_puzzle(envelope) else {
+		let Some((puzzle, expires)) = self.open_puzzle(envelope) else {
 			return false;
 		};
 		let Ok(nonce) = URL_SAFE_NO_PAD.decode(nonce_b64) else {
 			return false;
 		};
-		self.pow.verify(&puzzle, &nonce)
+		if !self.pow.verify(&puzzle, &nonce) {
+			return false;
+		}
+		// Single-use: a correctly-solved puzzle clears exactly once, so one PoW solve
+		// cannot be replayed to mint an unbounded number of clearances (and thus
+		// unbounded rate-limit budget). The clearance token itself stays multi-use — it
+		// is the per-client session identity the rate limiter counts on.
+		self.consume(puzzle.seed, expires)
 	}
 
 	fn needs_js(&self) -> bool {
@@ -410,6 +436,16 @@ mod challenge_tests {
 		let (puzzle, envelope) = chal.make_puzzle();
 		let req = parts_with_query(&solved_query(&envelope, &puzzle));
 		assert!(chal.verify(&req));
+	}
+
+	#[test]
+	fn solved_puzzle_is_single_use() {
+		let chal = challenge();
+		let (puzzle, envelope) = chal.make_puzzle();
+		let query = solved_query(&envelope, &puzzle);
+		// First redemption clears; replaying the exact same solution does not.
+		assert!(chal.verify(&parts_with_query(&query)));
+		assert!(!chal.verify(&parts_with_query(&query)), "a solved puzzle must clear at most once");
 	}
 
 	#[test]

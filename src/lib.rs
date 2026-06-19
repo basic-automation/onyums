@@ -41,6 +41,7 @@ extern crate rcgen;
 use std::sync::Arc;
 
 pub use axum::*;
+pub use onyums_skin::{self, Skin};
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
 	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
@@ -238,6 +239,32 @@ impl OnionServiceHandle {
 	}
 }
 
+/// How the onyums-skin abuse-defense gate is applied to the served router.
+///
+/// Secure by default: with no explicit choice, the secure-default Skin gate is
+/// on. You opt *down* (`no_skin`) or *across* (a custom [`Skin`]), never *up*.
+#[derive(Default)]
+enum SkinChoice {
+	/// Apply [`Skin::secure_default`] — the frontier secure-by-default posture.
+	#[default]
+	Default,
+	/// Apply a caller-supplied gate. Boxed: a `Skin` is much larger than the unit
+	/// variants.
+	Custom(Box<Skin>),
+	/// No Skin gate — an explicit opt-down.
+	Disabled,
+}
+
+/// Apply the chosen Skin gate to the router. Extracted from `serve` so the gate
+/// wiring is testable with `tower::ServiceExt::oneshot` and no live Tor network.
+fn apply_skin(app: Router, skin: SkinChoice) -> Router {
+	match skin {
+		SkinChoice::Default => app.layer(Skin::secure_default().into_layer()),
+		SkinChoice::Custom(skin) => app.layer((*skin).into_layer()),
+		SkinChoice::Disabled => app,
+	}
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -246,6 +273,7 @@ impl OnionServiceHandle {
 pub struct OnionServiceBuilder {
 	router: Option<Router>,
 	nickname: Option<String>,
+	skin: SkinChoice,
 }
 
 impl OnionServiceBuilder {
@@ -260,6 +288,27 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub fn nickname(mut self, nickname: impl Into<String>) -> Self {
 		self.nickname = Some(nickname.into());
+		self
+	}
+
+	/// Replace the default Skin gate with a caller-tuned [`Skin`].
+	///
+	/// The secure-default gate (`PoW` + no-JS patience fallback + token rate
+	/// limiting) is *already on* without this call; use it only to tune the gate,
+	/// not to enable it. See [`Skin::builder`].
+	#[must_use]
+	pub fn skin(mut self, skin: Skin) -> Self {
+		self.skin = SkinChoice::Custom(Box::new(skin));
+		self
+	}
+
+	/// Opt *down*: serve the router with no Skin abuse-defense gate.
+	///
+	/// An explicit, named relaxation of the secure default — the gate is on
+	/// unless you call this.
+	#[must_use]
+	pub fn no_skin(mut self) -> Self {
+		self.skin = SkinChoice::Disabled;
 		self
 	}
 
@@ -281,6 +330,12 @@ impl OnionServiceBuilder {
 
 		let app = self.router.ok_or_else(|| anyhow::anyhow!("router not set on OnionServiceBuilder"))?;
 		let nickname = self.nickname.ok_or_else(|| anyhow::anyhow!("nickname not set on OnionServiceBuilder"))?;
+
+		// Insert the onyums-skin gate ahead of the application on the HTTP path
+		// (Phase 2 Skin integration). Secure-by-default unless the caller opted down
+		// with `no_skin`. `Router::layer` keeps the `Router` type, so the rest of the
+		// serve path is unchanged.
+		let app = apply_skin(app, self.skin);
 
 		let client = setup_tor_client().await?;
 		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
@@ -496,6 +551,32 @@ mod tests {
 		assert_eq!(address.to_string(), "abcdef.onion");
 		let owned: String = address.into();
 		assert_eq!(owned, "abcdef.onion");
+	}
+
+	#[tokio::test]
+	async fn no_skin_passes_requests_through() {
+		use tower::ServiceExt as _;
+
+		let app = apply_skin(Router::new().route("/", get(|| async { "ok" })), SkinChoice::Disabled);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		assert_eq!(response.status(), StatusCode::OK);
+	}
+
+	#[tokio::test]
+	async fn default_skin_gates_uncleared_requests() {
+		use http_body_util::BodyExt as _;
+		use tower::ServiceExt as _;
+
+		// An uncleared request must be intercepted by the gate and never reach the
+		// app. The secure-default gate answers with the PoW interstitial (a 200 HTML
+		// challenge page), so we assert on the body, not the status: the app's
+		// "secret" must not leak, and the challenge page must be served instead.
+		let app = apply_skin(Router::new().route("/", get(|| async { "secret" })), SkinChoice::Default);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		let body = String::from_utf8_lossy(&body);
+		assert!(!body.contains("secret"), "the gated app response must not leak");
+		assert!(body.contains("Checking your connection"), "the challenge interstitial should be served, got: {body}");
 	}
 
 	#[tokio::test]

@@ -7,7 +7,7 @@
 //! mine-to-enter was rejected.
 
 use std::{
-	collections::HashMap, sync::Mutex, time::{Duration, SystemTime, UNIX_EPOCH}
+	collections::HashMap, sync::{Arc, Mutex}, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 
 use axum::{
@@ -19,6 +19,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use super::{Challenge, Gate};
+use crate::difficulty::AdaptiveDifficulty;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -128,6 +129,10 @@ pub struct PowChallenge<P: Pow> {
 	pow: P,
 	secret: Vec<u8>,
 	difficulty: u32,
+	/// Optional adaptive controller. When set, issued puzzles use
+	/// `max(difficulty, controller.current_difficulty())` — the static `difficulty`
+	/// is a floor the controller can raise under load but never lower.
+	adaptive: Option<Arc<AdaptiveDifficulty>>,
 	ttl: Duration,
 	submit_path: String,
 	/// Seeds of puzzles already redeemed, with the instant their entry can be pruned
@@ -139,7 +144,15 @@ impl<P: Pow> PowChallenge<P> {
 	/// Build a challenge over `pow` (typically [`Hashcash`]) signing puzzles with
 	/// `secret` at the given leading-zero-bit `difficulty`.
 	pub fn new(pow: P, secret: impl Into<Vec<u8>>, difficulty: u32) -> Self {
-		Self { pow, secret: secret.into(), difficulty, ttl: DEFAULT_PUZZLE_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
+		Self {
+			pow,
+			secret: secret.into(),
+			difficulty,
+			adaptive: None,
+			ttl: DEFAULT_PUZZLE_TTL,
+			submit_path: DEFAULT_SUBMIT_PATH.to_owned(),
+			consumed: Mutex::new(HashMap::new()),
+		}
 	}
 
 	/// Record `seed` as redeemed, returning `false` if it was already redeemed (a
@@ -170,6 +183,23 @@ impl<P: Pow> PowChallenge<P> {
 		self
 	}
 
+	/// Drive issued-puzzle difficulty from an [`AdaptiveDifficulty`] controller. Under
+	/// normal load the controller is dormant and the configured `difficulty` floor
+	/// applies; under load it raises difficulty toward its `max`. The controller never
+	/// lowers difficulty below the static floor. Share one `Arc` with the host code
+	/// that calls [`record_request`](AdaptiveDifficulty::record_request).
+	#[must_use]
+	pub fn with_adaptive_difficulty(mut self, controller: Arc<AdaptiveDifficulty>) -> Self {
+		self.adaptive = Some(controller);
+		self
+	}
+
+	/// The difficulty to issue at right now: the static floor, raised by the adaptive
+	/// controller if one is attached.
+	fn current_difficulty(&self) -> u32 {
+		self.adaptive.as_ref().map_or(self.difficulty, |a| self.difficulty.max(a.current_difficulty()))
+	}
+
 	/// `HMAC-SHA256(secret, payload)` over the puzzle envelope.
 	fn tag(&self, payload: &[u8]) -> Vec<u8> {
 		let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a key of any length");
@@ -180,7 +210,7 @@ impl<P: Pow> PowChallenge<P> {
 	/// Generate a fresh puzzle and its signed wire envelope
 	/// (`base64url(seed‖difficulty‖expires).base64url(tag)`).
 	fn make_puzzle(&self) -> (Puzzle, String) {
-		let puzzle = self.pow.new_puzzle(self.difficulty);
+		let puzzle = self.pow.new_puzzle(self.current_difficulty());
 		let expires = SystemTime::now() + self.ttl;
 		let mut payload = Vec::with_capacity(44);
 		payload.extend_from_slice(&puzzle.seed);
@@ -505,5 +535,47 @@ mod challenge_tests {
 		let req = parts_with_query(&solved_query(&envelope, &puzzle));
 		assert!(mint.verify(&parts_with_query(&solved_query(&envelope, &puzzle))));
 		assert!(!check.verify(&req));
+	}
+
+	#[test]
+	fn adaptive_difficulty_raises_issued_puzzle_difficulty() {
+		use crate::circuit::{Clock, ManualClock};
+		use std::time::Instant;
+
+		struct ArcClock(Arc<ManualClock>);
+		impl Clock for ArcClock {
+			fn now(&self) -> Instant {
+				self.0.now()
+			}
+		}
+
+		let clock = Arc::new(ManualClock::new());
+		// Controller ramps 0 -> 20 over rate band [2, 10]/window.
+		let ctrl = Arc::new(
+			AdaptiveDifficulty::new(0, 20)
+				.rate_band(2, 10)
+				.window(Duration::from_secs(1))
+				.with_clock(Box::new(ArcClock(clock.clone()))),
+		);
+		// Static floor 4; controller dormant at first.
+		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 4).with_adaptive_difficulty(ctrl.clone());
+
+		// No load: the floor applies.
+		assert_eq!(chal.make_puzzle().0.difficulty, 4);
+
+		// Drive the observed rate to/over high_rate; the controller maxes out and the
+		// issued difficulty follows (well above the floor).
+		for _ in 0..10 {
+			ctrl.record_request();
+		}
+		assert_eq!(chal.make_puzzle().0.difficulty, 20);
+	}
+
+	#[test]
+	fn adaptive_controller_never_lowers_below_floor() {
+		// A controller whose max is below the static floor cannot drag difficulty down.
+		let ctrl = Arc::new(AdaptiveDifficulty::new(0, 2));
+		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 9).with_adaptive_difficulty(ctrl);
+		assert_eq!(chal.make_puzzle().0.difficulty, 9);
 	}
 }

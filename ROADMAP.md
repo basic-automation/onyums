@@ -197,16 +197,48 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
 *conventions and glue* that make them feel like one framework.
 
 ### A. Server-rendered MVC core (no-JS-first)
-- **Views — single-file components (Vue/Nuxt SFC syntax), server-rendered.** The default view layer
-  is the SFC: one file with `<template>` / `<script>` / `<style scoped>`, a component model with
-  props and slots, and template directives (interpolation, conditionals, loops). Crucially it is
-  **compiled to server-rendered HTML — an `axum` `Response`** — not to client-side JS: the SFC
-  renders fully on the server (no-JS-first), with reactive "islands" as optional progressive
-  enhancement only where JS is available. This adopts Vue's beloved single-file ergonomics while
-  staying true to the no-JS thesis. Under the hood it lowers onto a Rust template engine
-  (`askama` / `maud`) or a purpose-built compiler, but the surface is the SFC, not raw templates.
-  Other Vue/Nuxt cues in the same convention-over-configuration spirit: file-based routing (a
-  `pages/` directory → axum routes) and layouts/slots. *Build (the SFC compiler) — the headline DX
+- **Views — single-file components with a `<rust>` block, async server-rendered.** The default view
+  layer is the SFC, adapted to Rust as **four blocks: `<template>`, `<rust>`, `<style scoped>`, and
+  an optional `<script>`** (for the rare hand-written island JS). The `<rust>` block is the
+  component's logic in a Vue-Composition-API style — reactive signals, computed values, lifecycle
+  stages. Rust can do this: Leptos and Dioxus already ship reactive signals + `#[server]` functions
+  that compile one component to both SSR and hydrated WASM, so the machinery is proven. onyums'
+  contribution is the **SFC file format** plus two opinions those frameworks don't take:
+
+  - **Lifecycle stage = compile target.** The Composition-API lifecycle is the boundary that routes
+    each part of `<rust>` to one of three targets:
+    - *setup / render* → runs server-side, produces the `<template>`'s HTML;
+    - *server action* (`#[server]`-style fn / form handler) → compiled to an **axum endpoint**,
+      reachable by a plain `<form>` POST (no JS) or `fetch` (JS);
+    - *client island* (mount / effect) → compiled to **WASM**, hydrating only where JS/WASM exists,
+      skipped entirely under Tor "Safest".
+
+    No-JS-first discipline holds: a component must be fully functional from server-render +
+    server-endpoints alone; WASM islands only *enhance*. The lifecycle line that picks the compile
+    target is the same line that protects the no-JS baseline.
+  - **Async-everywhere, tokio-multithreaded.** The real departure from Leptos/Dioxus, whose reactive
+    cores are *synchronous* (component fns are `fn`, async bolted on via `Resource`/`Suspense`) and
+    often `!Send` / single-thread. In onyums the **server side — setup/render, lifecycle, server
+    actions, and the reactive runtime itself — is async-native and `Send + Sync`, running on the
+    same tokio multithreaded runtime as axum and arti.** So a component's `async` setup can `.await`
+    a Turso query, a Tor-client call, or an onyums-skin check *directly during SSR* — no
+    `Resource`/`Suspense` ceremony — and renders compose across work-stealing threads alongside the
+    rest of the stack. (Honest cost: a `Send + Sync` async reactive runtime is materially harder to
+    build than a thread-local sync one — exactly why Leptos chose `!Send` signals — so this is the
+    deep build of the phase, not a thin wrapper. The client island is necessarily single-threaded
+    browser WASM; the async-multithreaded property is the server-side model.)
+
+  Other Vue/Nuxt cues in the same spirit: file-based routing (a `pages/` directory → axum routes)
+  and layouts/slots. Under the hood the template can still lower onto a Rust engine (`askama`/`maud`)
+  or a purpose-built compiler, but the surface is the SFC.
+
+  ```
+  <template>      <!-- HTML, directives, slots -->
+  <rust>          // async, Send+Sync composition logic; lifecycle stage → compile target
+  <style scoped>
+  <script>        <!-- optional, rare island JS -->
+  ```
+  *Build (the SFC compiler + an async/multithreaded signal & lifecycle runtime) — the headline DX
   bet of this phase, and the clearest "abstraction over axum" of the framework layer.*
 - **Typed forms + validation** — `axum::Form` extraction + `garde` / `validator`, with
   server-rendered error re-rendering (Laravel Form Requests / Phoenix changesets). The no-JS form is

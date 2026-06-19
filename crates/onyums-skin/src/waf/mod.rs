@@ -12,8 +12,16 @@
 //! operator-extensible: [`Waf::new`] takes any rule iterator, so a caller can extend
 //! [`starter_rules`] with its own.
 //!
-//! This slice is the detection engine, testable standalone; wiring it ahead of the
-//! gate in the [`SkinLayer`](crate::layer) layer order is a later slice.
+//! Inspection is over the **raw** request strings (the target as received, header
+//! values as received); it does not percent- or otherwise decode first, so an attack
+//! hidden behind encoding (`%3Cscript%3E`) is not yet caught. Normalization /
+//! decode-before-match is a deliberate later slice — encoded-payload coverage and the
+//! double-decoding evasion it invites deserve their own treatment.
+//!
+//! The engine is wired ahead of the gate in the [`SkinLayer`](crate::layer) layer
+//! order (WAF → clearance → challenge → rate-limit); it is off unless a [`Waf`] is
+//! configured, and [`Skin::secure_default`](crate::layer::Skin::secure_default) turns
+//! on the [`starter`](Waf::starter) ruleset.
 
 use axum::http::request::Parts;
 use regex::RegexSet;

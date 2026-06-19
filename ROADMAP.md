@@ -229,6 +229,12 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   *Reuse.*
 - **Sessions** — `tower-sessions` with a SQLite store and signed/encrypted cookies, composing with
   onyums-skin clearance tokens into one identity story. *Reuse.*
+- **Outbound mailer (Tor-native, opt-in)** — transactional email (password resets, notifications) à
+  la ActionMailer, but **relayed through onyums' own embedded arti `TorClient`** to an external SMTP
+  server, so mail leaves over a Tor circuit and never reveals the service's location. Built on
+  `lettre` and enqueued through the background-jobs queue above. Opt-in, because it needs an SMTP
+  relay configured (like every framework's mailer) — so it is not part of the zero-config default,
+  but it is supported, not excluded. *Reuse (`lettre`) + glue.*
 
 ### C. Auth & secrets
 - **Built-in auth scaffold** — password auth (`argon2` via `password-auth`) + session login
@@ -251,7 +257,9 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   *Reuse + conventions.*
 
 ### Explicit non-goals (the un-Rails parts)
-- **No mailer.** Email over Tor leaks anonymity and needs a daemon — a non-goal, not a default.
+- **No inbound mail server.** onyums won't run an MTA or receive email — that needs a listening
+  daemon and is squarely out of scope. *Outbound* transactional mail *is* supported, Tor-native and
+  opt-in (see section B) — only receiving is excluded.
 - **No heavy asset pipeline.** Ship fingerprinted static-asset serving, not a Propshaft/Vite bundler;
   onion sites are lean and no-JS-leaning.
 - **No LiveView/Hotwire reactive layer.** Server-driven reactive UIs require client JS, contradicting

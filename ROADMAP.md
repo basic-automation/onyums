@@ -303,6 +303,17 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   server-side state per client) sits behind the onyums-skin gate. SSE is the lighter default for
   server→client-only streams. *Build — the live counterpart of the SFC islands.*
 
+  > **Experiment (near-term, ahead of the rest of this phase).** WS-over-Tor already works, so the
+  > riskiest assumption here — that Tor's latency budget permits a *usable* server-driven reactive
+  > layer — can be validated **now** with a spike, independent of the SFC compiler. Build a minimal
+  > prototype (server-authoritative state → diff pushed over a Tor WebSocket → a tiny client island
+  > applies it) and measure on the live network: the real round-trip latency of one state update;
+  > how long a rendezvous-circuit-backed WS stays up and how often it drops; the reconnect +
+  > state-resync cost; and how coarse the update granularity must be to feel acceptable. The output
+  > is an empirical finding that confirms or refutes the "coarse, batched, optimistic-UI" design
+  > above and sets concrete update-granularity guidance for the full build — a cheap way to de-risk
+  > Phase 5's most uncertain piece early.
+
 ### B. Self-contained data & jobs (no daemon)
 - **Database — Turso by default.** The default datastore is **Turso** (SQLite-compatible). This keeps 
   the self-contained / single-box thesis and matches the wider toolchain (sibling projects already 

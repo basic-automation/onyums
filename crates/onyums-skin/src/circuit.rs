@@ -98,6 +98,13 @@ pub trait CircuitPolicy: Send + Sync {
 	fn on_new_stream(&self, id: &CircuitId, target: &StreamTarget) -> CircuitAction;
 	/// A request arrived on an accepted stream (per-circuit rate/quota).
 	fn on_request(&self, id: &CircuitId) -> CircuitAction;
+	/// `bytes` were transferred on the circuit (the host's choice of direction —
+	/// typically response bytes). Drives the per-circuit byte budget. The default
+	/// records nothing and accepts, so existing policies need no change.
+	fn on_bytes(&self, id: &CircuitId, bytes: u64) -> CircuitAction {
+		let _ = (id, bytes);
+		CircuitAction::Accept
+	}
 }
 
 /// Cumulative running totals for one rendezvous circuit.
@@ -107,6 +114,9 @@ pub struct CircuitStats {
 	pub streams: u64,
 	/// Requests seen on this circuit so far.
 	pub requests: u64,
+	/// Bytes transferred on this circuit so far (as reported via
+	/// [`on_bytes`](CircuitPolicy::on_bytes)).
+	pub bytes: u64,
 }
 
 /// A concrete [`CircuitPolicy`] that does per-circuit accounting and enforces
@@ -116,11 +126,12 @@ pub struct CircuitStats {
 /// - force every new circuit through the app-layer gate ("Under Attack Mode"),
 /// - tear down (`Shutdown`) a circuit that opens more than `max_streams` streams —
 ///   a circuit fanning out streams is a classic abuse pattern, torn down wholesale,
-/// - reject (`Reject`) requests on a circuit past `max_requests`.
-///
+/// - reject (`Reject`) requests on a circuit past `max_requests`,
 /// - reject (`Reject`) requests on a circuit that exceeds a time-windowed request
 ///   *rate* ([`max_request_rate`](Self::max_request_rate)) — the sustained-flood
-///   circuit-breaker, distinct from the cumulative `max_requests` ceiling.
+///   circuit-breaker, distinct from the cumulative `max_requests` ceiling,
+/// - tear down (`Shutdown`) a circuit that transfers more than `max_bytes` bytes —
+///   a per-circuit data budget against bandwidth-exhaustion abuse.
 ///
 /// All caps are opt-in; with none set the policy is accept-all and serves purely
 /// as the accounting substrate (the [`stats`](Self::stats) the host reads for
@@ -136,6 +147,7 @@ pub struct AccountingCircuitPolicy {
 	max_requests: Option<u64>,
 	/// `(max requests, per window)` — the time-windowed request-rate cap.
 	max_request_rate: Option<(u64, Duration)>,
+	max_bytes: Option<u64>,
 	under_attack: bool,
 	clock: Box<dyn Clock>,
 }
@@ -161,6 +173,7 @@ impl AccountingCircuitPolicy {
 			max_streams: None,
 			max_requests: None,
 			max_request_rate: None,
+			max_bytes: None,
 			under_attack: false,
 			clock: Box::new(SystemClock),
 		}
@@ -190,6 +203,14 @@ impl AccountingCircuitPolicy {
 	#[must_use]
 	pub const fn max_request_rate(mut self, max: u64, per: Duration) -> Self {
 		self.max_request_rate = Some((max, per));
+		self
+	}
+
+	/// Tear down any circuit that transfers more than `max` bytes (a per-circuit data
+	/// budget; the host reports transfer via [`on_bytes`](CircuitPolicy::on_bytes)).
+	#[must_use]
+	pub const fn max_bytes(mut self, max: u64) -> Self {
+		self.max_bytes = Some(max);
 		self
 	}
 
@@ -280,6 +301,16 @@ impl CircuitPolicy for AccountingCircuitPolicy {
 		}
 		CircuitAction::Accept
 	}
+
+	fn on_bytes(&self, id: &CircuitId, bytes: u64) -> CircuitAction {
+		let mut map = self.lock();
+		let state = map.entry(*id).or_default();
+		state.stats.bytes = state.stats.bytes.saturating_add(bytes);
+		if self.max_bytes.is_some_and(|max| state.stats.bytes > max) {
+			return CircuitAction::Shutdown;
+		}
+		CircuitAction::Accept
+	}
 }
 
 #[cfg(test)]
@@ -300,7 +331,7 @@ mod tests {
 		assert_eq!(policy.on_new_stream(&C1, &target()), CircuitAction::Accept);
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
-		assert_eq!(policy.stats(&C1), Some(CircuitStats { streams: 1, requests: 2 }));
+		assert_eq!(policy.stats(&C1), Some(CircuitStats { streams: 1, requests: 2, bytes: 0 }));
 	}
 
 	#[test]
@@ -332,8 +363,8 @@ mod tests {
 		let policy = AccountingCircuitPolicy::new();
 		policy.on_new_stream(&C1, &target());
 		policy.on_request(&C2);
-		assert_eq!(policy.stats(&C1), Some(CircuitStats { streams: 1, requests: 0 }));
-		assert_eq!(policy.stats(&C2), Some(CircuitStats { streams: 0, requests: 1 }));
+		assert_eq!(policy.stats(&C1), Some(CircuitStats { streams: 1, requests: 0, bytes: 0 }));
+		assert_eq!(policy.stats(&C2), Some(CircuitStats { streams: 0, requests: 1, bytes: 0 }));
 	}
 
 	#[test]
@@ -361,7 +392,7 @@ mod tests {
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
 		assert_eq!(policy.on_request(&C1), CircuitAction::Reject);
 		// Cumulative accounting still counts every request, throttled or not.
-		assert_eq!(policy.stats(&C1), Some(CircuitStats { streams: 0, requests: 6 }));
+		assert_eq!(policy.stats(&C1), Some(CircuitStats { streams: 0, requests: 6, bytes: 0 }));
 	}
 
 	#[test]
@@ -389,6 +420,56 @@ mod tests {
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
 		// The lifetime ceiling bites even though the rate window is wide open.
 		assert_eq!(policy.on_request(&C1), CircuitAction::Reject);
+	}
+
+	#[test]
+	fn byte_accounting_accumulates_without_cap() {
+		let policy = AccountingCircuitPolicy::new();
+		assert_eq!(policy.on_bytes(&C1, 100), CircuitAction::Accept);
+		assert_eq!(policy.on_bytes(&C1, 250), CircuitAction::Accept);
+		assert_eq!(policy.stats(&C1), Some(CircuitStats { streams: 0, requests: 0, bytes: 350 }));
+	}
+
+	#[test]
+	fn byte_cap_shuts_down_over_budget_circuit() {
+		let policy = AccountingCircuitPolicy::new().max_bytes(1000);
+		assert_eq!(policy.on_bytes(&C1, 600), CircuitAction::Accept);
+		assert_eq!(policy.on_bytes(&C1, 400), CircuitAction::Accept); // exactly at budget
+		assert_eq!(policy.on_bytes(&C1, 1), CircuitAction::Shutdown); // one byte over
+	}
+
+	#[test]
+	fn byte_budgets_are_per_circuit() {
+		let policy = AccountingCircuitPolicy::new().max_bytes(100);
+		assert_eq!(policy.on_bytes(&C1, 101), CircuitAction::Shutdown);
+		assert_eq!(policy.on_bytes(&C2, 50), CircuitAction::Accept);
+	}
+
+	#[test]
+	fn byte_accounting_saturates_rather_than_overflows() {
+		let policy = AccountingCircuitPolicy::new();
+		policy.on_bytes(&C1, u64::MAX);
+		assert_eq!(policy.on_bytes(&C1, 1), CircuitAction::Accept);
+		assert_eq!(policy.stats(&C1).map(|s| s.bytes), Some(u64::MAX));
+	}
+
+	#[test]
+	fn default_on_bytes_is_a_noop_accept() {
+		// A bare CircuitPolicy that overrides nothing else still accepts and records
+		// nothing via the default on_bytes.
+		struct AcceptAll;
+		impl CircuitPolicy for AcceptAll {
+			fn on_new_circuit(&self, _: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+			fn on_new_stream(&self, _: &CircuitId, _: &StreamTarget) -> CircuitAction {
+				CircuitAction::Accept
+			}
+			fn on_request(&self, _: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+		}
+		assert_eq!(AcceptAll.on_bytes(&C1, 9999), CircuitAction::Accept);
 	}
 
 	#[test]

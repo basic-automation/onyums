@@ -51,6 +51,51 @@ pub fn get_onion_name() -> String {
 	ONION_NAME.try_lock().map_or_else(|_| String::new(), |guard| (*guard.clone()).to_string())
 }
 
+/// A Tor v3 onion service address — the service's public identity.
+///
+/// Normalized to exactly one trailing `.onion` suffix, so it is safe to use
+/// directly as a TLS subject-alternative-name or an HTTP redirect host. This is
+/// the typed replacement for the stringly-typed, process-global onion name: the
+/// address is threaded explicitly from the launched service to the handlers that
+/// need it (TLS cert generation, the port-80 → HTTPS redirect) rather than read
+/// from a shared `static`.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OnionAddress(String);
+
+impl OnionAddress {
+	/// Normalize a raw onion service name to exactly one trailing `.onion`
+	/// suffix, handling a bare name, a single suffix, or accidental repetition.
+	#[must_use]
+	pub fn normalized(name: &str) -> Self {
+		Self(format!("{}.onion", name.trim_end_matches(".onion")))
+	}
+
+	/// The full address, including the `.onion` suffix.
+	#[must_use]
+	pub fn as_str(&self) -> &str {
+		&self.0
+	}
+
+	/// The host used for TLS SANs and redirect targets. Identical to
+	/// [`Self::as_str`]; named for intent at the call site.
+	#[must_use]
+	pub fn host(&self) -> &str {
+		&self.0
+	}
+}
+
+impl std::fmt::Display for OnionAddress {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(&self.0)
+	}
+}
+
+impl From<OnionAddress> for String {
+	fn from(address: OnionAddress) -> Self {
+		address.0
+	}
+}
+
 /// Sets up and bootstraps a Tor client.
 ///
 /// Uses onyums-specific state and cache directories (`./tor/onyums/state`,
@@ -78,23 +123,19 @@ fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &st
 		.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
 }
 
-/// Retrieves and stores the onion service name.
-async fn get_and_store_onion_name(service: &Arc<RunningOnionService>) -> Result<String> {
+/// Retrieves the onion service address from the launched service.
+fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress> {
 	event!(Level::INFO, "Getting the onion service name...");
 	let service_name = service.onion_address().ok_or_else(|| anyhow::anyhow!("Failed to get onion service name."))?.display_unredacted().to_string();
 	event!(Level::INFO, "Onion service name: {service_name}");
 
-	// Normalize to exactly one trailing `.onion` suffix (handles a bare name, a single
-	// suffix, or any accidental repetition).
-	let clean_name = format!("{}.onion", service_name.trim_end_matches(".onion"));
-
-	event!(Level::INFO, "Cleaned onion service name: {clean_name}");
-	ONION_NAME.lock().await.clone_from(&clean_name);
-	Ok(clean_name)
+	let address = OnionAddress::normalized(&service_name);
+	event!(Level::INFO, "Cleaned onion service name: {address}");
+	Ok(address)
 }
 
 /// Handles incoming stream requests by spawning tasks to process them.
-async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = StreamRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor) -> Result<()> {
+async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = StreamRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress) -> Result<()> {
 	event!(Level::INFO, "Waiting for Incoming request...");
 	while let Some(stream_request) = stream_requests.next().await {
 		let incoming_request_trace_span = span!(Level::INFO, "onyums - incoming_request");
@@ -102,10 +143,11 @@ async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = Stream
 		event!(Level::INFO, "New incoming request found...");
 		let app = app.clone();
 		let tls_acceptor = tls_acceptor.clone();
+		let address = address.clone();
 
 		tokio::spawn(async move {
 			// handle the incoming request
-			let result = handle_stream_request(stream_request, tls_acceptor, app.clone()).await;
+			let result = handle_stream_request(stream_request, tls_acceptor, app.clone(), &address).await;
 
 			if let Err(err) = result {
 				event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
@@ -116,10 +158,10 @@ async fn handle_incoming_requests(mut stream_requests: impl Stream<Item = Stream
 }
 
 /// Initializes the onion service and returns the service and request stream.
-async fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest>)> {
+fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest>)> {
 	let (service, request_stream) = launch_onion_service(client, nickname)?;
-	let _service_name = get_and_store_onion_name(&service).await?;
-	Ok((service, request_stream))
+	let address = get_onion_address(&service)?;
+	Ok((service, address, request_stream))
 }
 
 /// Prepares the request handling stream.
@@ -156,14 +198,19 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 
 	let client = setup_tor_client().await?;
 
-	let (service, request_stream) = initialize_onion_service(&client, nickname).await?;
+	let (service, address, request_stream) = initialize_onion_service(&client, nickname)?;
 
-	let tls_acceptor = tls_acceptor()?;
+	// Compat: keep the legacy process-global populated for `get_onion_name()` until
+	// the per-service handle API (Phase 0) replaces it. The serve path itself no
+	// longer reads the global — the address is threaded explicitly below.
+	*ONION_NAME.lock().await = address.to_string();
+
+	let tls_acceptor = tls_acceptor(&address)?;
 
 	let stream_requests = prepare_request_stream(request_stream);
 	tokio::pin!(stream_requests);
 
-	handle_incoming_requests(stream_requests, app, tls_acceptor).await?;
+	handle_incoming_requests(stream_requests, app, tls_acceptor, address).await?;
 
 	drop(service);
 	event!(Level::INFO, "Onion service exited cleanly.");
@@ -239,9 +286,8 @@ impl AxumConnected<Self> for ConnectionInfo {
 }
 
 // Move tls_acceptor function up, before serve
-fn tls_acceptor() -> Result<TlsAcceptor> {
-	let onion_name = get_onion_name();
-	let subject_alt_names = vec![onion_name];
+fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
+	let subject_alt_names = vec![address.host().to_string()];
 	let cert = generate_simple_self_signed(subject_alt_names).unwrap();
 
 	let key_der = match PrivatePkcs8KeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()) {
@@ -263,7 +309,7 @@ fn tls_acceptor() -> Result<TlsAcceptor> {
 }
 
 // Then handle_stream_request
-async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router) -> Result<()> {
+async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
 	let _handling_request_trace_guard = handling_request_trace_span.enter();
 	match stream_request.request().clone() {
@@ -274,8 +320,7 @@ async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsA
 		}
 		IncomingStreamRequest::Begin(begin) if begin.port() == 80 => {
 			// Handle Port 80 (Plain HTTP) - Redirect to HTTPS
-			let onion_name = get_onion_name();
-			handle_http_redirect(stream_request, onion_name).await
+			handle_http_redirect(stream_request, address.host().to_string()).await
 		}
 		_ => {
 			// Reject the incoming request
@@ -290,6 +335,33 @@ mod tests {
 	use axum::{routing::get, Router};
 
 	use super::*;
+
+	#[test]
+	fn onion_address_normalizes_bare_name() {
+		let address = OnionAddress::normalized("abcdef");
+		assert_eq!(address.as_str(), "abcdef.onion");
+		assert_eq!(address.host(), "abcdef.onion");
+	}
+
+	#[test]
+	fn onion_address_keeps_single_suffix() {
+		let address = OnionAddress::normalized("abcdef.onion");
+		assert_eq!(address.as_str(), "abcdef.onion");
+	}
+
+	#[test]
+	fn onion_address_collapses_repeated_suffix() {
+		let address = OnionAddress::normalized("abcdef.onion.onion");
+		assert_eq!(address.as_str(), "abcdef.onion");
+	}
+
+	#[test]
+	fn onion_address_display_and_into_string_match() {
+		let address = OnionAddress::normalized("abcdef");
+		assert_eq!(address.to_string(), "abcdef.onion");
+		let owned: String = address.into();
+		assert_eq!(owned, "abcdef.onion");
+	}
 
 	#[tokio::test]
 	async fn test_serve() {

@@ -194,21 +194,27 @@ impl Waf {
 		})
 	}
 
-	/// Inspect one field: match the raw string, then — if it was percent-encoded — its
-	/// decoded form, applying the multiple-encoding guard. `location` labels where the
-	/// string came from for the returned [`WafMatch`].
+	/// Inspect one field whose encoding follows path/header rules (`%XX` only, `+` is a
+	/// literal). Body inspection and the tests use this; query strings use
+	/// [`inspect_field`](Self::inspect_field) with `plus_is_space = true`.
 	fn inspect_str(&self, raw: &str, location: &str) -> Option<WafMatch> {
+		self.inspect_field(raw, location, false)
+	}
+
+	/// Inspect one field: match the raw string, then — if normalization changes it — its
+	/// decoded form, applying the multiple-encoding guard. With `plus_is_space`, a `+` is
+	/// first folded to a space (`application/x-www-form-urlencoded` semantics), so a
+	/// `+`-spaced payload (`a+OR+1=1`) trips the same rules as its space form. `location`
+	/// labels where the string came from for the returned [`WafMatch`].
+	fn inspect_field(&self, raw: &str, location: &str, plus_is_space: bool) -> Option<WafMatch> {
 		// 1. The raw string exactly as received.
 		if let Some(m) = self.match_raw(raw, location) {
 			return Some(m);
 		}
-		// 2. Decode to a fixed point. Nothing encoded → raw was the whole story.
-		let norm = normalize(raw);
-		if norm.decode_passes == 0 {
-			return None;
-		}
-		// 3. Multiply-encoded input is itself the signal: block it as an anomaly. With the
-		//    guard off, fall through and let the decoded form match a specific rule.
+		// 2. Normalize: optional '+'→space, then percent-decode to a fixed point.
+		let norm = normalize(raw, plus_is_space);
+		// 3. Multiply percent-encoded input is itself the signal: block it as an anomaly.
+		//    With the guard off, fall through and let the decoded form match a specific rule.
 		if self.block_multi_encoded && norm.decode_passes >= 2 {
 			return Some(WafMatch {
 				rule_id: MULTI_ENCODING_RULE_ID,
@@ -216,28 +222,34 @@ impl Waf {
 				location: location.to_owned(),
 			});
 		}
-		// 4. Match the decoded form (only if decoding actually changed the string).
+		// 4. Match the decoded form, but only when normalization actually changed it
+		//    (nothing encoded → raw was the whole story, already checked).
 		if norm.decoded != raw {
 			return self.match_raw(&norm.decoded, location);
 		}
 		None
 	}
 
-	/// Inspect a request's method, target (path + query), and header values. Returns
-	/// [`Verdict::Block`] on the first matching signature, else [`Verdict::Allow`].
+	/// Inspect a request's method, path, query string, and header values. The query is
+	/// scanned with `+`→space form-decoding; the path and headers are not (a `+` is
+	/// literal there). Returns [`Verdict::Block`] on the first matching signature, else
+	/// [`Verdict::Allow`].
 	#[must_use]
 	pub fn inspect(&self, parts: &Parts) -> Verdict {
-		if let Some(m) = self.inspect_str(parts.method.as_str(), "method") {
+		if let Some(m) = self.inspect_field(parts.method.as_str(), "method", false) {
 			return Verdict::Block(m);
 		}
-		if let Some(pq) = parts.uri.path_and_query()
-			&& let Some(m) = self.inspect_str(pq.as_str(), "target")
+		if let Some(m) = self.inspect_field(parts.uri.path(), "target", false) {
+			return Verdict::Block(m);
+		}
+		if let Some(query) = parts.uri.query()
+			&& let Some(m) = self.inspect_field(query, "query", true)
 		{
 			return Verdict::Block(m);
 		}
 		for (name, value) in &parts.headers {
 			if let Ok(s) = value.to_str()
-				&& let Some(m) = self.inspect_str(s, &format!("header:{name}"))
+				&& let Some(m) = self.inspect_field(s, &format!("header:{name}"), false)
 			{
 				return Verdict::Block(m);
 			}
@@ -259,11 +271,14 @@ struct Normalized {
 	decode_passes: usize,
 }
 
-/// Iteratively percent-decode `input` until it stops changing or [`MAX_DECODE_PASSES`]
-/// is reached. The pass count distinguishes un-encoded (`0`), singly-encoded (`1`), and
-/// the evasive multiply-encoded (`>= 2`) cases.
-fn normalize(input: &str) -> Normalized {
-	let mut cur = input.to_owned();
+/// Normalize `input` for matching: when `plus_is_space`, first fold `+` to a space
+/// (`application/x-www-form-urlencoded` semantics), then iteratively percent-decode
+/// until it stops changing or [`MAX_DECODE_PASSES`] is reached. `decode_passes` counts
+/// only the percent-decode passes (the `+` fold is not multi-encoding), distinguishing
+/// un-encoded (`0`), singly-encoded (`1`), and the evasive multiply-encoded (`>= 2`)
+/// cases. `decoded` may differ from `input` through the `+` fold alone.
+fn normalize(input: &str, plus_is_space: bool) -> Normalized {
+	let mut cur = if plus_is_space { input.replace('+', " ") } else { input.to_owned() };
 	let mut passes = 0;
 	while passes < MAX_DECODE_PASSES {
 		let (next, changed) = percent_decode_once(&cur);
@@ -593,10 +608,38 @@ mod tests {
 
 	#[test]
 	fn normalize_counts_decode_passes() {
-		assert_eq!(normalize("plain/path").decode_passes, 0);
-		assert_eq!(normalize("%2e%2e").decode_passes, 1);
-		assert_eq!(normalize("%252e").decode_passes, 2);
+		assert_eq!(normalize("plain/path", false).decode_passes, 0);
+		assert_eq!(normalize("%2e%2e", false).decode_passes, 1);
+		assert_eq!(normalize("%252e", false).decode_passes, 2);
 		// Decoding stops at the cap even if more layers remain.
-		assert!(normalize("%25252525252e").decode_passes <= MAX_DECODE_PASSES);
+		assert!(normalize("%25252525252e", false).decode_passes <= MAX_DECODE_PASSES);
+	}
+
+	#[test]
+	fn plus_folds_to_space_only_when_requested() {
+		// '+' is a literal in a path/header, a space in a query/form field.
+		let n_path = normalize("a+b", false);
+		assert_eq!(n_path.decoded, "a+b");
+		assert_eq!(n_path.decode_passes, 0);
+		let n_query = normalize("a+b", true);
+		assert_eq!(n_query.decoded, "a b");
+	}
+
+	#[test]
+	fn plus_encoded_sqli_in_query_is_caught() {
+		// `a+OR+1=1` evades the whitespace-requiring tautology rule on the raw string but
+		// trips it once '+' folds to a space in the query field.
+		let waf = Waf::starter();
+		let v = waf.inspect(&parts("GET", "/login?user=a+OR+1=1"));
+		let m = blocked(&v);
+		assert_eq!(m.category, WafCategory::Sqli);
+		assert_eq!(m.location, "query");
+	}
+
+	#[test]
+	fn plus_in_path_is_not_treated_as_space() {
+		// A literal '+' in a path segment must not be folded — no false "query" decoding.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect(&parts("GET", "/c++/reference")), Verdict::Allow);
 	}
 }

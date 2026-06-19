@@ -197,8 +197,17 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
 *conventions and glue* that make them feel like one framework.
 
 ### A. Server-rendered MVC core (no-JS-first)
-- **Views / templating** — `askama` / `rinja` (compile-time, type-checked, Jinja-like) as the
-  default, `maud` for macro HTML, with first-class `IntoResponse` integration. *Reuse.*
+- **Views — single-file components (Vue/Nuxt SFC syntax), server-rendered.** The default view layer
+  is the SFC: one file with `<template>` / `<script>` / `<style scoped>`, a component model with
+  props and slots, and template directives (interpolation, conditionals, loops). Crucially it is
+  **compiled to server-rendered HTML — an `axum` `Response`** — not to client-side JS: the SFC
+  renders fully on the server (no-JS-first), with reactive "islands" as optional progressive
+  enhancement only where JS is available. This adopts Vue's beloved single-file ergonomics while
+  staying true to the no-JS thesis. Under the hood it lowers onto a Rust template engine
+  (`askama` / `maud`) or a purpose-built compiler, but the surface is the SFC, not raw templates.
+  Other Vue/Nuxt cues in the same convention-over-configuration spirit: file-based routing (a
+  `pages/` directory → axum routes) and layouts/slots. *Build (the SFC compiler) — the headline DX
+  bet of this phase, and the clearest "abstraction over axum" of the framework layer.*
 - **Typed forms + validation** — `axum::Form` extraction + `garde` / `validator`, with
   server-rendered error re-rendering (Laravel Form Requests / Phoenix changesets). The no-JS form is
   the primary UI, not a fallback. *Reuse + glue.*
@@ -207,10 +216,13 @@ optional parts. Where a mature pure-Rust crate exists we **reuse**; the value on
   *Reuse + small build.*
 
 ### B. Self-contained data & jobs (no daemon)
-- **ORM + migrations** — `sqlx` (compile-time-checked queries + migrations) or `sea-orm` (richer
-  entity API), defaulting to **SQLite in production** (Rails-8 style), with migrations + seeds. The
-  one pragmatic FFI is the SQLite C engine (`rusqlite`/`libsqlite3-sys`); the fully pure-Rust path
-  (Turso's `limbo`) is the track to watch for a no-FFI onyums. *Reuse.*
+- **Database — Turso by default.** The default datastore is **Turso** (SQLite-compatible): the
+  embedded **libSQL** today — single-file, no daemon, with optional embedded replicas / sync for
+  backup without standing up a database server — converging on the **pure-Rust Turso Database**
+  (formerly Limbo) as it matures, which also lands the no-FFI goal. This keeps the self-contained /
+  single-box thesis and matches the wider toolchain (sibling projects already run on Turso/libSQL). A
+  query + migration layer (`sqlx` compile-time-checked queries, or `sea-orm` for a richer entity
+  API) plus seeds sits on top. *Reuse (libSQL today) → track the pure-Rust engine.*
 - **Background jobs / queue** — `apalis` on its **SQLite backend** (no Redis): the Solid-Queue
   analog — enqueue, retry, schedule, all in the app DB. *Reuse.*
 - **Cache** — `moka` in-process (Solid-Cache analog for a single box); a DB-backed tier optional.

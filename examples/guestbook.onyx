@@ -1,0 +1,153 @@
+<!--
+  examples/guestbook.onyx — ASPIRATIONAL onyums single-file component.
+
+  This is a Phase-5 design target, NOT compilable code yet (see ROADMAP.md → "Phase 5 — The
+  framework layer"). It exists to pin down what an onyums SFC should feel like.
+
+  What it demonstrates:
+    • all five blocks: <template>, <rust>, <script>, <style scoped>, <style>
+    • <rust> is "<script setup>, in Rust": a Composition-API analog (ref/computed/lifecycle),
+      async + Send + Sync, on the tokio multithreaded runtime
+    • <script> is real Vue.js <script setup> (JavaScript) for the client-enhancement layer
+    • THE HOOK, NOT THE BLOCK, DECIDES WHERE CODE RUNS:
+        - server-phase  (setup, on_server_prefetch)      → runs on the server during SSR
+        - server action (#[server])                       → compiles to an axum endpoint
+        - client-phase  (on_mounted, …)                   → runs on the client (Rust→WASM / Vue JS)
+    • no-JS-first: the server-rendered list + plain <form> POST work with JS fully disabled
+      (Tor "Safest"); every island is purely additive and inert without JS/WASM.
+
+  A guestbook for an onion site: anyone can sign it; signatures persist in Turso.
+-->
+
+<template>
+  <section class="guestbook">
+    <h1>{{ title }}</h1>
+
+    <!-- Flash from the last server action — server-rendered, owned by <rust>. -->
+    <p v-if="flash" class="flash" role="status">{{ flash.message }}</p>
+
+    <!-- BASELINE: a plain form POSTing to the `sign` server action. Works with zero JS,
+         because `sign` is a real axum endpoint and `sign.url` is its generated path.
+         CSRF + the onyums-skin gate are applied to that endpoint automatically. -->
+    <form method="post" :action="sign.url" class="sign-form">
+      <CsrfField />
+
+      <label for="name">Name</label>
+      <input id="name" name="name" maxlength="40" required />
+
+      <label for="message">Message</label>
+      <textarea id="message" name="message" maxlength="280" required></textarea>
+
+      <!-- ENHANCEMENT (owned by the Vue <script> island): a live char counter.
+           v-if'd on `jsReady`, so it renders nothing in the no-JS baseline. -->
+      <small v-if="jsReady" class="counter">{{ remaining }} characters left</small>
+
+      <button type="submit">Sign the guestbook</button>
+    </form>
+
+    <!-- Server-rendered list (filled by on_server_prefetch; owned by <rust>).
+         The WASM island below refreshes it in place when JS/WASM is available. -->
+    <ol v-if="entries" class="entries">
+      <li v-for="entry in entries" :key="entry.id">
+        <strong>{{ entry.name }}</strong>
+        <time :datetime="entry.created_at">{{ entry.relative_time }}</time>
+        <p>{{ entry.message }}</p>
+      </li>
+    </ol>
+    <p v-else class="empty">No one has signed yet — be the first.</p>
+  </section>
+</template>
+
+<rust>
+// `<rust>` == `<script setup>`, in Rust. Top-level setup; bindings are auto-exposed to
+// <template>. Async-native and Send + Sync on the tokio multithreaded runtime.
+
+use onyums::prelude::*;        // ref, computed, on_server_prefetch, on_mounted, server, db, use_flash, ...
+use crate::models::Entry;      // a Turso-backed row: { id, name, message, created_at, relative_time }
+
+// Props from the router/parent — Vue `defineProps`, but a typed Rust struct.
+#[derive(Props)]
+struct Props {
+    #[prop(default = "Guestbook")]
+    title: String,
+}
+let props = define_props::<Props>();
+
+// Reactive state (Vue `ref`). `entries` is filled during SSR and re-filled on the
+// client by the WASM island; the template re-renders on `.set()`.
+let entries = ref::<Vec<Entry>>(Vec::new());
+let flash   = use_flash();     // one-shot message surfaced after a redirect from `sign`
+
+// SERVER-PHASE — runs only on the server during SSR; never shipped to the client.
+// Being async, it `.await`s Turso directly: no Resource/Suspense ceremony.
+on_server_prefetch(async {
+    entries.set(recent_entries().await?);
+    Ok(())
+});
+
+// SERVER ACTION → compiled to an axum endpoint. The <form> POSTs here with no JS;
+// enhanced clients can `fetch` it. Runs behind the onyums-skin gate + CSRF check.
+#[server]
+async fn sign(name: String, message: String) -> Result<Redirect> {
+    let (name, message) = (name.trim(), message.trim());
+    if name.is_empty() || message.is_empty() || message.chars().count() > 280 {
+        use_flash().error("Enter a name and a message under 280 characters.");
+        return Ok(Redirect::back());
+    }
+    db().execute("insert into entries (name, message) values (?, ?)", (name, message))
+        .await?;
+    use_flash().success("Thanks for signing!");
+    Ok(Redirect::to("/guestbook"))
+}
+
+// SERVER FUNCTION → endpoint, but also called on the server in `on_server_prefetch`.
+// One definition, used from both sides of the wire.
+#[server]
+async fn recent_entries() -> Result<Vec<Entry>> {
+    db().query_as::<Entry>("select * from entries order by created_at desc limit 50")
+        .fetch_all()
+        .await
+}
+
+// CLIENT-PHASE — compiles to WASM; runs only after hydration, where JS/WASM exists;
+// skipped entirely under Tor "Safest". Progressive enhancement: poll for new
+// signatures every 30s and swap them in without a full page reload.
+on_mounted(|| {
+    set_interval(Duration::from_secs(30), || async {
+        entries.set(recent_entries().await?);   // calls the endpoint from the browser
+        Ok(())
+    });
+});
+</rust>
+
+<script>
+// `<script>` == Vue's `<script setup>`, in real JavaScript. Client island only — a live
+// "characters left" counter. Gated by `jsReady`, so it's inert under Tor "Safest".
+import { ref, computed, onMounted } from 'vue'
+
+const jsReady = ref(true)                         // proves JS ran; <small> is v-if'd on this
+const used = ref(0)
+const remaining = computed(() => 280 - used.value)
+
+onMounted(() => {
+  const box = document.getElementById('message')
+  box.addEventListener('input', () => { used.value = box.value.length })
+})
+</script>
+
+<style scoped>
+/* Scoped to this component (compiled to data-attribute selectors). */
+.guestbook { max-width: 42rem; margin-inline: auto; }
+.sign-form { display: grid; gap: .5rem; margin-block: 1.5rem; }
+.entries time { margin-inline-start: .5rem; color: var(--muted); font-size: .85em; }
+.flash { padding: .5rem .75rem; border-radius: .375rem; background: var(--accent-soft); }
+.empty { color: var(--muted); font-style: italic; }
+</style>
+
+<style>
+/* Global tokens this page relies on (un-scoped). */
+:root {
+  --muted: #6b7280;
+  --accent-soft: #1f2937;
+}
+</style>

@@ -208,8 +208,12 @@ impl SecurityEventSink for CapturingSink {
 /// watches to see attack pressure and gate health at a glance.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SecurityMetrics {
-	/// WAF signature blocks ([`SecurityEvent::WafBlock`]).
+	/// WAF signature blocks ([`SecurityEvent::WafBlock`]), all categories.
 	pub waf_blocks: u64,
+	/// WAF blocks broken down by [`WafCategory`], indexed by
+	/// [`WafCategory::index`]. Read it ergonomically with
+	/// [`waf_blocks_in`](Self::waf_blocks_in); the per-index sum equals [`waf_blocks`](Self::waf_blocks).
+	pub waf_blocks_by_category: [u64; WafCategory::ALL.len()],
 	/// Per-token rate-limit trips ([`SecurityEvent::RateLimited`]).
 	pub rate_limited: u64,
 	/// Challenges presented ([`SecurityEvent::ChallengeIssued`]).
@@ -225,6 +229,13 @@ pub struct SecurityMetrics {
 }
 
 impl SecurityMetrics {
+	/// WAF blocks attributed to one [`WafCategory`] — which attack class is hitting the
+	/// service hardest.
+	#[must_use]
+	pub const fn waf_blocks_in(&self, category: WafCategory) -> u64 {
+		self.waf_blocks_by_category[category.index()]
+	}
+
 	/// The share of decided challenges that were cleared — `passed / (passed + failed)`.
 	/// Returns `None` until at least one challenge has been decided (no submissions yet),
 	/// so a fresh gate does not report a misleading `0%`. A low ratio under load is a
@@ -250,6 +261,7 @@ pub struct MetricsSink {
 #[derive(Default)]
 struct MetricsCounters {
 	waf_blocks: AtomicU64,
+	waf_by_category: [AtomicU64; WafCategory::ALL.len()],
 	rate_limited: AtomicU64,
 	challenges_issued: AtomicU64,
 	challenges_passed: AtomicU64,
@@ -271,8 +283,13 @@ impl MetricsSink {
 	#[must_use]
 	pub fn snapshot(&self) -> SecurityMetrics {
 		let c = &self.inner;
+		let mut waf_blocks_by_category = [0u64; WafCategory::ALL.len()];
+		for (slot, counter) in waf_blocks_by_category.iter_mut().zip(c.waf_by_category.iter()) {
+			*slot = counter.load(Ordering::Relaxed);
+		}
 		SecurityMetrics {
 			waf_blocks: c.waf_blocks.load(Ordering::Relaxed),
+			waf_blocks_by_category,
 			rate_limited: c.rate_limited.load(Ordering::Relaxed),
 			challenges_issued: c.challenges_issued.load(Ordering::Relaxed),
 			challenges_passed: c.challenges_passed.load(Ordering::Relaxed),
@@ -285,6 +302,10 @@ impl MetricsSink {
 
 impl SecurityEventSink for MetricsSink {
 	fn record(&self, event: &SecurityEvent) {
+		// A WAF block also bumps its per-category counter (the total is counted below).
+		if let SecurityEvent::WafBlock { category, .. } = event {
+			self.inner.waf_by_category[category.index()].fetch_add(1, Ordering::Relaxed);
+		}
 		let counter = match event {
 			SecurityEvent::WafBlock { .. } => &self.inner.waf_blocks,
 			SecurityEvent::RateLimited { .. } => &self.inner.rate_limited,
@@ -407,6 +428,29 @@ mod tests {
 		assert_eq!(m.challenges_failed, 1);
 		assert_eq!(m.challenges_unavailable, 1);
 		assert_eq!(m.circuit_actions, 1);
+		// The two WAF blocks split one Sqli + one Xss.
+		assert_eq!(m.waf_blocks_in(WafCategory::Sqli), 1);
+		assert_eq!(m.waf_blocks_in(WafCategory::Xss), 1);
+		assert_eq!(m.waf_blocks_in(WafCategory::PathTraversal), 0);
+	}
+
+	#[test]
+	fn waf_category_index_round_trips_and_breakdown_sums_to_total() {
+		// The index is a stable bijection over ALL, so array-backed counters are correct.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+
+		let sink = MetricsSink::new();
+		for _ in 0..3 {
+			sink.record(&SecurityEvent::WafBlock { rule_id: "p", category: WafCategory::PathTraversal, location: "target".to_owned() });
+		}
+		sink.record(&SecurityEvent::WafBlock { rule_id: "s", category: WafCategory::Sqli, location: "query".to_owned() });
+		let m = sink.snapshot();
+		assert_eq!(m.waf_blocks_in(WafCategory::PathTraversal), 3);
+		assert_eq!(m.waf_blocks_in(WafCategory::Sqli), 1);
+		// The per-category breakdown sums to the all-categories total.
+		assert_eq!(m.waf_blocks_by_category.iter().sum::<u64>(), m.waf_blocks);
 	}
 
 	#[test]

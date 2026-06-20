@@ -58,6 +58,9 @@ pub enum WafCategory {
 }
 
 impl WafCategory {
+	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
+	pub const ALL: [WafCategory; 5] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::ProtocolAnomaly];
+
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
 	pub const fn name(self) -> &'static str {
@@ -67,6 +70,19 @@ impl WafCategory {
 			Self::PathTraversal => "path_traversal",
 			Self::CommandInjection => "command_injection",
 			Self::ProtocolAnomaly => "protocol_anomaly",
+		}
+	}
+
+	/// A stable dense index in `0..`[`ALL.len()`](Self::ALL), for array-backed per-category
+	/// counters. `WafCategory::ALL[c.index()] == c` for every category.
+	#[must_use]
+	pub const fn index(self) -> usize {
+		match self {
+			Self::Sqli => 0,
+			Self::Xss => 1,
+			Self::PathTraversal => 2,
+			Self::CommandInjection => 3,
+			Self::ProtocolAnomaly => 4,
 		}
 	}
 }

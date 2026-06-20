@@ -125,9 +125,19 @@ impl Skin {
 	/// challenge self-clears (e.g. an aged patience ticket).
 	fn present_challenge(&self, parts: &Parts) -> Response {
 		match self.challenge.issue(parts, self.client_has_js) {
-			Gate::Pass(level) => self.cleared_redirect(&self.store.mint(level, self.clearance_ttl)),
-			Gate::Present(resp) => resp,
-			Gate::Reject => (StatusCode::FORBIDDEN, "No challenge available for this client.").into_response(),
+			Gate::Pass(level) => {
+				// A self-clearing challenge (e.g. an aged patience ticket) is a pass.
+				self.sink.record(&SecurityEvent::ChallengePassed { level });
+				self.cleared_redirect(&self.store.mint(level, self.clearance_ttl))
+			}
+			Gate::Present(resp) => {
+				self.sink.record(&SecurityEvent::ChallengeIssued { client_has_js: self.client_has_js });
+				resp
+			}
+			Gate::Reject => {
+				self.sink.record(&SecurityEvent::ChallengeUnavailable);
+				(StatusCode::FORBIDDEN, "No challenge available for this client.").into_response()
+			}
 		}
 	}
 
@@ -175,10 +185,13 @@ impl Skin {
 				// Phase 1: the submission route is the JS PoW path, so the minted level
 				// is Pow. When CAPTCHA lands as a second submitting gate, the level
 				// should come from the verifying challenge rather than be assumed here.
+				self.sink.record(&SecurityEvent::ChallengePassed { level: ClearanceLevel::Pow });
 				let token = self.store.mint(ClearanceLevel::Pow, self.clearance_ttl);
 				return Decision::Respond(self.cleared_redirect(&token));
 			}
-			// A bad/again submission re-presents the challenge.
+			// A bad/again submission re-presents the challenge (which itself emits a
+			// ChallengeIssued event).
+			self.sink.record(&SecurityEvent::ChallengeFailed);
 			return Decision::Respond(self.present_challenge(parts));
 		}
 
@@ -781,5 +794,66 @@ mod tests {
 		let events = sink.events();
 		assert_eq!(events.len(), 1);
 		assert!(matches!(&events[0], SecurityEvent::WafBlock { location, .. } if location == "body"));
+	}
+
+	#[test]
+	fn uncleared_request_emits_challenge_issued() {
+		let (skin, _store, sink) = observed_gate(30);
+		let _ = skin.decide(&bare_parts("/"));
+		let events = sink.events();
+		assert_eq!(events, vec![SecurityEvent::ChallengeIssued { client_has_js: true }]);
+	}
+
+	#[test]
+	fn bad_submission_emits_failed_then_reissued() {
+		let (skin, _store, sink) = observed_gate(30);
+		// A garbage submission fails verification, then the gate re-presents the challenge.
+		let _ = skin.decide(&bare_parts(&format!("{DEFAULT_SUBMIT_PATH}?puzzle=AAAA.BBBB&nonce=AAAA")));
+		let events = sink.events();
+		assert_eq!(events, vec![SecurityEvent::ChallengeFailed, SecurityEvent::ChallengeIssued { client_has_js: true }]);
+	}
+
+	#[test]
+	fn no_available_challenge_emits_unavailable() {
+		// A JS-only chain against a no-JS client has no fitting challenge: the gate rejects
+		// and emits ChallengeUnavailable.
+		let store = Arc::new(HmacClearanceStore::new(b"unavail-secret".to_vec()));
+		let sink = CapturingSink::new();
+		let skin = Skin::builder()
+			.store(store.clone())
+			.client_has_js(false)
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
+			.events(Arc::new(sink.clone()))
+			.build();
+		match skin.decide(&bare_parts("/")) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+			Decision::Forward => panic!("a no-JS client against a JS-only chain must be rejected"),
+		}
+		assert_eq!(sink.events(), vec![SecurityEvent::ChallengeUnavailable]);
+	}
+
+	#[tokio::test]
+	async fn solved_submission_emits_challenge_passed() {
+		let store = Arc::new(HmacClearanceStore::new(b"pass-secret".to_vec()));
+		let sink = CapturingSink::new();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).events(Arc::new(sink.clone())).build();
+
+		// Issue, solve, and submit a real PoW puzzle (mirrors the mint/redirect test).
+		let pow = PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY);
+		let html = match pow.issue(&bare_parts("/")) {
+			Gate::Present(resp) => String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap(),
+			_ => panic!("PoW issues an interstitial"),
+		};
+		let seed_hex = js_var(&html, "SEED");
+		let envelope = js_var(&html, "PUZZLE").to_owned();
+		let mut seed = [0u8; 32];
+		for (i, byte) in seed.iter_mut().enumerate() {
+			*byte = u8::from_str_radix(&seed_hex[i * 2..i * 2 + 2], 16).unwrap();
+		}
+		let nonce = Hashcash.solve(&Puzzle { seed, difficulty: TEST_DIFFICULTY });
+		let nonce_b64 = base64::Engine::encode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, nonce);
+		let _ = skin.decide(&bare_parts(&format!("{DEFAULT_SUBMIT_PATH}?puzzle={envelope}&nonce={nonce_b64}")));
+
+		assert_eq!(sink.events(), vec![SecurityEvent::ChallengePassed { level: ClearanceLevel::Pow }]);
 	}
 }

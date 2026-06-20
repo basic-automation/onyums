@@ -25,6 +25,7 @@ pub mod circuit;
 pub mod clearance;
 pub mod difficulty;
 pub mod layer;
+pub mod observe;
 pub mod ratelimit;
 pub mod waf;
 
@@ -37,5 +38,6 @@ pub use circuit::{
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
 pub use difficulty::AdaptiveDifficulty;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
+pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};
 pub use ratelimit::{Quota, SkinRateLimit};
 pub use waf::{Rule, Verdict, Waf, WafCategory, WafMatch};

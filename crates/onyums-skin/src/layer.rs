@@ -30,7 +30,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{
-	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, ratelimit::SkinRateLimit, waf::{Verdict, Waf}
+	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -58,6 +58,7 @@ pub struct Skin {
 	challenge: ChallengeChain,
 	ratelimit: Option<SkinRateLimit>,
 	waf: Option<Waf>,
+	sink: Arc<dyn SecurityEventSink>,
 	cookie_name: String,
 	submit_path: String,
 	return_path: String,
@@ -153,6 +154,7 @@ impl Skin {
 		if let Some(waf) = &self.waf
 			&& let Verdict::Block(m) = waf.inspect(parts)
 		{
+			self.sink.record(&waf_block_event(&m));
 			return Decision::Respond(waf_block_response(&m));
 		}
 
@@ -161,6 +163,7 @@ impl Skin {
 			if let Some(rl) = &self.ratelimit
 				&& !rl.check(&clearance.id)
 			{
+				self.sink.record(&SecurityEvent::RateLimited { token: clearance.id });
 				return Decision::Respond((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded.").into_response());
 			}
 			return Decision::Forward;
@@ -185,8 +188,13 @@ impl Skin {
 }
 
 /// The `403` served when a [`Waf`] rule fires (on a request field or its body).
-fn waf_block_response(m: &crate::waf::WafMatch) -> Response {
+fn waf_block_response(m: &WafMatch) -> Response {
 	(StatusCode::FORBIDDEN, format!("Blocked by WAF rule {} ({}).", m.rule_id, m.category.name())).into_response()
+}
+
+/// The structured [`SecurityEvent`] for a WAF block, built from the firing match.
+fn waf_block_event(m: &WafMatch) -> SecurityEvent {
+	SecurityEvent::WafBlock { rule_id: m.rule_id, category: m.category, location: m.location.clone() }
 }
 
 /// Outcome of [`Skin::decide`]: either serve a Skin response directly, or let the
@@ -255,6 +263,7 @@ where
 								if let Some(waf) = &skin.waf
 									&& let Verdict::Block(m) = waf.inspect_body(&bytes)
 								{
+									skin.sink.record(&waf_block_event(&m));
 									return Ok(waf_block_response(&m));
 								}
 								Body::from(bytes)
@@ -278,6 +287,7 @@ pub struct SkinBuilder {
 	challenges: Vec<Box<dyn Challenge>>,
 	ratelimit: Option<SkinRateLimit>,
 	waf: Option<Waf>,
+	sink: Option<Arc<dyn SecurityEventSink>>,
 	cookie_name: String,
 	submit_path: String,
 	return_path: String,
@@ -287,7 +297,7 @@ pub struct SkinBuilder {
 
 impl Default for SkinBuilder {
 	fn default() -> Self {
-		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
+		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, sink: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
 	}
 }
 
@@ -312,6 +322,17 @@ impl SkinBuilder {
 	#[must_use]
 	pub fn rate_limit(mut self, limiter: SkinRateLimit) -> Self {
 		self.ratelimit = Some(limiter);
+		self
+	}
+
+	/// Route structured [`SecurityEvent`](crate::observe::SecurityEvent)s to a custom
+	/// [`SecurityEventSink`] (metrics, audit log, alerting). Defaults to
+	/// [`TracingSink`](crate::observe::TracingSink), which logs them under the
+	/// `onyums_skin::security` target; pass [`NullSink`](crate::observe::NullSink) to opt
+	/// out entirely.
+	#[must_use]
+	pub fn events(mut self, sink: Arc<dyn SecurityEventSink>) -> Self {
+		self.sink = Some(sink);
 		self
 	}
 
@@ -366,7 +387,7 @@ impl SkinBuilder {
 	/// Finish building the gate.
 	#[must_use]
 	pub fn build(self) -> Skin {
-		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
+		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, sink: self.sink.unwrap_or_else(|| Arc::new(TracingSink)), cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
 	}
 }
 
@@ -378,7 +399,7 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		challenge::{patience::PatienceChallenge, pow::{Hashcash, PowChallenge, Puzzle}}, clearance::ClearanceStore, ratelimit::SkinRateLimit
+		challenge::{patience::PatienceChallenge, pow::{Hashcash, PowChallenge, Puzzle}}, clearance::ClearanceStore, observe::CapturingSink, ratelimit::SkinRateLimit
 	};
 
 	/// Test difficulty kept low so the in-test PoW solve returns instantly.
@@ -677,5 +698,88 @@ mod tests {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::OK),
 			Decision::Forward => panic!("uncleared request is challenged"),
 		}
+	}
+
+	/// A gate over a known store, the starter WAF, a per-token rate limit, and a
+	/// [`CapturingSink`] returned alongside so tests can read the emitted events.
+	fn observed_gate(rate: u32) -> (Skin, Arc<HmacClearanceStore>, CapturingSink) {
+		let store = Arc::new(HmacClearanceStore::new(b"observe-secret".to_vec()));
+		let sink = CapturingSink::new();
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter())
+			.rate_limit(SkinRateLimit::per_second(std::num::NonZeroU32::new(rate).unwrap()))
+			.events(Arc::new(sink.clone()))
+			.build();
+		(skin, store, sink)
+	}
+
+	#[test]
+	fn waf_block_emits_a_security_event() {
+		let (skin, _store, sink) = observed_gate(30);
+		let parts = Request::builder().uri("/").header("user-agent", "<script>alert(1)</script>").body(()).unwrap().into_parts().0;
+		let _ = skin.decide(&parts);
+		let events = sink.events();
+		assert_eq!(events.len(), 1, "exactly one WAF block event");
+		match &events[0] {
+			SecurityEvent::WafBlock { category, location, .. } => {
+				assert_eq!(*category, crate::waf::WafCategory::Xss);
+				assert!(location.starts_with("header:"), "the match location names the offending header, got {location}");
+			}
+			other => panic!("expected a WafBlock event, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn rate_limit_trip_emits_an_event_carrying_the_token() {
+		let (skin, store, sink) = observed_gate(1);
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let id = store.verify(&token).unwrap().id;
+		let cookie = format!("{DEFAULT_COOKIE}={token}");
+
+		// Drain the burst, then flood until throttled.
+		assert!(matches!(skin.decide(&parts_with_cookie("/", &cookie)), Decision::Forward));
+		for _ in 0..5 {
+			if let Decision::Respond(_) = skin.decide(&parts_with_cookie("/", &cookie)) {
+				break;
+			}
+		}
+
+		let events = sink.events();
+		assert!(events.iter().any(|e| matches!(e, SecurityEvent::RateLimited { token } if *token == id)), "a throttled request emits a RateLimited event carrying the offending token, got {events:?}");
+		// A forwarded (un-throttled) request emits nothing.
+		assert!(events.iter().all(|e| matches!(e, SecurityEvent::RateLimited { .. })), "only rate-limit events were expected on this path, got {events:?}");
+	}
+
+	#[test]
+	fn cleared_benign_request_emits_no_event() {
+		let (skin, store, sink) = observed_gate(30);
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		assert!(matches!(skin.decide(&parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"))), Decision::Forward));
+		assert!(sink.is_empty(), "a clean, within-rate, cleared request is not a security event");
+	}
+
+	#[tokio::test]
+	async fn waf_body_block_emits_a_security_event() {
+		// A signature in the request body (inspected after the gate clears) also emits.
+		let store = Arc::new(HmacClearanceStore::new(b"observe-body-secret".to_vec()));
+		let sink = CapturingSink::new();
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter().inspect_body_up_to(64 * 1024))
+			.events(Arc::new(sink.clone()))
+			.build();
+		let mut svc = skin.into_layer().layer(Router::new().route("/post", get(|| async { "app" })));
+
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let req = Request::builder().uri("/post").header(header::COOKIE, format!("{DEFAULT_COOKIE}={token}")).body(Body::from("c=<script>steal()</script>")).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+		let events = sink.events();
+		assert_eq!(events.len(), 1);
+		assert!(matches!(&events[0], SecurityEvent::WafBlock { location, .. } if location == "body"));
 	}
 }

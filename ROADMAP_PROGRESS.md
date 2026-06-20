@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-20 — onyums-skin Phase 4 observability: structured security events + metrics (6 increments)
 
-Branch `routine/onyums-2026-06-20` → PR (base `master`). Since the last run, the
+Branch `routine/onyums-2026-06-20` → PR [#10](https://github.com/basic-automation/onyums/pull/10)
+(base `master`). Since the last run, the
 human feature branch `feat/onyums-circuitpolicy-wiring` merged as PR
 [#9](https://github.com/basic-automation/onyums/pull/9) (`master` head `d8b9019`),
 wiring onyums' rendezvous loop to the onyums-skin `CircuitPolicy`. This run branched

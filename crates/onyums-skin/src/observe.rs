@@ -13,7 +13,10 @@
 //! WAF rule id), never a network address. Emission points are wired in [`crate::layer`]
 //! (the HTTP gate) and [`crate::circuit`] (the Tor dimension).
 
-use std::sync::{Arc, Mutex};
+use std::sync::{
+	Arc, Mutex,
+	atomic::{AtomicU64, Ordering},
+};
 
 use crate::{
 	circuit::{CircuitAction, CircuitId}, clearance::{ClearanceLevel, TokenId}, waf::WafCategory
@@ -200,6 +203,125 @@ impl SecurityEventSink for CapturingSink {
 	}
 }
 
+/// A point-in-time snapshot of cumulative security-event counts, one counter per
+/// [`SecurityEvent`] variant. Cheap, `Copy`, and IP-free — the numbers an operator
+/// watches to see attack pressure and gate health at a glance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SecurityMetrics {
+	/// WAF signature blocks ([`SecurityEvent::WafBlock`]).
+	pub waf_blocks: u64,
+	/// Per-token rate-limit trips ([`SecurityEvent::RateLimited`]).
+	pub rate_limited: u64,
+	/// Challenges presented ([`SecurityEvent::ChallengeIssued`]).
+	pub challenges_issued: u64,
+	/// Challenges cleared ([`SecurityEvent::ChallengePassed`]).
+	pub challenges_passed: u64,
+	/// Challenge submissions that failed verification ([`SecurityEvent::ChallengeFailed`]).
+	pub challenges_failed: u64,
+	/// Requests with no fitting challenge ([`SecurityEvent::ChallengeUnavailable`]).
+	pub challenges_unavailable: u64,
+	/// Non-`Accept` circuit-policy decisions ([`SecurityEvent::Circuit`]).
+	pub circuit_actions: u64,
+}
+
+impl SecurityMetrics {
+	/// The share of decided challenges that were cleared — `passed / (passed + failed)`.
+	/// Returns `None` until at least one challenge has been decided (no submissions yet),
+	/// so a fresh gate does not report a misleading `0%`. A low ratio under load is a
+	/// bot-flood signal (many failed solves); a high ratio is healthy human traffic.
+	#[must_use]
+	pub fn challenge_pass_ratio(&self) -> Option<f64> {
+		let decided = self.challenges_passed + self.challenges_failed;
+		(decided > 0).then(|| self.challenges_passed as f64 / decided as f64)
+	}
+}
+
+/// A [`SecurityEventSink`] that tallies events into atomic per-variant counters, exposing
+/// a [`SecurityMetrics`] [`snapshot`](Self::snapshot) for a metrics endpoint or dashboard.
+/// Lock-free on the record path and cheaply cloneable — clones share the same counters, so
+/// a host can hand one clone to the gate and keep another to read.
+///
+/// To both log *and* count, compose this with [`TracingSink`] under a [`FanoutSink`].
+#[derive(Clone, Default)]
+pub struct MetricsSink {
+	inner: Arc<MetricsCounters>,
+}
+
+#[derive(Default)]
+struct MetricsCounters {
+	waf_blocks: AtomicU64,
+	rate_limited: AtomicU64,
+	challenges_issued: AtomicU64,
+	challenges_passed: AtomicU64,
+	challenges_failed: AtomicU64,
+	challenges_unavailable: AtomicU64,
+	circuit_actions: AtomicU64,
+}
+
+impl MetricsSink {
+	/// A fresh sink with all counters at zero.
+	#[must_use]
+	pub fn new() -> Self {
+		Self::default()
+	}
+
+	/// Read the current cumulative counts. Counters are read with `Relaxed` ordering, so a
+	/// snapshot taken during concurrent recording is internally consistent per counter but
+	/// not a single global instant — fine for monitoring.
+	#[must_use]
+	pub fn snapshot(&self) -> SecurityMetrics {
+		let c = &self.inner;
+		SecurityMetrics {
+			waf_blocks: c.waf_blocks.load(Ordering::Relaxed),
+			rate_limited: c.rate_limited.load(Ordering::Relaxed),
+			challenges_issued: c.challenges_issued.load(Ordering::Relaxed),
+			challenges_passed: c.challenges_passed.load(Ordering::Relaxed),
+			challenges_failed: c.challenges_failed.load(Ordering::Relaxed),
+			challenges_unavailable: c.challenges_unavailable.load(Ordering::Relaxed),
+			circuit_actions: c.circuit_actions.load(Ordering::Relaxed),
+		}
+	}
+}
+
+impl SecurityEventSink for MetricsSink {
+	fn record(&self, event: &SecurityEvent) {
+		let counter = match event {
+			SecurityEvent::WafBlock { .. } => &self.inner.waf_blocks,
+			SecurityEvent::RateLimited { .. } => &self.inner.rate_limited,
+			SecurityEvent::ChallengeIssued { .. } => &self.inner.challenges_issued,
+			SecurityEvent::ChallengePassed { .. } => &self.inner.challenges_passed,
+			SecurityEvent::ChallengeFailed => &self.inner.challenges_failed,
+			SecurityEvent::ChallengeUnavailable => &self.inner.challenges_unavailable,
+			SecurityEvent::Circuit { .. } => &self.inner.circuit_actions,
+		};
+		counter.fetch_add(1, Ordering::Relaxed);
+	}
+}
+
+/// A [`SecurityEventSink`] that forwards each event to several sinks in order — so a host
+/// can, e.g., both log via [`TracingSink`] and count via [`MetricsSink`] from the gate's
+/// single sink slot. Cheaply cloneable (the sink list lives behind an [`Arc`]).
+#[derive(Clone)]
+pub struct FanoutSink {
+	sinks: Arc<Vec<Arc<dyn SecurityEventSink>>>,
+}
+
+impl FanoutSink {
+	/// Fan out to each of `sinks`, in the given order.
+	#[must_use]
+	pub fn new(sinks: Vec<Arc<dyn SecurityEventSink>>) -> Self {
+		Self { sinks: Arc::new(sinks) }
+	}
+}
+
+impl SecurityEventSink for FanoutSink {
+	fn record(&self, event: &SecurityEvent) {
+		for sink in self.sinks.iter() {
+			sink.record(event);
+		}
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -260,5 +382,68 @@ mod tests {
 		let sink = TracingSink;
 		sink.record(&SecurityEvent::RateLimited { token: TokenId("abc".to_owned()) });
 		sink.record(&SecurityEvent::Circuit { id: CircuitId(1), action: CircuitAction::Shutdown });
+	}
+
+	#[test]
+	fn metrics_sink_tallies_per_variant() {
+		let sink = MetricsSink::new();
+		assert_eq!(sink.snapshot(), SecurityMetrics::default());
+
+		sink.record(&SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Sqli, location: "query".to_owned() });
+		sink.record(&SecurityEvent::WafBlock { rule_id: "y", category: WafCategory::Xss, location: "body".to_owned() });
+		sink.record(&SecurityEvent::ChallengeIssued { client_has_js: true });
+		sink.record(&SecurityEvent::ChallengePassed { level: ClearanceLevel::Pow });
+		sink.record(&SecurityEvent::ChallengePassed { level: ClearanceLevel::Patience });
+		sink.record(&SecurityEvent::ChallengeFailed);
+		sink.record(&SecurityEvent::ChallengeUnavailable);
+		sink.record(&SecurityEvent::RateLimited { token: TokenId("t".to_owned()) });
+		sink.record(&SecurityEvent::Circuit { id: CircuitId(1), action: CircuitAction::Shutdown });
+
+		let m = sink.snapshot();
+		assert_eq!(m.waf_blocks, 2);
+		assert_eq!(m.rate_limited, 1);
+		assert_eq!(m.challenges_issued, 1);
+		assert_eq!(m.challenges_passed, 2);
+		assert_eq!(m.challenges_failed, 1);
+		assert_eq!(m.challenges_unavailable, 1);
+		assert_eq!(m.circuit_actions, 1);
+	}
+
+	#[test]
+	fn metrics_clones_share_counters() {
+		let sink = MetricsSink::new();
+		let reader = sink.clone();
+		sink.record(&SecurityEvent::ChallengeFailed);
+		assert_eq!(reader.snapshot().challenges_failed, 1);
+	}
+
+	#[test]
+	fn challenge_pass_ratio_is_none_until_decided_then_correct() {
+		let sink = MetricsSink::new();
+		// No submissions decided yet: ratio is undefined, not a misleading 0%.
+		assert_eq!(sink.snapshot().challenge_pass_ratio(), None);
+
+		// 3 passed, 1 failed → 0.75. (Issued/unavailable do not move the ratio.)
+		sink.record(&SecurityEvent::ChallengeIssued { client_has_js: true });
+		for _ in 0..3 {
+			sink.record(&SecurityEvent::ChallengePassed { level: ClearanceLevel::Pow });
+		}
+		sink.record(&SecurityEvent::ChallengeFailed);
+		assert_eq!(sink.snapshot().challenge_pass_ratio(), Some(0.75));
+	}
+
+	#[test]
+	fn fanout_forwards_to_every_sink() {
+		// A fanout over a metrics sink and a capturing sink feeds both from one event.
+		let metrics = MetricsSink::new();
+		let captured = CapturingSink::new();
+		let fan = FanoutSink::new(vec![Arc::new(metrics.clone()), Arc::new(captured.clone())]);
+
+		fan.record(&SecurityEvent::ChallengeFailed);
+		fan.record(&SecurityEvent::WafBlock { rule_id: "z", category: WafCategory::CommandInjection, location: "query".to_owned() });
+
+		assert_eq!(metrics.snapshot().challenges_failed, 1);
+		assert_eq!(metrics.snapshot().waf_blocks, 1);
+		assert_eq!(captured.len(), 2);
 	}
 }

@@ -7,9 +7,11 @@
 
 use std::{
 	collections::HashMap,
-	sync::Mutex,
+	sync::{Arc, Mutex},
 	time::{Duration, Instant},
 };
+
+use crate::observe::{SecurityEvent, SecurityEventSink};
 
 /// A monotonic time source, injectable so time-windowed policy is deterministically
 /// testable without sleeping. Production uses [`SystemClock`]; tests (and downstream
@@ -157,6 +159,9 @@ pub struct AccountingCircuitPolicy {
 	max_bytes: Option<u64>,
 	under_attack: bool,
 	clock: Box<dyn Clock>,
+	/// Optional sink for [`SecurityEvent::Circuit`] events. `None` (default) emits
+	/// nothing; the host opts in with [`with_events`](Self::with_events).
+	sink: Option<Arc<dyn SecurityEventSink>>,
 }
 
 /// Internal per-circuit bookkeeping: the publicly surfaced [`CircuitStats`] plus the
@@ -183,6 +188,7 @@ impl AccountingCircuitPolicy {
 			max_bytes: None,
 			under_attack: false,
 			clock: Box::new(SystemClock),
+			sink: None,
 		}
 	}
 
@@ -236,6 +242,27 @@ impl AccountingCircuitPolicy {
 		self
 	}
 
+	/// Route a [`SecurityEvent::Circuit`] to `sink` whenever this policy returns a
+	/// non-[`Accept`](CircuitAction::Accept) action (a reject, a teardown, or an
+	/// Under-Attack-Mode challenge). Off by default — circuit accounting is a low-level
+	/// building block the host wires, so it stays silent unless events are requested.
+	#[must_use]
+	pub fn with_events(mut self, sink: Arc<dyn SecurityEventSink>) -> Self {
+		self.sink = Some(sink);
+		self
+	}
+
+	/// Emit a [`SecurityEvent::Circuit`] for a non-`Accept` action (when a sink is
+	/// configured), then return the action unchanged so call sites read `self.emit(id, a)`.
+	fn emit(&self, id: &CircuitId, action: CircuitAction) -> CircuitAction {
+		if action != CircuitAction::Accept
+			&& let Some(sink) = &self.sink
+		{
+			sink.record(&SecurityEvent::Circuit { id: *id, action });
+		}
+		action
+	}
+
 	/// The current accounting for a circuit, if it is known.
 	#[must_use]
 	pub fn stats(&self, id: &CircuitId) -> Option<CircuitStats> {
@@ -259,59 +286,57 @@ impl Default for AccountingCircuitPolicy {
 impl CircuitPolicy for AccountingCircuitPolicy {
 	fn on_new_circuit(&self, id: &CircuitId) -> CircuitAction {
 		self.lock().entry(*id).or_default();
-		if self.under_attack {
-			CircuitAction::Challenge
-		} else {
-			CircuitAction::Accept
-		}
+		let action = if self.under_attack { CircuitAction::Challenge } else { CircuitAction::Accept };
+		self.emit(id, action)
 	}
 
 	fn on_new_stream(&self, id: &CircuitId, _target: &StreamTarget) -> CircuitAction {
-		let mut map = self.lock();
-		let state = map.entry(*id).or_default();
-		state.stats.streams += 1;
-		if self.max_streams.is_some_and(|max| state.stats.streams > max) {
-			return CircuitAction::Shutdown;
-		}
-		CircuitAction::Accept
+		let over = {
+			let mut map = self.lock();
+			let state = map.entry(*id).or_default();
+			state.stats.streams += 1;
+			self.max_streams.is_some_and(|max| state.stats.streams > max)
+		};
+		self.emit(id, if over { CircuitAction::Shutdown } else { CircuitAction::Accept })
 	}
 
 	fn on_request(&self, id: &CircuitId) -> CircuitAction {
 		// Read the clock before taking the lock so we never call into a user-supplied
 		// clock while holding it.
 		let now = self.max_request_rate.map(|_| self.clock.now());
-		let mut map = self.lock();
-		let state = map.entry(*id).or_default();
-		state.stats.requests += 1;
-		if self.max_requests.is_some_and(|max| state.stats.requests > max) {
-			return CircuitAction::Reject;
-		}
-		if let (Some((max, per)), Some(now)) = (self.max_request_rate, now) {
-			let fresh_window = match state.window_start {
-				Some(start) => now.saturating_duration_since(start) >= per,
-				None => true,
-			};
-			if fresh_window {
-				state.window_start = Some(now);
-				state.window_count = 1;
+		let action = {
+			let mut map = self.lock();
+			let state = map.entry(*id).or_default();
+			state.stats.requests += 1;
+			if self.max_requests.is_some_and(|max| state.stats.requests > max) {
+				CircuitAction::Reject
+			} else if let (Some((max, per)), Some(now)) = (self.max_request_rate, now) {
+				let fresh_window = match state.window_start {
+					Some(start) => now.saturating_duration_since(start) >= per,
+					None => true,
+				};
+				if fresh_window {
+					state.window_start = Some(now);
+					state.window_count = 1;
+				} else {
+					state.window_count += 1;
+				}
+				if state.window_count > max { CircuitAction::Reject } else { CircuitAction::Accept }
 			} else {
-				state.window_count += 1;
+				CircuitAction::Accept
 			}
-			if state.window_count > max {
-				return CircuitAction::Reject;
-			}
-		}
-		CircuitAction::Accept
+		};
+		self.emit(id, action)
 	}
 
 	fn on_bytes(&self, id: &CircuitId, bytes: u64) -> CircuitAction {
-		let mut map = self.lock();
-		let state = map.entry(*id).or_default();
-		state.stats.bytes = state.stats.bytes.saturating_add(bytes);
-		if self.max_bytes.is_some_and(|max| state.stats.bytes > max) {
-			return CircuitAction::Shutdown;
-		}
-		CircuitAction::Accept
+		let over = {
+			let mut map = self.lock();
+			let state = map.entry(*id).or_default();
+			state.stats.bytes = state.stats.bytes.saturating_add(bytes);
+			self.max_bytes.is_some_and(|max| state.stats.bytes > max)
+		};
+		self.emit(id, if over { CircuitAction::Shutdown } else { CircuitAction::Accept })
 	}
 
 	fn forget(&self, id: &CircuitId) {
@@ -527,5 +552,49 @@ mod tests {
 		fn now(&self) -> Instant {
 			self.0.now()
 		}
+	}
+
+	#[test]
+	fn no_events_emitted_without_a_sink() {
+		// The default policy has no sink; a teardown must still happen, just silently —
+		// proving emission is genuinely opt-in (and the action path is unchanged).
+		let policy = AccountingCircuitPolicy::new().max_streams(1);
+		assert_eq!(policy.on_new_stream(&C1, &target()), CircuitAction::Accept);
+		assert_eq!(policy.on_new_stream(&C1, &target()), CircuitAction::Shutdown);
+	}
+
+	#[test]
+	fn shutdown_and_reject_emit_circuit_events() {
+		let sink = crate::observe::CapturingSink::new();
+		let policy = AccountingCircuitPolicy::new().max_streams(1).max_requests(1).with_events(Arc::new(sink.clone()));
+
+		// An accepted stream/request emits nothing.
+		assert_eq!(policy.on_new_stream(&C1, &target()), CircuitAction::Accept);
+		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
+		assert!(sink.is_empty(), "accepted actions are not events");
+
+		// The over-cap stream tears the circuit down; the over-ceiling request rejects.
+		assert_eq!(policy.on_new_stream(&C1, &target()), CircuitAction::Shutdown);
+		assert_eq!(policy.on_request(&C1), CircuitAction::Reject);
+
+		let events = sink.events();
+		assert_eq!(events, vec![SecurityEvent::Circuit { id: C1, action: CircuitAction::Shutdown }, SecurityEvent::Circuit { id: C1, action: CircuitAction::Reject }]);
+	}
+
+	#[test]
+	fn under_attack_challenge_emits_a_circuit_event() {
+		let sink = crate::observe::CapturingSink::new();
+		let policy = AccountingCircuitPolicy::new().under_attack(true).with_events(Arc::new(sink.clone()));
+		assert_eq!(policy.on_new_circuit(&C1), CircuitAction::Challenge);
+		assert_eq!(sink.events(), vec![SecurityEvent::Circuit { id: C1, action: CircuitAction::Challenge }]);
+	}
+
+	#[test]
+	fn byte_budget_teardown_emits_a_circuit_event() {
+		let sink = crate::observe::CapturingSink::new();
+		let policy = AccountingCircuitPolicy::new().max_bytes(100).with_events(Arc::new(sink.clone()));
+		assert_eq!(policy.on_bytes(&C1, 50), CircuitAction::Accept);
+		assert_eq!(policy.on_bytes(&C1, 60), CircuitAction::Shutdown); // over budget
+		assert_eq!(sink.events(), vec![SecurityEvent::Circuit { id: C1, action: CircuitAction::Shutdown }]);
 	}
 }

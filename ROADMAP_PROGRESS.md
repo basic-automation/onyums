@@ -7,6 +7,132 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-20 — onyums-skin Phase 4 observability: structured security events + metrics (6 increments)
+
+Branch `routine/onyums-2026-06-20` → PR (base `master`). Since the last run, the
+human feature branch `feat/onyums-circuitpolicy-wiring` merged as PR
+[#9](https://github.com/basic-automation/onyums/pull/9) (`master` head `d8b9019`),
+wiring onyums' rendezvous loop to the onyums-skin `CircuitPolicy`. This run branched
+fresh off that updated `master` and executed the prior run's documented NEXT STEP:
+**open onyums-skin ROADMAP Phase 4 (Observability)** with the structured-security-event
+system, then build the aggregate-metrics layer on top of it. All six increments are
+pure-Rust and no-Tor; the only dependency touched was `tracing`, already a declared (but
+until now unused) workspace dep. Workspace stayed green and clippy-clean after every
+increment.
+
+**Increment 1 — typed `SecurityEvent` + `SecurityEventSink` + default sinks.** *Phase 4,
+"Structured security events … emitted as typed events, not just `tracing` logs".* Files:
+`crates/onyums-skin/src/observe.rs` (new), `src/lib.rs`. A typed `SecurityEvent` enum
+(WAF block, rate-limit trip, challenge issued/passed/failed/unavailable, circuit action),
+IP-free by construction — every field is a Tor-surviving identity (clearance `TokenId`,
+host-assigned `CircuitId`, WAF rule id), never a network address. A `SecurityEventSink`
+trait the host implements to route events into metrics/audit/alerting, with three default
+sinks: `TracingSink` (emits under the `onyums_skin::security` target at a level matching
+each event's `Severity`), `NullSink` (explicit opt-out), and `CapturingSink` (in-memory,
+for tests). `kind()`/`Severity` give stable log/metric labels. **6 unit tests.**
+
+**Increment 2 — emit WAF-block + rate-limit events from the gate.** *Phase 4, "WAF
+blocks, rate-limit trips" as the first event sources.* Files: `src/layer.rs`. `Skin` now
+holds a `SecurityEventSink` (new `SkinBuilder::events(sink)`; default `TracingSink`, so
+every gate is observable out of the box). The gate records `WafBlock` (both request-line/
+header inspection in `decide` and post-clear body inspection in the service `call`) and
+`RateLimited { token }` carrying the throttled clearance id. A clean, within-rate, cleared
+request emits nothing. **4 new layer tests** over a `CapturingSink`.
+
+**Increment 3 — emit challenge-lifecycle events.** *Phase 4, "challenge issued/passed/
+failed".* Files: `src/layer.rs`. `ChallengeIssued { client_has_js }` on interstitial
+presentation; `ChallengePassed { level }` on a self-clearing patience ticket and on a
+verified submission; `ChallengeFailed` on a failed submission (followed by the re-presented
+challenge's own `ChallengeIssued`); `ChallengeUnavailable` when no challenge fits (e.g.
+JS-only chain vs. a no-JS client). The whole gate decision stream is now visible from typed
+events. **4 new layer tests** (incl. a pass via a real solved PoW).
+
+**Increment 4 — emit circuit-teardown events.** *Phase 4, "circuit teardowns".* Files:
+`src/circuit.rs`. `AccountingCircuitPolicy::with_events(sink)` routes
+`SecurityEvent::Circuit { id, action }` on any non-`Accept` action — stream-cap/byte-budget
+`Shutdown`, request-ceiling/rate `Reject`, Under-Attack-Mode `Challenge`. Opt-in (`sink`
+defaults to `None`), so onyums' existing wiring is byte-for-byte unchanged without a sink.
+The `on_*` methods were restructured to compute the action, **release the accounting lock,
+then emit** — preserving the existing "never call a user callback (clock, now sink) under
+the mutex" discipline. **4 new circuit tests.**
+
+**Increment 5 — `MetricsSink` + `FanoutSink` for aggregate metrics.** *Phase 4, "Per-token
+/ per-circuit metrics — gate pass rates".* Files: `src/observe.rs`, `src/lib.rs`.
+`MetricsSink` tallies events into lock-free atomic per-variant counters and exposes a
+`SecurityMetrics` `snapshot()`; clones share counters (one to the gate, one to read).
+`SecurityMetrics::challenge_pass_ratio()` derives passed/(passed+failed), `None` until a
+challenge is decided (no misleading 0% on a fresh gate; a low ratio under load is a
+bot-flood signal). `FanoutSink` forwards to several sinks so a host can log *and* count
+from the gate's single sink slot. **4 new observe tests.**
+
+**Increment 6 — per-category WAF-block breakdown.** *Phase 4, sharpening "see what is being
+blocked and why".* Files: `src/observe.rs`, `src/waf/mod.rs`. `MetricsSink` now keeps an
+array-backed atomic counter per `WafCategory` beside the total; `SecurityMetrics` gains
+`waf_blocks_by_category` + an ergonomic `waf_blocks_in(category)`. Backed by two new
+`WafCategory` helpers — `ALL` and a stable `index()` `0..5` bijection — so the array is
+correct by construction (`ALL[c.index()] == c`); the per-category counts sum to the total.
+**2 new/extended observe tests.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **132 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 107+1 at run start; +25 across the six increments).
+- `cargo test -p onyums --lib -- --skip test_serve`: **13 passed; 0 failed** (1 filtered) —
+  confirms the `CircuitPolicy` change did not regress onyums' no-Tor integration tests.
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** throughout (no `#[allow]`
+  added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Note — pre-existing flaky test (not introduced this run)
+`challenge::pow::challenge_tests::wrong_nonce_is_rejected` is probabilistically flaky: a
+random "wrong" nonce has ~1/256 odds of accidentally satisfying the 8-bit test difficulty
+(observed failing once, then passing 3/3 on isolated rerun). It is unrelated to this run's
+changes (no `pow.rs` edits) and passed in every full-suite run above. Flagged as a
+follow-up background task to make it deterministic (raise the test difficulty or construct
+a guaranteed-failing nonce); the PoW verify logic itself is correct.
+
+### Done vs. open (onyums-skin Phase 4 — observability)
+- **DONE this run:** the structured-security-event system end-to-end — typed `SecurityEvent`
+  + `SecurityEventSink` with `Tracing`/`Null`/`Capturing` defaults; all event sources wired
+  (WAF block, rate-limit trip, full challenge lifecycle, circuit teardown); aggregate
+  `MetricsSink` (per-variant counts, pass ratio) + `FanoutSink` composition; per-category
+  WAF breakdown. The Phase-4 "an operator can see what is being blocked and why" half is met.
+- **OPEN (Phase 4):** *adaptive difficulty driven by deviation-from-baseline* (the other
+  half of the phase "Done when") — `AdaptiveDifficulty` still ramps on raw request rate, not
+  baseline deviation; **request-shape baselining** (learn the normal UA/path/header-shape
+  distribution and flag deviation) is the larger standalone design that feeds it. Also open:
+  onyums-side consumption — exposing `SecurityMetrics` on a served route / wiring a
+  `FanoutSink(Tracing, Metrics)` into onyums' Skin setup ("feeds onyums' own Phase 4
+  observability"), which touches the live-serve path this routine cannot runtime-verify.
+- **OPEN (Phase 3):** a `wirefilter` rule-expression language; broader OWASP-CRS ruleset;
+  per-rule/category enable-disable.
+- **BLOCKED:** skin Phase 1 `CaptchaChallenge` (the `captcha` crate license audit — an open
+  ROADMAP question).
+- **NOT STARTED:** onyums server Phase 1 (identity), Phase 3 (TLS-first/strict); skin Phase 5
+  (frontier).
+
+**STOP REASON:** Landed 6 verifiable increments (above the 2–4 bar) as one coherent arc —
+the complete onyums-skin Phase 4 *structured-security-events* foundation, from the typed
+event + sink trait through every emission source to aggregate and per-category metrics.
+Every increment is green, clippy-clean, and fully unit-tested where no live Tor is required;
+nothing is half-landed. The natural next pieces are each a larger standalone design better
+started fresh: **request-shape baselining** (a statistics/learning model) to drive
+deviation-based adaptive difficulty, and **onyums-side metrics consumption** (a served
+route + Skin-setup wiring) which touches the live-serve path this routine cannot
+runtime-verify. Stopping here keeps the night's work a clean, single-theme PR.
+
+**NEXT STEP:** Begin **request-shape baselining** in onyums-skin — a `RequestShape` feature
+extractor over the Tor-surviving HTTP dimensions (UA token, path-segment shape, header
+name-set/order) and a rolling baseline that scores deviation, exposed as a new
+`SecurityEvent`/metric and (next) fed into `AdaptiveDifficulty` so difficulty ramps on
+*deviation from normal*, not raw rate — closing the Phase-4 "Done when". In parallel no-Tor
+work: the Phase-3 `wirefilter` rule-expression front-end. Separately, an onyums-side slice
+can wire `FanoutSink(TracingSink, MetricsSink)` into onyums' Skin setup and expose
+`SecurityMetrics` on an internal route (note: live-serve, not routine-verifiable).
+
+---
+
 ## 2026-06-19 (run 2) — onyums-skin Phase 3 WAF: normalization, body inspection, ruleset (4 increments)
 
 Branch `routine/onyums-2026-06-19-2` → PR [#8](https://github.com/basic-automation/onyums/pull/8)

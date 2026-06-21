@@ -94,9 +94,29 @@ pub enum SecurityEvent {
 		/// What the policy decided.
 		action: CircuitAction,
 	},
+	/// A request's shape deviated from the learned baseline (Phase 4 request-shape
+	/// baselining). Carries the deviation as **per-mille** (`0..=1000`) rather than a raw
+	/// `f64`, so the event stays `Eq`/`Hash`-friendly; build it with
+	/// [`shape_anomaly`](Self::shape_anomaly). This is a *signal*, not a block — a host
+	/// typically emits it only above a configured threshold and feeds it into difficulty
+	/// tuning.
+	ShapeAnomaly {
+		/// Deviation from baseline in per-mille: `0` = matches normal traffic, `1000` =
+		/// maximally novel. (`score * 1000`, rounded.)
+		score_permille: u16,
+	},
 }
 
 impl SecurityEvent {
+	/// Build a [`ShapeAnomaly`](Self::ShapeAnomaly) from a deviation `score` in `[0.0, 1.0]`
+	/// (as produced by [`ShapeBaseline`](crate::shape::ShapeBaseline)), quantizing it to
+	/// per-mille. Out-of-range scores are clamped.
+	#[must_use]
+	pub fn shape_anomaly(score: f64) -> Self {
+		let score_permille = (score.clamp(0.0, 1.0) * 1000.0).round() as u16;
+		Self::ShapeAnomaly { score_permille }
+	}
+
 	/// A stable, lowercase event kind for logs and metric names (the variant, not its
 	/// fields).
 	#[must_use]
@@ -109,6 +129,7 @@ impl SecurityEvent {
 			Self::ChallengeFailed => "challenge_failed",
 			Self::ChallengeUnavailable => "challenge_unavailable",
 			Self::Circuit { .. } => "circuit_action",
+			Self::ShapeAnomaly { .. } => "shape_anomaly",
 		}
 	}
 
@@ -122,7 +143,7 @@ impl SecurityEvent {
 				CircuitAction::Shutdown => Severity::Warning,
 				_ => Severity::Notice,
 			},
-			Self::RateLimited { .. } | Self::ChallengeFailed | Self::ChallengeUnavailable => Severity::Notice,
+			Self::RateLimited { .. } | Self::ChallengeFailed | Self::ChallengeUnavailable | Self::ShapeAnomaly { .. } => Severity::Notice,
 			Self::ChallengeIssued { .. } | Self::ChallengePassed { .. } => Severity::Info,
 		}
 	}
@@ -226,6 +247,8 @@ pub struct SecurityMetrics {
 	pub challenges_unavailable: u64,
 	/// Non-`Accept` circuit-policy decisions ([`SecurityEvent::Circuit`]).
 	pub circuit_actions: u64,
+	/// Request-shape anomalies flagged ([`SecurityEvent::ShapeAnomaly`]).
+	pub shape_anomalies: u64,
 }
 
 impl SecurityMetrics {
@@ -268,6 +291,7 @@ struct MetricsCounters {
 	challenges_failed: AtomicU64,
 	challenges_unavailable: AtomicU64,
 	circuit_actions: AtomicU64,
+	shape_anomalies: AtomicU64,
 }
 
 impl MetricsSink {
@@ -296,6 +320,7 @@ impl MetricsSink {
 			challenges_failed: c.challenges_failed.load(Ordering::Relaxed),
 			challenges_unavailable: c.challenges_unavailable.load(Ordering::Relaxed),
 			circuit_actions: c.circuit_actions.load(Ordering::Relaxed),
+			shape_anomalies: c.shape_anomalies.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -314,6 +339,7 @@ impl SecurityEventSink for MetricsSink {
 			SecurityEvent::ChallengeFailed => &self.inner.challenges_failed,
 			SecurityEvent::ChallengeUnavailable => &self.inner.challenges_unavailable,
 			SecurityEvent::Circuit { .. } => &self.inner.circuit_actions,
+			SecurityEvent::ShapeAnomaly { .. } => &self.inner.shape_anomalies,
 		};
 		counter.fetch_add(1, Ordering::Relaxed);
 	}
@@ -474,6 +500,27 @@ mod tests {
 		}
 		sink.record(&SecurityEvent::ChallengeFailed);
 		assert_eq!(sink.snapshot().challenge_pass_ratio(), Some(0.75));
+	}
+
+	#[test]
+	fn shape_anomaly_quantizes_and_clamps_score() {
+		// Mid-range rounds to per-mille; out-of-range clamps.
+		assert_eq!(SecurityEvent::shape_anomaly(0.5), SecurityEvent::ShapeAnomaly { score_permille: 500 });
+		assert_eq!(SecurityEvent::shape_anomaly(0.1234), SecurityEvent::ShapeAnomaly { score_permille: 123 });
+		assert_eq!(SecurityEvent::shape_anomaly(1.5), SecurityEvent::ShapeAnomaly { score_permille: 1000 });
+		assert_eq!(SecurityEvent::shape_anomaly(-2.0), SecurityEvent::ShapeAnomaly { score_permille: 0 });
+		// Kind/severity are stable.
+		let ev = SecurityEvent::shape_anomaly(0.9);
+		assert_eq!(ev.kind(), "shape_anomaly");
+		assert_eq!(ev.severity(), Severity::Notice);
+	}
+
+	#[test]
+	fn metrics_sink_tallies_shape_anomalies() {
+		let sink = MetricsSink::new();
+		sink.record(&SecurityEvent::shape_anomaly(0.8));
+		sink.record(&SecurityEvent::shape_anomaly(0.95));
+		assert_eq!(sink.snapshot().shape_anomalies, 2);
 	}
 
 	#[test]

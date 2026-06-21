@@ -13,11 +13,15 @@
 //! with [`ManualClock`](crate::circuit::ManualClock) and never needs to sleep.
 
 use std::{
-	sync::Mutex,
+	sync::{Arc, Mutex},
 	time::{Duration, Instant},
 };
 
-use crate::circuit::{Clock, SystemClock};
+use crate::{
+	circuit::{Clock, SystemClock},
+	observe::{SecurityEvent, SecurityEventSink},
+	shape::{RequestShape, ShapeBaseline},
+};
 
 /// Default rate window.
 const DEFAULT_WINDOW: Duration = Duration::from_secs(1);
@@ -152,6 +156,128 @@ impl AdaptiveDifficulty {
 	}
 }
 
+/// Default deviation band: below `0.3` deviation difficulty stays at baseline, at/above
+/// `0.9` it is maxed.
+const DEFAULT_LOW_DEV: f64 = 0.3;
+const DEFAULT_HIGH_DEV: f64 = 0.9;
+/// Default deviation at/above which a [`SecurityEvent::ShapeAnomaly`] is emitted.
+const DEFAULT_EMIT_THRESHOLD: f64 = 0.5;
+
+/// A PoW-difficulty controller driven by **deviation from the learned request-shape
+/// baseline**, the complement to [`AdaptiveDifficulty`]'s raw-rate signal and the second
+/// half of the Phase-4 "Done when" (difficulty driven by deviation-from-baseline, not just
+/// request rate — see `ROADMAP.md`).
+///
+/// It owns a [`ShapeBaseline`]: each [`observe`](Self::observe) folds a request's shape into
+/// the baseline, reads the resulting deviation in `[0.0, 1.0]`, and maps it to a difficulty:
+/// - at or below `low_dev` deviation → `baseline` (a shape matching normal traffic costs
+///   nothing extra),
+/// - at or above `high_dev` deviation → `max` (a maximally novel shape pays full effort),
+/// - in between → linearly interpolated.
+///
+/// When deviation reaches `emit_threshold`, a [`SecurityEvent::ShapeAnomaly`] is recorded to
+/// the configured sink (if any). Because the baseline returns `0.0` while still learning,
+/// difficulty stays at `baseline` during cold start — no false flagging of early traffic.
+///
+/// `Send + Sync`; the host shares one instance and calls `observe` per request when minting
+/// a puzzle. Use [`ShapeDifficulty::with_baseline`] to inject a clock-controlled baseline in
+/// tests.
+pub struct ShapeDifficulty {
+	baseline: u32,
+	max: u32,
+	low_dev: f64,
+	high_dev: f64,
+	emit_threshold: f64,
+	shapes: ShapeBaseline,
+	sink: Option<Arc<dyn SecurityEventSink>>,
+}
+
+impl ShapeDifficulty {
+	/// A controller ramping from `baseline` to `max` difficulty as request-shape deviation
+	/// climbs across the default `0.3..0.9` band, emitting a [`SecurityEvent::ShapeAnomaly`]
+	/// at deviation `>= 0.5`. `max` is clamped to at least `baseline`. Starts with a fresh
+	/// default [`ShapeBaseline`].
+	#[must_use]
+	pub fn new(baseline: u32, max: u32) -> Self {
+		Self {
+			baseline,
+			max: max.max(baseline),
+			low_dev: DEFAULT_LOW_DEV,
+			high_dev: DEFAULT_HIGH_DEV,
+			emit_threshold: DEFAULT_EMIT_THRESHOLD,
+			shapes: ShapeBaseline::new(),
+			sink: None,
+		}
+	}
+
+	/// Set the deviation band: at or below `low` deviation difficulty is `baseline`, at or
+	/// above `high` it is `max`. Both are clamped to `[0.0, 1.0]` and `high` is kept strictly
+	/// above `low`.
+	#[must_use]
+	pub fn dev_band(mut self, low: f64, high: f64) -> Self {
+		self.low_dev = low.clamp(0.0, 1.0);
+		self.high_dev = high.clamp(0.0, 1.0).max(self.low_dev + f64::EPSILON);
+		self
+	}
+
+	/// Set the deviation at/above which a [`SecurityEvent::ShapeAnomaly`] is emitted
+	/// (clamped to `[0.0, 1.0]`).
+	#[must_use]
+	pub fn emit_threshold(mut self, threshold: f64) -> Self {
+		self.emit_threshold = threshold.clamp(0.0, 1.0);
+		self
+	}
+
+	/// Replace the internal [`ShapeBaseline`] (e.g. one with a [`ManualClock`](crate::circuit::ManualClock)
+	/// or tuned decay/window).
+	#[must_use]
+	pub fn with_baseline(mut self, baseline: ShapeBaseline) -> Self {
+		self.shapes = baseline;
+		self
+	}
+
+	/// Route emitted [`SecurityEvent::ShapeAnomaly`] events to `sink`. Without one, anomalies
+	/// still raise difficulty but emit no event.
+	#[must_use]
+	pub fn events(mut self, sink: Arc<dyn SecurityEventSink>) -> Self {
+		self.sink = Some(sink);
+		self
+	}
+
+	/// The shared baseline, for observability (`total_weight`, `distinct`).
+	#[must_use]
+	pub const fn baseline(&self) -> &ShapeBaseline {
+		&self.shapes
+	}
+
+	/// Fold `shape` into the baseline, emit a [`SecurityEvent::ShapeAnomaly`] if its
+	/// deviation is at/above `emit_threshold`, and return the PoW difficulty for that
+	/// deviation. The per-request entry point.
+	pub fn observe(&self, shape: &RequestShape) -> u32 {
+		let deviation = self.shapes.observe(shape);
+		if deviation >= self.emit_threshold
+			&& let Some(sink) = &self.sink
+		{
+			sink.record(&SecurityEvent::shape_anomaly(deviation));
+		}
+		self.difficulty_for(deviation)
+	}
+
+	/// Map a deviation score to a difficulty along the configured band, without recording.
+	#[must_use]
+	pub fn difficulty_for(&self, deviation: f64) -> u32 {
+		if deviation <= self.low_dev {
+			return self.baseline;
+		}
+		if deviation >= self.high_dev {
+			return self.max;
+		}
+		let frac = (deviation - self.low_dev) / (self.high_dev - self.low_dev);
+		let span = f64::from(self.max - self.baseline);
+		self.baseline + (frac * span).round() as u32
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
@@ -241,5 +367,89 @@ mod tests {
 		}
 		// high was clamped to low+1 = 6, so rate 6 is at/above max.
 		assert_eq!(ctrl.current_difficulty(), 8);
+	}
+
+	// --- ShapeDifficulty (deviation-driven) ---
+
+	use axum::http::Request;
+
+	use crate::{observe::CapturingSink, shape::RequestShape};
+
+	fn req_shape(uri: &str, ua: &str) -> RequestShape {
+		RequestShape::from_parts(&Request::builder().uri(uri).header("user-agent", ua).body(()).unwrap().into_parts().0)
+	}
+
+	/// A [`ShapeBaseline`] on a shared [`ManualClock`], primed with `n` copies of one
+	/// "normal" shape so deviation scoring is active and that shape reads as normal.
+	fn primed_baseline(n: usize) -> (ShapeBaseline, Arc<ManualClock>) {
+		let clock = Arc::new(ManualClock::new());
+		let baseline = ShapeBaseline::new().min_observations(5.0).window(Duration::from_secs(10)).decay(0.5).with_clock(Box::new(ArcClock(clock.clone())));
+		for _ in 0..n {
+			baseline.observe(&req_shape("/", "tor-browser"));
+		}
+		(baseline, clock)
+	}
+
+	#[test]
+	fn difficulty_for_interpolates_across_dev_band() {
+		let ctrl = ShapeDifficulty::new(0, 20).dev_band(0.2, 0.8);
+		assert_eq!(ctrl.difficulty_for(0.1), 0); // below band → baseline
+		assert_eq!(ctrl.difficulty_for(0.2), 0); // at low edge → baseline
+		assert_eq!(ctrl.difficulty_for(0.5), 10); // midpoint of 0.2..0.8 → half of 20
+		assert_eq!(ctrl.difficulty_for(0.8), 20); // at high edge → max
+		assert_eq!(ctrl.difficulty_for(0.95), 20); // above band → max
+	}
+
+	#[test]
+	fn normal_shape_stays_at_baseline_and_emits_nothing() {
+		let (baseline, _clock) = primed_baseline(20);
+		let sink = CapturingSink::new();
+		let ctrl = ShapeDifficulty::new(2, 24).with_baseline(baseline).events(Arc::new(sink.clone()));
+		// The primed normal shape deviates ~0 → baseline difficulty, no anomaly event.
+		assert_eq!(ctrl.observe(&req_shape("/", "tor-browser")), 2);
+		assert!(sink.is_empty());
+	}
+
+	#[test]
+	fn novel_shape_raises_difficulty_and_emits_anomaly() {
+		let (baseline, _clock) = primed_baseline(20);
+		let sink = CapturingSink::new();
+		let ctrl = ShapeDifficulty::new(0, 20).with_baseline(baseline).events(Arc::new(sink.clone()));
+		// A never-seen shape deviates ~1.0 → max difficulty and an emitted anomaly.
+		let diff = ctrl.observe(&req_shape("/wp-login.php", "curl/8.4"));
+		assert_eq!(diff, 20);
+		let events = sink.events();
+		assert_eq!(events.len(), 1);
+		match events[0] {
+			SecurityEvent::ShapeAnomaly { score_permille } => assert!(score_permille > 900, "expected high deviation, got {score_permille}"),
+			ref other => panic!("expected ShapeAnomaly, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn cold_start_stays_at_baseline() {
+		// A baseline still under its learning floor returns deviation 0 → baseline difficulty.
+		let clock = Arc::new(ManualClock::new());
+		let baseline = ShapeBaseline::new().min_observations(50.0).with_clock(Box::new(ArcClock(clock)));
+		let ctrl = ShapeDifficulty::new(3, 30).with_baseline(baseline);
+		assert_eq!(ctrl.observe(&req_shape("/anything", "weird-bot")), 3);
+	}
+
+	#[test]
+	fn no_sink_still_raises_difficulty() {
+		let (baseline, _clock) = primed_baseline(20);
+		let ctrl = ShapeDifficulty::new(0, 16).with_baseline(baseline); // no events()
+		assert_eq!(ctrl.observe(&req_shape("/novel", "bot")), 16);
+		// Baseline observability still works through the controller.
+		assert!(ctrl.baseline().total_weight() > 20.0);
+	}
+
+	#[test]
+	fn dev_band_clamps_degenerate_input() {
+		// high <= low must not divide by zero; out-of-range clamps into [0,1].
+		let ctrl = ShapeDifficulty::new(0, 10).dev_band(0.9, 0.1);
+		// high was forced above low, so a mid score still maps sanely (no NaN/panic).
+		let d = ctrl.difficulty_for(0.95);
+		assert_eq!(d, 10);
 	}
 }

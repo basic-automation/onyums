@@ -19,7 +19,7 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use super::{Challenge, Gate};
-use crate::difficulty::AdaptiveDifficulty;
+use crate::{difficulty::{AdaptiveDifficulty, ShapeDifficulty}, shape::RequestShape};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -133,6 +133,10 @@ pub struct PowChallenge<P: Pow> {
 	/// `max(difficulty, controller.current_difficulty())` — the static `difficulty`
 	/// is a floor the controller can raise under load but never lower.
 	adaptive: Option<Arc<AdaptiveDifficulty>>,
+	/// Optional request-shape controller. When set, the shape of the challenged request
+	/// raises difficulty toward its `max` for shapes that deviate from the learned
+	/// baseline — complementary to `adaptive`, which keys on raw request *rate*.
+	shape: Option<Arc<ShapeDifficulty>>,
 	ttl: Duration,
 	submit_path: String,
 	/// Seeds of puzzles already redeemed, with the instant their entry can be pruned
@@ -149,6 +153,7 @@ impl<P: Pow> PowChallenge<P> {
 			secret: secret.into(),
 			difficulty,
 			adaptive: None,
+			shape: None,
 			ttl: DEFAULT_PUZZLE_TTL,
 			submit_path: DEFAULT_SUBMIT_PATH.to_owned(),
 			consumed: Mutex::new(HashMap::new()),
@@ -194,10 +199,30 @@ impl<P: Pow> PowChallenge<P> {
 		self
 	}
 
-	/// The difficulty to issue at right now: the static floor, raised by the adaptive
-	/// controller if one is attached.
-	fn current_difficulty(&self) -> u32 {
-		self.adaptive.as_ref().map_or(self.difficulty, |a| self.difficulty.max(a.current_difficulty()))
+	/// Drive issued-puzzle difficulty from a [`ShapeDifficulty`] controller — the
+	/// request-shape-deviation signal, complementary to [`with_adaptive_difficulty`](Self::with_adaptive_difficulty)'s
+	/// rate signal. When the challenged request's shape deviates from the learned baseline,
+	/// the controller raises difficulty toward its `max`; a shape matching normal traffic
+	/// leaves the static floor in place. The controller never lowers difficulty below the
+	/// floor. Observing the request also folds its shape into the controller's baseline.
+	#[must_use]
+	pub fn with_shape_difficulty(mut self, controller: Arc<ShapeDifficulty>) -> Self {
+		self.shape = Some(controller);
+		self
+	}
+
+	/// The difficulty to issue at right now: the static floor, raised by whichever
+	/// controllers are attached (the max of the rate-driven and shape-driven signals). The
+	/// shape signal needs the request [`Parts`]; pass `None` to skip it.
+	fn current_difficulty(&self, req: Option<&Parts>) -> u32 {
+		let mut difficulty = self.difficulty;
+		if let Some(adaptive) = &self.adaptive {
+			difficulty = difficulty.max(adaptive.current_difficulty());
+		}
+		if let (Some(shape), Some(req)) = (&self.shape, req) {
+			difficulty = difficulty.max(shape.observe(&RequestShape::from_parts(req)));
+		}
+		difficulty
 	}
 
 	/// `HMAC-SHA256(secret, payload)` over the puzzle envelope.
@@ -209,8 +234,8 @@ impl<P: Pow> PowChallenge<P> {
 
 	/// Generate a fresh puzzle and its signed wire envelope
 	/// (`base64url(seed‖difficulty‖expires).base64url(tag)`).
-	fn make_puzzle(&self) -> (Puzzle, String) {
-		let puzzle = self.pow.new_puzzle(self.current_difficulty());
+	fn make_puzzle(&self, req: Option<&Parts>) -> (Puzzle, String) {
+		let puzzle = self.pow.new_puzzle(self.current_difficulty(req));
 		let expires = SystemTime::now() + self.ttl;
 		let mut payload = Vec::with_capacity(44);
 		payload.extend_from_slice(&puzzle.seed);
@@ -254,8 +279,8 @@ impl<P: Pow> PowChallenge<P> {
 }
 
 impl<P: Pow> Challenge for PowChallenge<P> {
-	fn issue(&self, _req: &Parts) -> Gate {
-		let (puzzle, envelope) = self.make_puzzle();
+	fn issue(&self, req: &Parts) -> Gate {
+		let (puzzle, envelope) = self.make_puzzle(Some(req));
 		Gate::Present(self.interstitial(&puzzle, &envelope))
 	}
 
@@ -463,7 +488,7 @@ mod challenge_tests {
 	#[test]
 	fn solved_submission_verifies() {
 		let chal = challenge();
-		let (puzzle, envelope) = chal.make_puzzle();
+		let (puzzle, envelope) = chal.make_puzzle(None);
 		let req = parts_with_query(&solved_query(&envelope, &puzzle));
 		assert!(chal.verify(&req));
 	}
@@ -471,7 +496,7 @@ mod challenge_tests {
 	#[test]
 	fn solved_puzzle_is_single_use() {
 		let chal = challenge();
-		let (puzzle, envelope) = chal.make_puzzle();
+		let (puzzle, envelope) = chal.make_puzzle(None);
 		let query = solved_query(&envelope, &puzzle);
 		// First redemption clears; replaying the exact same solution does not.
 		assert!(chal.verify(&parts_with_query(&query)));
@@ -491,7 +516,7 @@ mod challenge_tests {
 	#[test]
 	fn tampered_envelope_is_rejected() {
 		let chal = challenge();
-		let (puzzle, envelope) = chal.make_puzzle();
+		let (puzzle, envelope) = chal.make_puzzle(None);
 		// Flip the last char of the payload (before the '.'), keeping the tag.
 		let (payload, tag) = envelope.split_once('.').unwrap();
 		let mut chars: Vec<char> = payload.chars().collect();
@@ -505,7 +530,7 @@ mod challenge_tests {
 	#[test]
 	fn wrong_nonce_is_rejected() {
 		let chal = challenge();
-		let (_puzzle, envelope) = chal.make_puzzle();
+		let (_puzzle, envelope) = chal.make_puzzle(None);
 		let req = parts_with_query(&format!("puzzle={envelope}&nonce={}", URL_SAFE_NO_PAD.encode(b"not-a-solution")));
 		assert!(!chal.verify(&req));
 	}
@@ -514,7 +539,7 @@ mod challenge_tests {
 	fn expired_puzzle_is_rejected() {
 		// A zero TTL means the envelope is already expired when submitted.
 		let chal = PowChallenge::new(Hashcash, b"test-secret".to_vec(), 0).with_ttl(Duration::ZERO);
-		let (puzzle, envelope) = chal.make_puzzle();
+		let (puzzle, envelope) = chal.make_puzzle(None);
 		let req = parts_with_query(&solved_query(&envelope, &puzzle));
 		assert!(!chal.verify(&req));
 	}
@@ -531,7 +556,7 @@ mod challenge_tests {
 		// A puzzle signed by a different secret must not verify here.
 		let mint = PowChallenge::new(Hashcash, b"secret-a".to_vec(), TEST_DIFFICULTY);
 		let check = PowChallenge::new(Hashcash, b"secret-b".to_vec(), TEST_DIFFICULTY);
-		let (puzzle, envelope) = mint.make_puzzle();
+		let (puzzle, envelope) = mint.make_puzzle(None);
 		let req = parts_with_query(&solved_query(&envelope, &puzzle));
 		assert!(mint.verify(&parts_with_query(&solved_query(&envelope, &puzzle))));
 		assert!(!check.verify(&req));
@@ -561,14 +586,14 @@ mod challenge_tests {
 		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 4).with_adaptive_difficulty(ctrl.clone());
 
 		// No load: the floor applies.
-		assert_eq!(chal.make_puzzle().0.difficulty, 4);
+		assert_eq!(chal.make_puzzle(None).0.difficulty, 4);
 
 		// Drive the observed rate to/over high_rate; the controller maxes out and the
 		// issued difficulty follows (well above the floor).
 		for _ in 0..10 {
 			ctrl.record_request();
 		}
-		assert_eq!(chal.make_puzzle().0.difficulty, 20);
+		assert_eq!(chal.make_puzzle(None).0.difficulty, 20);
 	}
 
 	#[test]
@@ -576,6 +601,38 @@ mod challenge_tests {
 		// A controller whose max is below the static floor cannot drag difficulty down.
 		let ctrl = Arc::new(AdaptiveDifficulty::new(0, 2));
 		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 9).with_adaptive_difficulty(ctrl);
-		assert_eq!(chal.make_puzzle().0.difficulty, 9);
+		assert_eq!(chal.make_puzzle(None).0.difficulty, 9);
+	}
+
+	#[test]
+	fn shape_difficulty_raises_issued_puzzle_difficulty_for_anomalous_shape() {
+		use std::time::Instant;
+
+		use crate::{circuit::{Clock, ManualClock}, shape::{RequestShape, ShapeBaseline}};
+
+		struct ArcClock(Arc<ManualClock>);
+		impl Clock for ArcClock {
+			fn now(&self) -> Instant {
+				self.0.now()
+			}
+		}
+
+		let normal = || Request::builder().uri("/").header("user-agent", "tor-browser").body(()).unwrap().into_parts().0;
+		// A baseline primed with a dominant "normal" shape so deviation scoring is active.
+		let clock = Arc::new(ManualClock::new());
+		let baseline = ShapeBaseline::new().min_observations(5.0).with_clock(Box::new(ArcClock(clock)));
+		for _ in 0..20 {
+			baseline.observe(&RequestShape::from_parts(&normal()));
+		}
+		let shape = Arc::new(ShapeDifficulty::new(0, 18).with_baseline(baseline));
+		// Static floor 2; the shape controller can raise toward 18 for novel shapes.
+		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 2).with_shape_difficulty(shape);
+
+		// A request whose shape matches the baseline stays at the floor.
+		assert_eq!(chal.make_puzzle(Some(&normal())).0.difficulty, 2);
+
+		// A never-seen shape deviates fully → difficulty jumps to the controller max.
+		let novel = Request::builder().uri("/wp-login.php").header("user-agent", "curl/8.4").body(()).unwrap().into_parts().0;
+		assert_eq!(chal.make_puzzle(Some(&novel)).0.difficulty, 18);
 	}
 }

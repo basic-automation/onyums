@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-21 — onyums-skin Phase 4: request-shape baselining → deviation-driven difficulty (5 increments)
 
-Branch `routine/onyums-2026-06-21` → PR (base `master`). Last night's run (PR
+Branch `routine/onyums-2026-06-21` → PR [#11](https://github.com/basic-automation/onyums/pull/11)
+(base `master`). Last night's run (PR
 [#10](https://github.com/basic-automation/onyums/pull/10), merged; `master` head
 `28c0d8c`) landed the Phase-4 *structured-security-events* half and set the NEXT STEP:
 **request-shape baselining**, then feed it into `AdaptiveDifficulty` to close the Phase-4

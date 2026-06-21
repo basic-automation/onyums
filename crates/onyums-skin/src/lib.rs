@@ -27,6 +27,7 @@ pub mod difficulty;
 pub mod layer;
 pub mod observe;
 pub mod ratelimit;
+pub mod shape;
 pub mod waf;
 
 pub use challenge::{
@@ -36,8 +37,9 @@ pub use circuit::{
 	AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock
 };
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
-pub use difficulty::AdaptiveDifficulty;
+pub use difficulty::{AdaptiveDifficulty, ShapeDifficulty};
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};
 pub use ratelimit::{Quota, SkinRateLimit};
+pub use shape::{RequestShape, ShapeBaseline};
 pub use waf::{Rule, Verdict, Waf, WafCategory, WafMatch};

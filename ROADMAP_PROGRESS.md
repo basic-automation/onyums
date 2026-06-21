@@ -7,6 +7,117 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-21 — onyums-skin Phase 4: request-shape baselining → deviation-driven difficulty (5 increments)
+
+Branch `routine/onyums-2026-06-21` → PR [#11](https://github.com/basic-automation/onyums/pull/11)
+(base `master`). Last night's run (PR
+[#10](https://github.com/basic-automation/onyums/pull/10), merged; `master` head
+`28c0d8c`) landed the Phase-4 *structured-security-events* half and set the NEXT STEP:
+**request-shape baselining**, then feed it into `AdaptiveDifficulty` to close the Phase-4
+"Done when" (difficulty driven by deviation-from-baseline, not just raw rate). This run
+executed exactly that, end to end, and then wired it live into the gate. All five
+increments are pure-Rust and no-Tor; **no new dependencies**. Workspace stayed green and
+clippy-clean after every increment.
+
+**Increment 1 — `RequestShape` extractor.** *Phase 4, "request-shape baselining … fields
+that survive Tor".* Files: `crates/onyums-skin/src/shape.rs` (new), `src/lib.rs`.
+`RequestShape::from_parts` extracts the HTTP dimensions an onion service can still observe
+— method, path depth + file-extension flag, the **sorted/deduped header name *set***,
+cookie presence, and a length-capped user-agent — into a stable `fingerprint()` string.
+IP/ASN/geo/TLS-free by construction. Keys on the header *set* rather than JA4H wire order
+because axum/hyper lose the on-the-wire order during parsing (documented in-module). **6
+unit tests.**
+
+**Increment 2 — `ShapeBaseline` rolling deviation model.** *Phase 4, "learn the normal
+distribution … and flag deviation".* Files: `src/shape.rs`, `src/lib.rs`. An
+exponentially-aged frequency model over fingerprints: `observe()` learns and scores in one
+locked pass, `score()` reads without recording. Deviation is the share-complement
+(`1 - weight(fp)/total`) in `[0,1]` — ~0 for a shape matching the bulk of recent traffic,
+~1 for a novel one — sound for onion traffic that clusters on a few pinned Tor Browser
+shapes. A `min_observations` learning floor avoids cold-start false positives; aging is
+driven by an injectable `Clock` (decay 0.5 per 10 s window by default) with a long-idle
+reset guard. The multi-modal-normal limitation is documented in-module (why the score is
+*one input to difficulty, never a hard block*). **6 unit tests.**
+
+**Increment 3 — `SecurityEvent::ShapeAnomaly` + metric.** *Phase 4, exposing the signal "as
+a new SecurityEvent/metric".* Files: `src/observe.rs`. New variant carrying the deviation
+quantized to **per-mille** (`0..=1000`) so the event stays `Eq`/`Hash`-friendly;
+`SecurityEvent::shape_anomaly(f64)` builds it (clamp + round). Kind `shape_anomaly`,
+severity `Notice`. `MetricsSink`/`SecurityMetrics` gain a `shape_anomalies` counter. **2 new
+observe tests.**
+
+**Increment 4 — `ShapeDifficulty` controller.** *Phase 4, the capstone: "adaptive difficulty
+… driven by deviation-from-baseline".* Files: `src/difficulty.rs`, `src/lib.rs`. Owns a
+`ShapeBaseline`; `observe(shape)` folds the request in, reads its deviation, and maps it
+across a configurable band (default `0.3..0.9`) to a difficulty between `baseline` and
+`max`. At/above `emit_threshold` (default 0.5) it records a `ShapeAnomaly` to an optional
+sink. Cold start stays at `baseline` (the model returns 0.0 while learning). The
+deviation-driven complement to the rate-driven `AdaptiveDifficulty`. **6 new difficulty
+tests.**
+
+**Increment 5 — wire shape difficulty into the gate.** *Phase 4 → live in the PoW gate.*
+Files: `src/challenge/pow.rs`. `PowChallenge::with_shape_difficulty(Arc<ShapeDifficulty>)`,
+mirroring the existing `with_adaptive_difficulty`. At issue time the challenged request's
+shape is folded into the baseline and its deviation raises issued-puzzle difficulty toward
+the controller max; difficulty is now `max(floor, rate-signal, shape-signal)` — the two
+controllers catch different attack profiles (rate → homogeneous floods; shape → anomalous
+oddballs that don't trip rate). `current_difficulty`/`make_puzzle` now take `Option<&Parts>`
+(the shape signal needs the request); `issue` threads it through; existing no-arg test
+callers updated to `make_puzzle(None)`. **1 new pow test.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **153 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 132+1 at run start; **+21** across the five increments — 6+6 shape, 2 observe,
+  6 difficulty, 1 pow).
+- `cargo test -p onyums --lib -- --skip test_serve`: **13 passed; 0 failed** (1 filtered) —
+  confirms the no-Tor onyums-root integration tests are unaffected (no root crate change
+  this run).
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** throughout (no `#[allow]`
+  added; let-chain used in `ShapeDifficulty::observe`).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open (onyums-skin Phase 4 — observability & adaptive defense)
+- **DONE this run:** request-shape baselining end to end — `RequestShape` feature extractor,
+  `ShapeBaseline` rolling deviation model, `SecurityEvent::ShapeAnomaly` + metric,
+  `ShapeDifficulty` controller, and the live wiring into `PowChallenge`. Combined with last
+  night's structured-events half, **both halves of the Phase-4 "Done when" are now met**:
+  an operator can see what is blocked and why, *and* adaptive difficulty is driven by
+  deviation-from-baseline, not just raw request rate.
+- **OPEN (Phase 4):** onyums-side consumption — wiring a `FanoutSink(Tracing, Metrics)` into
+  onyums' Skin setup and exposing `SecurityMetrics` / a `ShapeDifficulty` on the served path
+  (touches the live-serve path this routine cannot runtime-verify). Tuning guidance for the
+  default deviation band / decay window against real traffic is also open (needs live data).
+- **OPEN (Phase 3):** a `wirefilter` rule-expression front-end; broader OWASP-CRS ruleset;
+  per-rule/category enable-disable.
+- **BLOCKED:** skin Phase 1 `CaptchaChallenge` (the `captcha` crate license audit — an open
+  ROADMAP question).
+- **NOT STARTED:** onyums server Phase 0 (kill `ONION_NAME` singleton / readiness+shutdown
+  handle), Phase 1 (identity), Phase 3 (TLS-first/strict); skin Phase 5 (frontier).
+
+**STOP REASON:** Landed 5 verifiable increments (above the 2–4 bar) as one coherent arc —
+the complete onyums-skin Phase-4 request-shape-baselining pipeline, from the `RequestShape`
+extractor through the deviation model, the typed event + metric, and the `ShapeDifficulty`
+controller, to the live wiring into the PoW gate. This closes the remaining half of the
+Phase-4 "Done when". Every increment is green, clippy-clean, and fully unit-tested where no
+live Tor is required; nothing is half-landed. The natural next pieces are each a new theme
+better started fresh: the **Phase-3 `wirefilter` rule-expression front-end** (a heavier dep
+and a larger language design), and **onyums-side metrics/difficulty consumption** (a
+served-route + Skin-setup wiring that touches the live-serve path this routine cannot
+runtime-verify). Stopping here keeps the night's work a clean, single-theme PR.
+
+**NEXT STEP:** Begin the **Phase-3 `wirefilter` rule-expression front-end** in onyums-skin —
+promote the pure-Rust `wirefilter` crate to `[workspace.dependencies]` and let operators
+express WAF rules as filter expressions over the request fields the engine already
+normalizes (method/target/query/headers/body), evaluated alongside the existing `RegexSet`
+signatures. In parallel, an onyums-side slice (note: live-serve, not routine-verifiable) can
+wire `FanoutSink(TracingSink, MetricsSink)` into onyums' Skin setup, attach a
+`ShapeDifficulty` to the gate's `PowChallenge`, and expose `SecurityMetrics` on an internal
+route — making the now-complete Phase-4 baselining observable in the running server.
+
+---
+
 ## 2026-06-20 — onyums-skin Phase 4 observability: structured security events + metrics (6 increments)
 
 Branch `routine/onyums-2026-06-20` → PR [#10](https://github.com/basic-automation/onyums/pull/10)

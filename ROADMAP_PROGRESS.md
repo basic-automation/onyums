@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-22 — onyums-skin Phase 3 WAF hardening: operator control + anomaly scoring (4 increments)
 
-Branch `routine/onyums-2026-06-22` → PR (base `master`). Last run (PR
+Branch `routine/onyums-2026-06-22` → PR
+[#12](https://github.com/basic-automation/onyums/pull/12) (base `master`). Last run (PR
 [#11](https://github.com/basic-automation/onyums/pull/11), merged; `master` head
 `e437f5b`) closed both halves of onyums-skin Phase 4 and set the NEXT STEP to the Phase-3
 `wirefilter` rule-expression front-end. This run instead advanced the **other three open

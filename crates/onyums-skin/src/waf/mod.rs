@@ -10,7 +10,9 @@
 //! protocol anomalies); it is **not** OWASP-CRS-complete — the 100%-Rust rule (no
 //! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
 //! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
-//! takes any rule iterator, so a caller can extend [`starter_rules`] with its own.
+//! takes any rule iterator, so a caller can extend [`starter_rules`] with its own — and
+//! operator-tunable: [`Waf::disable_rule`] / [`Waf::disable_category`] silence a noisy
+//! signature or a whole class on the starter set without rebuilding it.
 //!
 //! Inspection runs each field **twice**: once over the raw string as received, then,
 //! if the field was percent-encoded, once more over its decoded form — so an attack
@@ -53,13 +55,17 @@ pub enum WafCategory {
 	PathTraversal,
 	/// OS command injection (shell metacharacters chaining a command).
 	CommandInjection,
+	/// Server-side request forgery: a request trying to make the server fetch an
+	/// internal/loopback/metadata URL. IP-free to detect (the *URL value* is in the
+	/// request), so it survives the loss of client IP and ports directly over Tor.
+	Ssrf,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 5] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::ProtocolAnomaly];
+	pub const ALL: [WafCategory; 6] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::ProtocolAnomaly];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -69,7 +75,23 @@ impl WafCategory {
 			Self::Xss => "xss",
 			Self::PathTraversal => "path_traversal",
 			Self::CommandInjection => "command_injection",
+			Self::Ssrf => "ssrf",
 			Self::ProtocolAnomaly => "protocol_anomaly",
+		}
+	}
+
+	/// The default anomaly **weight** this category contributes to an aggregate score in
+	/// [`anomaly_score`] / [`Waf::inspect_all`]. The scale mirrors OWASP-CRS severities
+	/// (critical injection/RCE/SSRF/LFI classes weigh most, protocol oddities least); the
+	/// *threshold* an operator compares the sum against is the tuning knob, not these
+	/// weights. Used only by the collect-all scoring path; the first-match [`Waf::inspect`]
+	/// fast path does not score.
+	#[must_use]
+	pub const fn weight(self) -> u32 {
+		match self {
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal => 5,
+			Self::Xss => 4,
+			Self::ProtocolAnomaly => 3,
 		}
 	}
 
@@ -82,7 +104,8 @@ impl WafCategory {
 			Self::Xss => 1,
 			Self::PathTraversal => 2,
 			Self::CommandInjection => 3,
-			Self::ProtocolAnomaly => 4,
+			Self::Ssrf => 4,
+			Self::ProtocolAnomaly => 5,
 		}
 	}
 }
@@ -125,6 +148,12 @@ pub struct Waf {
 	set: RegexSet,
 	/// Metadata for each pattern, in the same order passed to the [`RegexSet`].
 	meta: Vec<(&'static str, WafCategory)>,
+	/// Per-rule enable mask, index-aligned with [`meta`](Self::meta). A disabled rule is
+	/// skipped by [`match_raw`](Self::match_raw) as if it had not matched; all rules start
+	/// enabled. Operators silence a noisy rule or a whole class with
+	/// [`disable_rule`](Self::disable_rule) / [`disable_category`](Self::disable_category)
+	/// without rebuilding the rule list.
+	enabled: Vec<bool>,
 	/// When true (default), input requiring more than one percent-decode pass to reach a
 	/// fixed point is blocked outright as a [`WafCategory::ProtocolAnomaly`].
 	block_multi_encoded: bool,
@@ -132,6 +161,11 @@ pub struct Waf {
 	/// buffers that much before forwarding). `None` (default) leaves bodies uninspected —
 	/// body inspection means buffering, a request-handling cost the operator opts into.
 	body_inspection: Option<usize>,
+	/// When `Some(threshold)`, [`inspect`](Self::inspect) blocks on the *aggregate*
+	/// [`anomaly_score`] of all signatures reaching `threshold` rather than on the first
+	/// match. `None` (default) is first-match-blocks. The multiple-encoding guard still hard
+	/// blocks independently of the threshold when armed.
+	scoring_threshold: Option<u32>,
 }
 
 impl Waf {
@@ -143,8 +177,9 @@ impl Waf {
 	pub fn new(rules: impl IntoIterator<Item = Rule>) -> Result<Self, regex::Error> {
 		let rules: Vec<Rule> = rules.into_iter().collect();
 		let set = RegexSet::new(rules.iter().map(|r| r.pattern))?;
-		let meta = rules.iter().map(|r| (r.id, r.category)).collect();
-		Ok(Self { set, meta, block_multi_encoded: true, body_inspection: None })
+		let meta: Vec<(&'static str, WafCategory)> = rules.iter().map(|r| (r.id, r.category)).collect();
+		let enabled = vec![true; meta.len()];
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -155,6 +190,48 @@ impl Waf {
 	pub fn block_multi_encoded(mut self, block: bool) -> Self {
 		self.block_multi_encoded = block;
 		self
+	}
+
+	/// Disable the rule with the given [`Rule::id`], so it never fires (an unknown id is a
+	/// no-op). Lets an operator silence a single false-positive-prone signature while
+	/// keeping the rest of the ruleset, without reconstructing it from a filtered list.
+	/// Composes with [`disable_category`](Self::disable_category); disabling is sticky and
+	/// idempotent.
+	#[must_use]
+	pub fn disable_rule(mut self, id: &str) -> Self {
+		for (i, (rule_id, _)) in self.meta.iter().enumerate() {
+			if *rule_id == id {
+				self.enabled[i] = false;
+			}
+		}
+		self
+	}
+
+	/// Disable every rule in the given [`WafCategory`], so that whole signature class never
+	/// fires. Note this does **not** affect the multiple-encoding anomaly guard, which is
+	/// controlled independently by [`block_multi_encoded`](Self::block_multi_encoded) even
+	/// though it reports as a [`WafCategory::ProtocolAnomaly`].
+	#[must_use]
+	pub fn disable_category(mut self, category: WafCategory) -> Self {
+		for (i, (_, cat)) in self.meta.iter().enumerate() {
+			if *cat == category {
+				self.enabled[i] = false;
+			}
+		}
+		self
+	}
+
+	/// Whether the rule with the given [`Rule::id`] is currently enabled. Returns `false`
+	/// for an unknown id (it can never fire either).
+	#[must_use]
+	pub fn is_rule_enabled(&self, id: &str) -> bool {
+		self.meta.iter().zip(&self.enabled).any(|((rule_id, _), &on)| *rule_id == id && on)
+	}
+
+	/// The number of rules currently enabled (`<=` [`rule_count`](Self::rule_count)).
+	#[must_use]
+	pub fn enabled_rule_count(&self) -> usize {
+		self.enabled.iter().filter(|&&on| on).count()
 	}
 
 	/// Enable request-**body** inspection, buffering and scanning up to `max_bytes` of the
@@ -172,6 +249,18 @@ impl Waf {
 	#[must_use]
 	pub fn body_cap(&self) -> Option<usize> {
 		self.body_inspection
+	}
+
+	/// Switch [`inspect`](Self::inspect) into OWASP-CRS-style **anomaly-scoring** mode: a
+	/// request is blocked when the [`anomaly_score`] of *all* the signatures it trips reaches
+	/// `threshold`, rather than on the first single match. This lets several sub-blocking
+	/// signals combine, and lets an operator raise `threshold` to tolerate one weak hit. The
+	/// multiple-encoding guard (when armed) still hard-blocks independently of the score.
+	/// Default (without this call) is first-match-blocks.
+	#[must_use]
+	pub fn scoring_threshold(mut self, threshold: u32) -> Self {
+		self.scoring_threshold = Some(threshold);
+		self
 	}
 
 	/// Inspect a request body's bytes with the same rules and normalization as every
@@ -204,7 +293,7 @@ impl Waf {
 	/// rule index for a stable, deterministic result. `location` labels where the string
 	/// came from for the returned [`WafMatch`].
 	fn match_raw(&self, haystack: &str, location: &str) -> Option<WafMatch> {
-		self.set.matches(haystack).iter().min().map(|idx| {
+		self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]).min().map(|idx| {
 			let (rule_id, category) = self.meta[idx];
 			WafMatch { rule_id, category, location: location.to_owned() }
 		})
@@ -252,6 +341,9 @@ impl Waf {
 	/// [`Verdict::Allow`].
 	#[must_use]
 	pub fn inspect(&self, parts: &Parts) -> Verdict {
+		if let Some(threshold) = self.scoring_threshold {
+			return self.inspect_scored(parts, threshold);
+		}
 		if let Some(m) = self.inspect_field(parts.method.as_str(), "method", false) {
 			return Verdict::Block(m);
 		}
@@ -272,6 +364,93 @@ impl Waf {
 		}
 		Verdict::Allow
 	}
+
+	/// The anomaly-scoring decision for [`inspect`](Self::inspect) when a
+	/// [`scoring_threshold`](Self::scoring_threshold) is set. Blocks if any field is
+	/// multiply percent-encoded (the armed guard, independent of the score), else if the
+	/// aggregate [`anomaly_score`] reaches `threshold`. The reported [`WafMatch`] is the
+	/// highest-weight signature (ties broken toward the earliest in inspection order), so a
+	/// scored block names the most severe rule that drove it.
+	fn inspect_scored(&self, parts: &Parts, threshold: u32) -> Verdict {
+		let matches = self.inspect_all(parts);
+		if self.block_multi_encoded && let Some(m) = matches.iter().find(|m| m.rule_id == MULTI_ENCODING_RULE_ID) {
+			return Verdict::Block(m.clone());
+		}
+		if anomaly_score(&matches) < threshold {
+			return Verdict::Allow;
+		}
+		// Name the most severe rule that drove the block; on a weight tie keep the earliest
+		// (inspection order is method → target → query → headers, lowest rule index first).
+		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (m.category.weight(), std::cmp::Reverse(*i))).map(|(_, m)| m.clone());
+		dominant.map_or(Verdict::Allow, Verdict::Block)
+	}
+
+	/// Match the ruleset against one string and return **every** enabled rule that fires
+	/// (not just the lowest index), in ascending rule order. The collect-all counterpart of
+	/// [`match_raw`](Self::match_raw).
+	fn match_all_raw(&self, haystack: &str, location: &str, out: &mut Vec<WafMatch>) {
+		for idx in self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]) {
+			let (rule_id, category) = self.meta[idx];
+			out.push(WafMatch { rule_id, category, location: location.to_owned() });
+		}
+	}
+
+	/// Collect every distinct rule that fires on one field, over both the raw and (if
+	/// normalization changes it) the decoded form. A rule that matches both forms is
+	/// reported once (dedup by `rule_id` within the field). The multiple-encoding guard, when
+	/// armed, contributes its anomaly the same way [`inspect_field`](Self::inspect_field)
+	/// would block on it.
+	fn inspect_field_all(&self, raw: &str, location: &str, plus_is_space: bool, out: &mut Vec<WafMatch>) {
+		let start = out.len();
+		self.match_all_raw(raw, location, out);
+		let norm = normalize(raw, plus_is_space);
+		if self.block_multi_encoded && norm.decode_passes >= 2 {
+			out.push(WafMatch { rule_id: MULTI_ENCODING_RULE_ID, category: WafCategory::ProtocolAnomaly, location: location.to_owned() });
+			return;
+		}
+		if norm.decoded != raw {
+			let mut decoded = Vec::new();
+			self.match_all_raw(&norm.decoded, location, &mut decoded);
+			for m in decoded {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+	}
+
+	/// Inspect a request and return **every** signature that fires across the method, path,
+	/// query, and header values — the collect-all counterpart of the first-match
+	/// [`inspect`](Self::inspect). Useful for observability ("what did this request trip?")
+	/// and for [`anomaly_score`], where several weak signals combine. Bodies are not scanned
+	/// here (body inspection stays the separate, opt-in [`inspect_body`](Self::inspect_body)
+	/// path). The returned matches are grouped by field in inspection order; an empty vec
+	/// means the request is clean.
+	#[must_use]
+	pub fn inspect_all(&self, parts: &Parts) -> Vec<WafMatch> {
+		let mut out = Vec::new();
+		self.inspect_field_all(parts.method.as_str(), "method", false, &mut out);
+		self.inspect_field_all(parts.uri.path(), "target", false, &mut out);
+		if let Some(query) = parts.uri.query() {
+			self.inspect_field_all(query, "query", true, &mut out);
+		}
+		for (name, value) in &parts.headers {
+			if let Ok(s) = value.to_str() {
+				self.inspect_field_all(s, &format!("header:{name}"), false, &mut out);
+			}
+		}
+		out
+	}
+}
+
+/// Sum the [`WafCategory::weight`] of each match into a single anomaly score. Zero for an
+/// empty slice (a clean request). An operator compares this against a chosen threshold to
+/// decide whether the *aggregate* of several signals — none necessarily blocking on its
+/// own under first-match — warrants a block, the OWASP-CRS anomaly-scoring model ported to
+/// this engine. Pair with [`Waf::inspect_all`].
+#[must_use]
+pub fn anomaly_score(matches: &[WafMatch]) -> u32 {
+	matches.iter().map(|m| m.category.weight()).sum()
 }
 
 impl Default for Waf {
@@ -357,12 +536,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r"(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)" },
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
+		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
 		Rule { id: "xss_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(error|load|click|mouseover|focus|toggle)\s*=" },
 		Rule { id: "xss_iframe_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*iframe\b" },
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
+		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
 		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
@@ -372,6 +553,11 @@ pub fn starter_rules() -> Vec<Rule> {
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
+		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
+		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
+		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
+		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
+		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -657,5 +843,195 @@ mod tests {
 		// A literal '+' in a path segment must not be folded — no false "query" decoding.
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/c++/reference")), Verdict::Allow);
+	}
+
+	#[test]
+	fn scoring_mode_allows_single_weak_hit_below_threshold() {
+		// One protocol-anomaly hit (weight 3) under a threshold of 8 is tolerated, where
+		// first-match mode would have blocked it.
+		let waf = Waf::starter().scoring_threshold(8);
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "() { :; }; echo".parse().unwrap());
+		assert_eq!(waf.inspect(&p), Verdict::Allow);
+		// First-match mode (no threshold) still blocks the same request.
+		assert!(matches!(Waf::starter().inspect(&p), Verdict::Block(_)));
+	}
+
+	#[test]
+	fn scoring_mode_blocks_when_signals_combine() {
+		// SQLi (5) in the query + XSS (4) in a header = 9 >= threshold 8 → blocked, and the
+		// reported rule is the highest-weight (SQLi) signature.
+		let waf = Waf::starter().scoring_threshold(8);
+		let mut p = parts("GET", "/items?q=1%20OR%201=1");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let v = waf.inspect(&p);
+		assert_eq!(blocked(&v).category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn scoring_mode_blocks_single_hit_at_threshold() {
+		// A lone SQLi (weight 5) meets a threshold of 5.
+		let waf = Waf::starter().scoring_threshold(5);
+		assert!(matches!(waf.inspect(&parts("GET", "/items?q=1%20UNION%20SELECT%20pw")), Verdict::Block(_)));
+	}
+
+	#[test]
+	fn scoring_mode_still_hard_blocks_multi_encoding() {
+		// The multiple-encoding guard fires regardless of how high the threshold is.
+		let waf = Waf::starter().scoring_threshold(1000);
+		let v = waf.inspect(&parts("GET", "/x?p=a%252e%252e%252fb"));
+		assert_eq!(blocked(&v).rule_id, MULTI_ENCODING_RULE_ID);
+	}
+
+	#[test]
+	fn scoring_mode_allows_clean_request() {
+		let waf = Waf::starter().scoring_threshold(5);
+		assert_eq!(waf.inspect(&parts("GET", "/articles/hello-world?page=2")), Verdict::Allow);
+	}
+
+	#[test]
+	fn inspect_all_collects_every_signature() {
+		let waf = Waf::starter();
+		// SQLi in the query plus an XSS header — first-match `inspect` returns only one,
+		// `inspect_all` returns both.
+		let mut p = parts("GET", "/items?q=1%20UNION%20SELECT%20pw%20FROM%20users");
+		p.headers.insert("referer", "<script>x</script>".parse().unwrap());
+		let all = waf.inspect_all(&p);
+		assert!(all.iter().any(|m| m.category == WafCategory::Sqli && m.location == "query"));
+		assert!(all.iter().any(|m| m.rule_id == "xss_script_tag" && m.location == "header:referer"));
+	}
+
+	#[test]
+	fn inspect_all_is_empty_for_benign_request() {
+		let waf = Waf::starter();
+		assert!(waf.inspect_all(&parts("GET", "/articles/hello-world?page=2")).is_empty());
+		assert_eq!(anomaly_score(&[]), 0);
+	}
+
+	#[test]
+	fn inspect_all_dedups_raw_and_decoded_in_one_field() {
+		// `<script>` appears literally; its raw form already trips xss_script_tag and the
+		// field's decoded form is identical here — the rule is reported once per field.
+		let waf = Waf::starter();
+		let all = waf.inspect_all(&parts("GET", "/x?c=%3Cscript%3E%3Cscript%3E"));
+		let n = all.iter().filter(|m| m.rule_id == "xss_script_tag" && m.location == "query").count();
+		assert_eq!(n, 1, "a rule fires at most once per field");
+	}
+
+	#[test]
+	fn anomaly_score_sums_category_weights() {
+		// SQLi (5) + XSS (4) = 9; threshold tuning is the operator's, not the engine's.
+		let waf = Waf::starter();
+		let mut p = parts("GET", "/items?q=1%20OR%201=1");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let score = anomaly_score(&waf.inspect_all(&p));
+		assert!(score >= 9, "expected combined SQLi+XSS score >= 9, got {score}");
+	}
+
+	#[test]
+	fn inspect_all_respects_disabled_rules() {
+		// A disabled rule contributes neither a match nor score on the collect-all path.
+		let waf = Waf::starter().disable_category(WafCategory::Sqli);
+		let all = waf.inspect_all(&parts("GET", "/items?q=1%20UNION%20SELECT%20pw"));
+		assert!(all.iter().all(|m| m.category != WafCategory::Sqli));
+	}
+
+	#[test]
+	fn category_weight_scale_is_ordered() {
+		// Critical injection classes weigh at least as much as protocol oddities.
+		assert!(WafCategory::Sqli.weight() >= WafCategory::Xss.weight());
+		assert!(WafCategory::Xss.weight() >= WafCategory::ProtocolAnomaly.weight());
+		assert_eq!(WafCategory::Ssrf.weight(), WafCategory::Sqli.weight());
+	}
+
+	#[test]
+	fn ssrf_cloud_metadata_is_blocked() {
+		let waf = Waf::starter();
+		// The AWS/GCP/Azure link-local metadata endpoint, by IP and by path.
+		assert_eq!(waf.inspect_str("url=http://169.254.169.254/latest/meta-data/iam", "target").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("target=/computeMetadata/v1/project", "target").unwrap().rule_id, "ssrf_cloud_metadata_path");
+	}
+
+	#[test]
+	fn ssrf_internal_scheme_and_loopback_are_blocked() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("u=gopher://internal:6379/_INFO", "query").unwrap().rule_id, "ssrf_internal_scheme");
+		assert_eq!(waf.inspect_str("next=file:///etc/hostname", "query").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("fetch=http://127.0.0.1:8080/admin", "query").unwrap().rule_id, "ssrf_loopback_url");
+		assert_eq!(waf.inspect_str("fetch=https://localhost/internal", "query").unwrap().rule_id, "ssrf_loopback_url");
+	}
+
+	#[test]
+	fn ssrf_category_metadata_is_stable() {
+		assert_eq!(WafCategory::Ssrf.name(), "ssrf");
+		assert_eq!(WafCategory::ALL[WafCategory::Ssrf.index()], WafCategory::Ssrf);
+		// The index is still a bijection over the (now six) categories.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn new_sqli_and_xss_rules_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("1 UNION SELECT pw INTO OUTFILE '/tmp/x'", "target").map(|m| m.category), Some(WafCategory::Sqli));
+		assert_eq!(waf.inspect_str("href=vbscript:msgbox(1)", "target").unwrap().rule_id, "xss_vbscript_uri");
+	}
+
+	#[test]
+	fn ssrf_rules_keep_false_positives_low() {
+		// Benign requests that mention URLs/paths but are not SSRF must still pass.
+		let waf = Waf::starter();
+		for uri in ["/redirect?to=https://example.com/welcome", "/blog/file-formats-explained", "/docs/localhost-development-guide", "/articles/the-year-1692"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn disable_rule_silences_one_signature() {
+		// Disabling the script-tag rule lets that payload through while the rest still fire.
+		let waf = Waf::starter().disable_rule("xss_script_tag");
+		assert!(!waf.is_rule_enabled("xss_script_tag"));
+		assert_eq!(waf.enabled_rule_count(), waf.rule_count() - 1);
+		assert_eq!(waf.inspect_str("<script>alert(1)</script>", "target"), None);
+		// A different XSS rule (iframe) is untouched.
+		assert_eq!(waf.inspect_str("<iframe src=//evil", "target").unwrap().rule_id, "xss_iframe_tag");
+	}
+
+	#[test]
+	fn disable_rule_falls_through_to_next_matching_rule() {
+		// With the earlier-indexed rule off, a string matching two rules reports the other.
+		let waf = Waf::starter().disable_rule("xss_js_uri");
+		let m = waf.inspect_str("javascript:void(0) onerror=1", "target").unwrap();
+		assert_eq!(m.rule_id, "xss_event_handler");
+	}
+
+	#[test]
+	fn disable_category_silences_a_whole_class() {
+		let waf = Waf::starter().disable_category(WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("1 UNION SELECT pw FROM users", "target"), None);
+		assert_eq!(waf.inspect_str("id=1 AND SLEEP(5)", "target"), None);
+		// A non-SQLi attack is unaffected.
+		assert_eq!(waf.inspect_str("<script>x</script>", "target").unwrap().category, WafCategory::Xss);
+		// Every SQLi rule is now disabled.
+		for r in starter_rules().into_iter().filter(|r| r.category == WafCategory::Sqli) {
+			assert!(!waf.is_rule_enabled(r.id));
+		}
+	}
+
+	#[test]
+	fn disable_unknown_rule_is_a_noop() {
+		let waf = Waf::starter().disable_rule("does_not_exist");
+		assert_eq!(waf.enabled_rule_count(), waf.rule_count());
+		assert!(!waf.is_rule_enabled("does_not_exist"));
+	}
+
+	#[test]
+	fn disable_category_leaves_multi_encoding_guard_independent() {
+		// Disabling ProtocolAnomaly rules must not turn off the multiple-encoding guard,
+		// which is governed solely by block_multi_encoded.
+		let waf = Waf::starter().disable_category(WafCategory::ProtocolAnomaly);
+		let m = waf.inspect_str("a%252e%252e%252fb", "target").unwrap();
+		assert_eq!(m.rule_id, MULTI_ENCODING_RULE_ID);
 	}
 }

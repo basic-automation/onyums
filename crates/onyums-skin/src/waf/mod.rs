@@ -10,7 +10,9 @@
 //! protocol anomalies); it is **not** OWASP-CRS-complete — the 100%-Rust rule (no
 //! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
 //! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
-//! takes any rule iterator, so a caller can extend [`starter_rules`] with its own.
+//! takes any rule iterator, so a caller can extend [`starter_rules`] with its own — and
+//! operator-tunable: [`Waf::disable_rule`] / [`Waf::disable_category`] silence a noisy
+//! signature or a whole class on the starter set without rebuilding it.
 //!
 //! Inspection runs each field **twice**: once over the raw string as received, then,
 //! if the field was percent-encoded, once more over its decoded form — so an attack
@@ -125,6 +127,12 @@ pub struct Waf {
 	set: RegexSet,
 	/// Metadata for each pattern, in the same order passed to the [`RegexSet`].
 	meta: Vec<(&'static str, WafCategory)>,
+	/// Per-rule enable mask, index-aligned with [`meta`](Self::meta). A disabled rule is
+	/// skipped by [`match_raw`](Self::match_raw) as if it had not matched; all rules start
+	/// enabled. Operators silence a noisy rule or a whole class with
+	/// [`disable_rule`](Self::disable_rule) / [`disable_category`](Self::disable_category)
+	/// without rebuilding the rule list.
+	enabled: Vec<bool>,
 	/// When true (default), input requiring more than one percent-decode pass to reach a
 	/// fixed point is blocked outright as a [`WafCategory::ProtocolAnomaly`].
 	block_multi_encoded: bool,
@@ -143,8 +151,9 @@ impl Waf {
 	pub fn new(rules: impl IntoIterator<Item = Rule>) -> Result<Self, regex::Error> {
 		let rules: Vec<Rule> = rules.into_iter().collect();
 		let set = RegexSet::new(rules.iter().map(|r| r.pattern))?;
-		let meta = rules.iter().map(|r| (r.id, r.category)).collect();
-		Ok(Self { set, meta, block_multi_encoded: true, body_inspection: None })
+		let meta: Vec<(&'static str, WafCategory)> = rules.iter().map(|r| (r.id, r.category)).collect();
+		let enabled = vec![true; meta.len()];
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -155,6 +164,48 @@ impl Waf {
 	pub fn block_multi_encoded(mut self, block: bool) -> Self {
 		self.block_multi_encoded = block;
 		self
+	}
+
+	/// Disable the rule with the given [`Rule::id`], so it never fires (an unknown id is a
+	/// no-op). Lets an operator silence a single false-positive-prone signature while
+	/// keeping the rest of the ruleset, without reconstructing it from a filtered list.
+	/// Composes with [`disable_category`](Self::disable_category); disabling is sticky and
+	/// idempotent.
+	#[must_use]
+	pub fn disable_rule(mut self, id: &str) -> Self {
+		for (i, (rule_id, _)) in self.meta.iter().enumerate() {
+			if *rule_id == id {
+				self.enabled[i] = false;
+			}
+		}
+		self
+	}
+
+	/// Disable every rule in the given [`WafCategory`], so that whole signature class never
+	/// fires. Note this does **not** affect the multiple-encoding anomaly guard, which is
+	/// controlled independently by [`block_multi_encoded`](Self::block_multi_encoded) even
+	/// though it reports as a [`WafCategory::ProtocolAnomaly`].
+	#[must_use]
+	pub fn disable_category(mut self, category: WafCategory) -> Self {
+		for (i, (_, cat)) in self.meta.iter().enumerate() {
+			if *cat == category {
+				self.enabled[i] = false;
+			}
+		}
+		self
+	}
+
+	/// Whether the rule with the given [`Rule::id`] is currently enabled. Returns `false`
+	/// for an unknown id (it can never fire either).
+	#[must_use]
+	pub fn is_rule_enabled(&self, id: &str) -> bool {
+		self.meta.iter().zip(&self.enabled).any(|((rule_id, _), &on)| *rule_id == id && on)
+	}
+
+	/// The number of rules currently enabled (`<=` [`rule_count`](Self::rule_count)).
+	#[must_use]
+	pub fn enabled_rule_count(&self) -> usize {
+		self.enabled.iter().filter(|&&on| on).count()
 	}
 
 	/// Enable request-**body** inspection, buffering and scanning up to `max_bytes` of the
@@ -204,7 +255,7 @@ impl Waf {
 	/// rule index for a stable, deterministic result. `location` labels where the string
 	/// came from for the returned [`WafMatch`].
 	fn match_raw(&self, haystack: &str, location: &str) -> Option<WafMatch> {
-		self.set.matches(haystack).iter().min().map(|idx| {
+		self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]).min().map(|idx| {
 			let (rule_id, category) = self.meta[idx];
 			WafMatch { rule_id, category, location: location.to_owned() }
 		})
@@ -657,5 +708,53 @@ mod tests {
 		// A literal '+' in a path segment must not be folded — no false "query" decoding.
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/c++/reference")), Verdict::Allow);
+	}
+
+	#[test]
+	fn disable_rule_silences_one_signature() {
+		// Disabling the script-tag rule lets that payload through while the rest still fire.
+		let waf = Waf::starter().disable_rule("xss_script_tag");
+		assert!(!waf.is_rule_enabled("xss_script_tag"));
+		assert_eq!(waf.enabled_rule_count(), waf.rule_count() - 1);
+		assert_eq!(waf.inspect_str("<script>alert(1)</script>", "target"), None);
+		// A different XSS rule (iframe) is untouched.
+		assert_eq!(waf.inspect_str("<iframe src=//evil", "target").unwrap().rule_id, "xss_iframe_tag");
+	}
+
+	#[test]
+	fn disable_rule_falls_through_to_next_matching_rule() {
+		// With the earlier-indexed rule off, a string matching two rules reports the other.
+		let waf = Waf::starter().disable_rule("xss_js_uri");
+		let m = waf.inspect_str("javascript:void(0) onerror=1", "target").unwrap();
+		assert_eq!(m.rule_id, "xss_event_handler");
+	}
+
+	#[test]
+	fn disable_category_silences_a_whole_class() {
+		let waf = Waf::starter().disable_category(WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("1 UNION SELECT pw FROM users", "target"), None);
+		assert_eq!(waf.inspect_str("id=1 AND SLEEP(5)", "target"), None);
+		// A non-SQLi attack is unaffected.
+		assert_eq!(waf.inspect_str("<script>x</script>", "target").unwrap().category, WafCategory::Xss);
+		// Every SQLi rule is now disabled.
+		for r in starter_rules().into_iter().filter(|r| r.category == WafCategory::Sqli) {
+			assert!(!waf.is_rule_enabled(r.id));
+		}
+	}
+
+	#[test]
+	fn disable_unknown_rule_is_a_noop() {
+		let waf = Waf::starter().disable_rule("does_not_exist");
+		assert_eq!(waf.enabled_rule_count(), waf.rule_count());
+		assert!(!waf.is_rule_enabled("does_not_exist"));
+	}
+
+	#[test]
+	fn disable_category_leaves_multi_encoding_guard_independent() {
+		// Disabling ProtocolAnomaly rules must not turn off the multiple-encoding guard,
+		// which is governed solely by block_multi_encoded.
+		let waf = Waf::starter().disable_category(WafCategory::ProtocolAnomaly);
+		let m = waf.inspect_str("a%252e%252e%252fb", "target").unwrap();
+		assert_eq!(m.rule_id, MULTI_ENCODING_RULE_ID);
 	}
 }

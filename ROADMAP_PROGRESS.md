@@ -7,6 +7,114 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-22 — onyums-skin Phase 3 WAF hardening: operator control + anomaly scoring (4 increments)
+
+Branch `routine/onyums-2026-06-22` → PR (base `master`). Last run (PR
+[#11](https://github.com/basic-automation/onyums/pull/11), merged; `master` head
+`e437f5b`) closed both halves of onyums-skin Phase 4 and set the NEXT STEP to the Phase-3
+`wirefilter` rule-expression front-end. This run instead advanced the **other three open
+Phase-3 WAF items** — per-rule/category enable-disable, a broader ruleset, and OWASP-CRS
+anomaly scoring — which are pure-Rust, fast-compiling, and fully unit-testable without the
+heavy `wirefilter` dependency; the wirefilter front-end is deferred to its own focused
+night (see STOP REASON). All four increments are pure-Rust and no-Tor; **no new
+dependencies**. Workspace stayed green and clippy-clean after every increment. Only
+`crates/onyums-skin/src/waf/mod.rs` (and a one-line re-export in `src/lib.rs`) changed; no
+onyums-server (root) code touched.
+
+**Increment 1 — per-rule / per-category enable-disable.** *Phase 3, "per-rule/category
+enable-disable" open item.* Files: `src/waf/mod.rs`. Added a runtime enable mask
+(`enabled: Vec<bool>`, index-aligned with the rule metadata, all true on `new`) so an
+operator can silence a noisy signature or a whole attack class on the starter set without
+rebuilding it — the Cloudflare "disable rule X" control. `disable_rule(id)` /
+`disable_category(cat)` builder methods (consuming `self`, matching the existing
+`block_multi_encoded` style; sticky, idempotent, no-op on unknown id); `match_raw` skips
+disabled indices so detection falls through to the next-lowest matching rule;
+`is_rule_enabled` / `enabled_rule_count` for inspection. The multiple-encoding anomaly
+guard stays governed solely by `block_multi_encoded`, independent of disabling the
+ProtocolAnomaly class. **5 unit tests.**
+
+**Increment 2 — SSRF category + broader starter ruleset.** *Phase 3, "broader OWASP-CRS
+ruleset" open item.* Files: `src/waf/mod.rs`. New `WafCategory::Ssrf` (ALL/name/index
+updated; the per-category metric arrays in `observe.rs` are sized by
+`WafCategory::ALL.len()`, so they grew automatically — no observe.rs change needed). SSRF
+is a clean Cloudflare carry-over over Tor: the malicious URL is a *value in the request*,
+so detection needs no client IP. Six new conservative, high-signal rules:
+`ssrf_cloud_metadata_ip` (169.254.169.254), `ssrf_cloud_metadata_path` (AWS/GCP/Azure
+metadata service paths), `ssrf_internal_scheme` (gopher///dict///file//),
+`ssrf_loopback_url` (http(s)/ftp to localhost/127.0.0.1/0.0.0.0/[::1]),
+`sqli_into_outfile`, and `xss_vbscript_uri`. Kept deliberately conservative to hold the
+existing low-false-positive bar. **5 unit tests** (incl. an FP guard over benign
+URL-mentioning requests and a six-category index-bijection check).
+
+**Increment 3 — collect-all inspection + anomaly scoring primitives.** *Phase 3,
+OWASP-CRS anomaly-scoring model.* Files: `src/waf/mod.rs`, `src/lib.rs`.
+`Waf::inspect_all(parts) -> Vec<WafMatch>` returns *every* enabled signature that fires
+across method/path/query/headers (grouped by field; raw and decoded forms deduped per
+field; respects the enable mask and the multi-encoding guard). `WafCategory::weight()`
+gives a per-category default weight on a CRS-style scale (critical injection/RCE/SSRF/LFI
+= 5, XSS = 4, protocol anomaly = 3). `anomaly_score(&[WafMatch]) -> u32` sums those
+weights (re-exported from the crate root). The first-match `inspect` fast path is
+unchanged. **6 unit tests.**
+
+**Increment 4 — opt-in anomaly-scoring block mode.** *Phase 3, scoring made live.* Files:
+`src/waf/mod.rs`. `Waf::scoring_threshold(n)` switches `inspect` from first-match-blocks to
+blocking on the aggregate `anomaly_score` reaching `n`. Because the `SkinLayer` already
+calls `waf.inspect(parts)`, scoring takes effect with **zero layer changes**. `inspect`
+branches to `inspect_scored`: the armed multiple-encoding guard still hard-blocks
+independently of the score, then a block fires iff the summed weights reach the threshold,
+reporting the highest-weight signature (ties → earliest in inspection order) so the block
+names the most severe driving rule. Lets an operator raise the threshold to tolerate one
+weak hit while still blocking when several sub-blocking signals combine. **5 unit tests.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **174 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 153+1 at last run start; **+21** across the four increments — 5+5+6+5).
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** throughout (no `#[allow]`
+  added; one let-chain used in `inspect_scored`).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open (onyums-skin Phase 3 — WAF)
+- **DONE this run:** per-rule/category enable-disable; a broader starter ruleset with a new
+  SSRF category; the OWASP-CRS anomaly-scoring model (collect-all inspection, per-category
+  weights, aggregate score) and its live opt-in block mode in `inspect`.
+- **OPEN (Phase 3):** the `wirefilter` rule-expression front-end (a heavier dep + a filter
+  language design — deliberately deferred this run); further OWASP-CRS rule porting toward
+  fuller coverage; surfacing the anomaly score into the `WafBlock` SecurityEvent/metrics
+  (a wider observe.rs/layer.rs ripple, its own increment).
+- **OPEN (Phase 4):** onyums-side consumption — wiring `FanoutSink`/`SecurityMetrics`/a
+  `ShapeDifficulty` into onyums' live Skin setup (touches the live-serve path this routine
+  cannot runtime-verify).
+- **BLOCKED:** skin Phase 1 `CaptchaChallenge` (the `captcha` crate license audit — an open
+  ROADMAP question).
+- **NOT STARTED:** onyums server Phase 0 (kill `ONION_NAME` singleton / readiness+shutdown
+  handle), Phase 1 (identity), Phase 3 (TLS-first/strict); skin Phase 5 (frontier).
+
+**STOP REASON:** Landed 4 verifiable increments (top of the 2–4 bar) as one coherent arc —
+WAF operator control (disable rules/classes) and the OWASP-CRS anomaly-scoring model
+(collect-all → per-category weights → aggregate-score block mode), all pure-Rust, no new
+deps, fully unit-tested, green and clippy-clean, nothing half-landed. The remaining
+routine-verifiable Phase-3 piece — the `wirefilter` rule-expression front-end — is a heavy
+new dependency plus a filter-language integration that the previous run's NEXT STEP itself
+flagged as "a heavier dep and a larger language design"; starting it in the small hours
+risks exactly the half-landed outcome the routine forbids, so it is left for a fresh,
+dedicated night. The other near-term piece (surfacing the score into the WafBlock event)
+ripples across many observe.rs/layer.rs construction sites and is cleaner as its own
+increment.
+
+**NEXT STEP:** Begin the **Phase-3 `wirefilter` rule-expression front-end** in onyums-skin
+on a dedicated night — promote the pure-Rust `wirefilter` crate to
+`[workspace.dependencies]`, define a `Scheme` over the request fields the engine already
+normalizes (method/target/query/headers, plus the optional body), compile operator
+expressions into a `FilterRule`, and evaluate them alongside the existing `RegexSet`
+signatures, folding any filter hit into the same `WafMatch`/anomaly-score machinery built
+this run. A smaller follow-up: surface the anomaly score onto `SecurityEvent::WafBlock`
+(add an optional `score`/`signals` field and have the layer populate it) so scored blocks
+are observable as such.
+
+---
+
 ## 2026-06-21 — onyums-skin Phase 4: request-shape baselining → deviation-driven difficulty (5 increments)
 
 Branch `routine/onyums-2026-06-21` → PR [#11](https://github.com/basic-automation/onyums/pull/11)

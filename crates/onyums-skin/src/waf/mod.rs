@@ -80,6 +80,21 @@ impl WafCategory {
 		}
 	}
 
+	/// The default anomaly **weight** this category contributes to an aggregate score in
+	/// [`anomaly_score`] / [`Waf::inspect_all`]. The scale mirrors OWASP-CRS severities
+	/// (critical injection/RCE/SSRF/LFI classes weigh most, protocol oddities least); the
+	/// *threshold* an operator compares the sum against is the tuning knob, not these
+	/// weights. Used only by the collect-all scoring path; the first-match [`Waf::inspect`]
+	/// fast path does not score.
+	#[must_use]
+	pub const fn weight(self) -> u32 {
+		match self {
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal => 5,
+			Self::Xss => 4,
+			Self::ProtocolAnomaly => 3,
+		}
+	}
+
 	/// A stable dense index in `0..`[`ALL.len()`](Self::ALL), for array-backed per-category
 	/// counters. `WafCategory::ALL[c.index()] == c` for every category.
 	#[must_use]
@@ -329,6 +344,73 @@ impl Waf {
 		}
 		Verdict::Allow
 	}
+
+	/// Match the ruleset against one string and return **every** enabled rule that fires
+	/// (not just the lowest index), in ascending rule order. The collect-all counterpart of
+	/// [`match_raw`](Self::match_raw).
+	fn match_all_raw(&self, haystack: &str, location: &str, out: &mut Vec<WafMatch>) {
+		for idx in self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]) {
+			let (rule_id, category) = self.meta[idx];
+			out.push(WafMatch { rule_id, category, location: location.to_owned() });
+		}
+	}
+
+	/// Collect every distinct rule that fires on one field, over both the raw and (if
+	/// normalization changes it) the decoded form. A rule that matches both forms is
+	/// reported once (dedup by `rule_id` within the field). The multiple-encoding guard, when
+	/// armed, contributes its anomaly the same way [`inspect_field`](Self::inspect_field)
+	/// would block on it.
+	fn inspect_field_all(&self, raw: &str, location: &str, plus_is_space: bool, out: &mut Vec<WafMatch>) {
+		let start = out.len();
+		self.match_all_raw(raw, location, out);
+		let norm = normalize(raw, plus_is_space);
+		if self.block_multi_encoded && norm.decode_passes >= 2 {
+			out.push(WafMatch { rule_id: MULTI_ENCODING_RULE_ID, category: WafCategory::ProtocolAnomaly, location: location.to_owned() });
+			return;
+		}
+		if norm.decoded != raw {
+			let mut decoded = Vec::new();
+			self.match_all_raw(&norm.decoded, location, &mut decoded);
+			for m in decoded {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+	}
+
+	/// Inspect a request and return **every** signature that fires across the method, path,
+	/// query, and header values — the collect-all counterpart of the first-match
+	/// [`inspect`](Self::inspect). Useful for observability ("what did this request trip?")
+	/// and for [`anomaly_score`], where several weak signals combine. Bodies are not scanned
+	/// here (body inspection stays the separate, opt-in [`inspect_body`](Self::inspect_body)
+	/// path). The returned matches are grouped by field in inspection order; an empty vec
+	/// means the request is clean.
+	#[must_use]
+	pub fn inspect_all(&self, parts: &Parts) -> Vec<WafMatch> {
+		let mut out = Vec::new();
+		self.inspect_field_all(parts.method.as_str(), "method", false, &mut out);
+		self.inspect_field_all(parts.uri.path(), "target", false, &mut out);
+		if let Some(query) = parts.uri.query() {
+			self.inspect_field_all(query, "query", true, &mut out);
+		}
+		for (name, value) in &parts.headers {
+			if let Ok(s) = value.to_str() {
+				self.inspect_field_all(s, &format!("header:{name}"), false, &mut out);
+			}
+		}
+		out
+	}
+}
+
+/// Sum the [`WafCategory::weight`] of each match into a single anomaly score. Zero for an
+/// empty slice (a clean request). An operator compares this against a chosen threshold to
+/// decide whether the *aggregate* of several signals — none necessarily blocking on its
+/// own under first-match — warrants a block, the OWASP-CRS anomaly-scoring model ported to
+/// this engine. Pair with [`Waf::inspect_all`].
+#[must_use]
+pub fn anomaly_score(matches: &[WafMatch]) -> u32 {
+	matches.iter().map(|m| m.category.weight()).sum()
 }
 
 impl Default for Waf {
@@ -721,6 +803,61 @@ mod tests {
 		// A literal '+' in a path segment must not be folded — no false "query" decoding.
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/c++/reference")), Verdict::Allow);
+	}
+
+	#[test]
+	fn inspect_all_collects_every_signature() {
+		let waf = Waf::starter();
+		// SQLi in the query plus an XSS header — first-match `inspect` returns only one,
+		// `inspect_all` returns both.
+		let mut p = parts("GET", "/items?q=1%20UNION%20SELECT%20pw%20FROM%20users");
+		p.headers.insert("referer", "<script>x</script>".parse().unwrap());
+		let all = waf.inspect_all(&p);
+		assert!(all.iter().any(|m| m.category == WafCategory::Sqli && m.location == "query"));
+		assert!(all.iter().any(|m| m.rule_id == "xss_script_tag" && m.location == "header:referer"));
+	}
+
+	#[test]
+	fn inspect_all_is_empty_for_benign_request() {
+		let waf = Waf::starter();
+		assert!(waf.inspect_all(&parts("GET", "/articles/hello-world?page=2")).is_empty());
+		assert_eq!(anomaly_score(&[]), 0);
+	}
+
+	#[test]
+	fn inspect_all_dedups_raw_and_decoded_in_one_field() {
+		// `<script>` appears literally; its raw form already trips xss_script_tag and the
+		// field's decoded form is identical here — the rule is reported once per field.
+		let waf = Waf::starter();
+		let all = waf.inspect_all(&parts("GET", "/x?c=%3Cscript%3E%3Cscript%3E"));
+		let n = all.iter().filter(|m| m.rule_id == "xss_script_tag" && m.location == "query").count();
+		assert_eq!(n, 1, "a rule fires at most once per field");
+	}
+
+	#[test]
+	fn anomaly_score_sums_category_weights() {
+		// SQLi (5) + XSS (4) = 9; threshold tuning is the operator's, not the engine's.
+		let waf = Waf::starter();
+		let mut p = parts("GET", "/items?q=1%20OR%201=1");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let score = anomaly_score(&waf.inspect_all(&p));
+		assert!(score >= 9, "expected combined SQLi+XSS score >= 9, got {score}");
+	}
+
+	#[test]
+	fn inspect_all_respects_disabled_rules() {
+		// A disabled rule contributes neither a match nor score on the collect-all path.
+		let waf = Waf::starter().disable_category(WafCategory::Sqli);
+		let all = waf.inspect_all(&parts("GET", "/items?q=1%20UNION%20SELECT%20pw"));
+		assert!(all.iter().all(|m| m.category != WafCategory::Sqli));
+	}
+
+	#[test]
+	fn category_weight_scale_is_ordered() {
+		// Critical injection classes weigh at least as much as protocol oddities.
+		assert!(WafCategory::Sqli.weight() >= WafCategory::Xss.weight());
+		assert!(WafCategory::Xss.weight() >= WafCategory::ProtocolAnomaly.weight());
+		assert_eq!(WafCategory::Ssrf.weight(), WafCategory::Sqli.weight());
 	}
 
 	#[test]

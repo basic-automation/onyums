@@ -42,4 +42,4 @@ pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};
 pub use ratelimit::{Quota, SkinRateLimit};
 pub use shape::{RequestShape, ShapeBaseline};
-pub use waf::{Rule, Verdict, Waf, WafCategory, WafMatch};
+pub use waf::{Rule, Verdict, Waf, WafCategory, WafMatch, anomaly_score};

@@ -55,13 +55,17 @@ pub enum WafCategory {
 	PathTraversal,
 	/// OS command injection (shell metacharacters chaining a command).
 	CommandInjection,
+	/// Server-side request forgery: a request trying to make the server fetch an
+	/// internal/loopback/metadata URL. IP-free to detect (the *URL value* is in the
+	/// request), so it survives the loss of client IP and ports directly over Tor.
+	Ssrf,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 5] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::ProtocolAnomaly];
+	pub const ALL: [WafCategory; 6] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::ProtocolAnomaly];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -71,6 +75,7 @@ impl WafCategory {
 			Self::Xss => "xss",
 			Self::PathTraversal => "path_traversal",
 			Self::CommandInjection => "command_injection",
+			Self::Ssrf => "ssrf",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -84,7 +89,8 @@ impl WafCategory {
 			Self::Xss => 1,
 			Self::PathTraversal => 2,
 			Self::CommandInjection => 3,
-			Self::ProtocolAnomaly => 4,
+			Self::Ssrf => 4,
+			Self::ProtocolAnomaly => 5,
 		}
 	}
 }
@@ -408,12 +414,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r"(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)" },
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
+		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
 		Rule { id: "xss_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(error|load|click|mouseover|focus|toggle)\s*=" },
 		Rule { id: "xss_iframe_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*iframe\b" },
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
+		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
 		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
@@ -423,6 +431,11 @@ pub fn starter_rules() -> Vec<Rule> {
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
+		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
+		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
+		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
+		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
+		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -708,6 +721,49 @@ mod tests {
 		// A literal '+' in a path segment must not be folded — no false "query" decoding.
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/c++/reference")), Verdict::Allow);
+	}
+
+	#[test]
+	fn ssrf_cloud_metadata_is_blocked() {
+		let waf = Waf::starter();
+		// The AWS/GCP/Azure link-local metadata endpoint, by IP and by path.
+		assert_eq!(waf.inspect_str("url=http://169.254.169.254/latest/meta-data/iam", "target").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("target=/computeMetadata/v1/project", "target").unwrap().rule_id, "ssrf_cloud_metadata_path");
+	}
+
+	#[test]
+	fn ssrf_internal_scheme_and_loopback_are_blocked() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("u=gopher://internal:6379/_INFO", "query").unwrap().rule_id, "ssrf_internal_scheme");
+		assert_eq!(waf.inspect_str("next=file:///etc/hostname", "query").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("fetch=http://127.0.0.1:8080/admin", "query").unwrap().rule_id, "ssrf_loopback_url");
+		assert_eq!(waf.inspect_str("fetch=https://localhost/internal", "query").unwrap().rule_id, "ssrf_loopback_url");
+	}
+
+	#[test]
+	fn ssrf_category_metadata_is_stable() {
+		assert_eq!(WafCategory::Ssrf.name(), "ssrf");
+		assert_eq!(WafCategory::ALL[WafCategory::Ssrf.index()], WafCategory::Ssrf);
+		// The index is still a bijection over the (now six) categories.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn new_sqli_and_xss_rules_match() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("1 UNION SELECT pw INTO OUTFILE '/tmp/x'", "target").map(|m| m.category), Some(WafCategory::Sqli));
+		assert_eq!(waf.inspect_str("href=vbscript:msgbox(1)", "target").unwrap().rule_id, "xss_vbscript_uri");
+	}
+
+	#[test]
+	fn ssrf_rules_keep_false_positives_low() {
+		// Benign requests that mention URLs/paths but are not SSRF must still pass.
+		let waf = Waf::starter();
+		for uri in ["/redirect?to=https://example.com/welcome", "/blog/file-formats-explained", "/docs/localhost-development-guide", "/articles/the-year-1692"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

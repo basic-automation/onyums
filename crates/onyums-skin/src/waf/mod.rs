@@ -161,6 +161,11 @@ pub struct Waf {
 	/// buffers that much before forwarding). `None` (default) leaves bodies uninspected —
 	/// body inspection means buffering, a request-handling cost the operator opts into.
 	body_inspection: Option<usize>,
+	/// When `Some(threshold)`, [`inspect`](Self::inspect) blocks on the *aggregate*
+	/// [`anomaly_score`] of all signatures reaching `threshold` rather than on the first
+	/// match. `None` (default) is first-match-blocks. The multiple-encoding guard still hard
+	/// blocks independently of the threshold when armed.
+	scoring_threshold: Option<u32>,
 }
 
 impl Waf {
@@ -174,7 +179,7 @@ impl Waf {
 		let set = RegexSet::new(rules.iter().map(|r| r.pattern))?;
 		let meta: Vec<(&'static str, WafCategory)> = rules.iter().map(|r| (r.id, r.category)).collect();
 		let enabled = vec![true; meta.len()];
-		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None })
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -244,6 +249,18 @@ impl Waf {
 	#[must_use]
 	pub fn body_cap(&self) -> Option<usize> {
 		self.body_inspection
+	}
+
+	/// Switch [`inspect`](Self::inspect) into OWASP-CRS-style **anomaly-scoring** mode: a
+	/// request is blocked when the [`anomaly_score`] of *all* the signatures it trips reaches
+	/// `threshold`, rather than on the first single match. This lets several sub-blocking
+	/// signals combine, and lets an operator raise `threshold` to tolerate one weak hit. The
+	/// multiple-encoding guard (when armed) still hard-blocks independently of the score.
+	/// Default (without this call) is first-match-blocks.
+	#[must_use]
+	pub fn scoring_threshold(mut self, threshold: u32) -> Self {
+		self.scoring_threshold = Some(threshold);
+		self
 	}
 
 	/// Inspect a request body's bytes with the same rules and normalization as every
@@ -324,6 +341,9 @@ impl Waf {
 	/// [`Verdict::Allow`].
 	#[must_use]
 	pub fn inspect(&self, parts: &Parts) -> Verdict {
+		if let Some(threshold) = self.scoring_threshold {
+			return self.inspect_scored(parts, threshold);
+		}
 		if let Some(m) = self.inspect_field(parts.method.as_str(), "method", false) {
 			return Verdict::Block(m);
 		}
@@ -343,6 +363,26 @@ impl Waf {
 			}
 		}
 		Verdict::Allow
+	}
+
+	/// The anomaly-scoring decision for [`inspect`](Self::inspect) when a
+	/// [`scoring_threshold`](Self::scoring_threshold) is set. Blocks if any field is
+	/// multiply percent-encoded (the armed guard, independent of the score), else if the
+	/// aggregate [`anomaly_score`] reaches `threshold`. The reported [`WafMatch`] is the
+	/// highest-weight signature (ties broken toward the earliest in inspection order), so a
+	/// scored block names the most severe rule that drove it.
+	fn inspect_scored(&self, parts: &Parts, threshold: u32) -> Verdict {
+		let matches = self.inspect_all(parts);
+		if self.block_multi_encoded && let Some(m) = matches.iter().find(|m| m.rule_id == MULTI_ENCODING_RULE_ID) {
+			return Verdict::Block(m.clone());
+		}
+		if anomaly_score(&matches) < threshold {
+			return Verdict::Allow;
+		}
+		// Name the most severe rule that drove the block; on a weight tie keep the earliest
+		// (inspection order is method → target → query → headers, lowest rule index first).
+		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (m.category.weight(), std::cmp::Reverse(*i))).map(|(_, m)| m.clone());
+		dominant.map_or(Verdict::Allow, Verdict::Block)
 	}
 
 	/// Match the ruleset against one string and return **every** enabled rule that fires
@@ -803,6 +843,50 @@ mod tests {
 		// A literal '+' in a path segment must not be folded — no false "query" decoding.
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/c++/reference")), Verdict::Allow);
+	}
+
+	#[test]
+	fn scoring_mode_allows_single_weak_hit_below_threshold() {
+		// One protocol-anomaly hit (weight 3) under a threshold of 8 is tolerated, where
+		// first-match mode would have blocked it.
+		let waf = Waf::starter().scoring_threshold(8);
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "() { :; }; echo".parse().unwrap());
+		assert_eq!(waf.inspect(&p), Verdict::Allow);
+		// First-match mode (no threshold) still blocks the same request.
+		assert!(matches!(Waf::starter().inspect(&p), Verdict::Block(_)));
+	}
+
+	#[test]
+	fn scoring_mode_blocks_when_signals_combine() {
+		// SQLi (5) in the query + XSS (4) in a header = 9 >= threshold 8 → blocked, and the
+		// reported rule is the highest-weight (SQLi) signature.
+		let waf = Waf::starter().scoring_threshold(8);
+		let mut p = parts("GET", "/items?q=1%20OR%201=1");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let v = waf.inspect(&p);
+		assert_eq!(blocked(&v).category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn scoring_mode_blocks_single_hit_at_threshold() {
+		// A lone SQLi (weight 5) meets a threshold of 5.
+		let waf = Waf::starter().scoring_threshold(5);
+		assert!(matches!(waf.inspect(&parts("GET", "/items?q=1%20UNION%20SELECT%20pw")), Verdict::Block(_)));
+	}
+
+	#[test]
+	fn scoring_mode_still_hard_blocks_multi_encoding() {
+		// The multiple-encoding guard fires regardless of how high the threshold is.
+		let waf = Waf::starter().scoring_threshold(1000);
+		let v = waf.inspect(&parts("GET", "/x?p=a%252e%252e%252fb"));
+		assert_eq!(blocked(&v).rule_id, MULTI_ENCODING_RULE_ID);
+	}
+
+	#[test]
+	fn scoring_mode_allows_clean_request() {
+		let waf = Waf::starter().scoring_threshold(5);
+		assert_eq!(waf.inspect(&parts("GET", "/articles/hello-world?page=2")), Verdict::Allow);
 	}
 
 	#[test]

@@ -200,14 +200,20 @@ impl Skin {
 	}
 }
 
-/// The `403` served when a [`Waf`] rule fires (on a request field or its body).
+/// The `403` served when a [`Waf`] rule fires (on a request field or its body). A
+/// scoring-mode block names the aggregate anomaly score that crossed the threshold.
 fn waf_block_response(m: &WafMatch) -> Response {
-	(StatusCode::FORBIDDEN, format!("Blocked by WAF rule {} ({}).", m.rule_id, m.category.name())).into_response()
+	let body = match m.score {
+		Some(score) => format!("Blocked by WAF rule {} ({}); request anomaly score {score}.", m.rule_id, m.category.name()),
+		None => format!("Blocked by WAF rule {} ({}).", m.rule_id, m.category.name()),
+	};
+	(StatusCode::FORBIDDEN, body).into_response()
 }
 
-/// The structured [`SecurityEvent`] for a WAF block, built from the firing match.
+/// The structured [`SecurityEvent`] for a WAF block, built from the firing match. The
+/// match carries the aggregate anomaly score when it came from a scoring-mode block.
 fn waf_block_event(m: &WafMatch) -> SecurityEvent {
-	SecurityEvent::WafBlock { rule_id: m.rule_id, category: m.category, location: m.location.clone() }
+	SecurityEvent::WafBlock { rule_id: m.rule_id, category: m.category, location: m.location.clone(), score: m.score }
 }
 
 /// Outcome of [`Skin::decide`]: either serve a Skin response directly, or let the

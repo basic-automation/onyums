@@ -61,6 +61,11 @@ pub enum SecurityEvent {
 		category: WafCategory,
 		/// Which part of the request matched (e.g. `"query"`, `"header:user-agent"`, `"body"`).
 		location: String,
+		/// The aggregate WAF anomaly score that drove a scoring-mode block (see
+		/// [`Waf::scoring_threshold`](crate::Waf::scoring_threshold)), or `None` for a
+		/// first-match block. Lets a metrics/audit consumer tell aggregated blocks from
+		/// single-signature ones and weight attack pressure by severity.
+		score: Option<u32>,
 	},
 	/// A cleared client exceeded its per-token request rate; refused with `429`.
 	RateLimited {
@@ -376,13 +381,13 @@ mod tests {
 	#[test]
 	fn kind_is_stable_per_variant() {
 		assert_eq!(SecurityEvent::ChallengeFailed.kind(), "challenge_failed");
-		assert_eq!(SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Sqli, location: "query".to_owned() }.kind(), "waf_block");
+		assert_eq!(SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Sqli, location: "query".to_owned(), score: None }.kind(), "waf_block");
 		assert_eq!(SecurityEvent::Circuit { id: CircuitId(1), action: CircuitAction::Shutdown }.kind(), "circuit_action");
 	}
 
 	#[test]
 	fn severity_orders_attacks_above_routine() {
-		let block = SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Xss, location: "body".to_owned() };
+		let block = SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Xss, location: "body".to_owned(), score: None };
 		let issued = SecurityEvent::ChallengeIssued { client_has_js: true };
 		assert_eq!(block.severity(), Severity::Warning);
 		assert_eq!(issued.severity(), Severity::Info);
@@ -436,8 +441,8 @@ mod tests {
 		let sink = MetricsSink::new();
 		assert_eq!(sink.snapshot(), SecurityMetrics::default());
 
-		sink.record(&SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Sqli, location: "query".to_owned() });
-		sink.record(&SecurityEvent::WafBlock { rule_id: "y", category: WafCategory::Xss, location: "body".to_owned() });
+		sink.record(&SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Sqli, location: "query".to_owned(), score: None });
+		sink.record(&SecurityEvent::WafBlock { rule_id: "y", category: WafCategory::Xss, location: "body".to_owned(), score: None });
 		sink.record(&SecurityEvent::ChallengeIssued { client_has_js: true });
 		sink.record(&SecurityEvent::ChallengePassed { level: ClearanceLevel::Pow });
 		sink.record(&SecurityEvent::ChallengePassed { level: ClearanceLevel::Patience });
@@ -469,9 +474,9 @@ mod tests {
 
 		let sink = MetricsSink::new();
 		for _ in 0..3 {
-			sink.record(&SecurityEvent::WafBlock { rule_id: "p", category: WafCategory::PathTraversal, location: "target".to_owned() });
+			sink.record(&SecurityEvent::WafBlock { rule_id: "p", category: WafCategory::PathTraversal, location: "target".to_owned(), score: None });
 		}
-		sink.record(&SecurityEvent::WafBlock { rule_id: "s", category: WafCategory::Sqli, location: "query".to_owned() });
+		sink.record(&SecurityEvent::WafBlock { rule_id: "s", category: WafCategory::Sqli, location: "query".to_owned(), score: None });
 		let m = sink.snapshot();
 		assert_eq!(m.waf_blocks_in(WafCategory::PathTraversal), 3);
 		assert_eq!(m.waf_blocks_in(WafCategory::Sqli), 1);
@@ -531,7 +536,7 @@ mod tests {
 		let fan = FanoutSink::new(vec![Arc::new(metrics.clone()), Arc::new(captured.clone())]);
 
 		fan.record(&SecurityEvent::ChallengeFailed);
-		fan.record(&SecurityEvent::WafBlock { rule_id: "z", category: WafCategory::CommandInjection, location: "query".to_owned() });
+		fan.record(&SecurityEvent::WafBlock { rule_id: "z", category: WafCategory::CommandInjection, location: "query".to_owned(), score: None });
 
 		assert_eq!(metrics.snapshot().challenges_failed, 1);
 		assert_eq!(metrics.snapshot().waf_blocks, 1);

@@ -240,6 +240,15 @@ pub struct SecurityMetrics {
 	/// [`WafCategory::index`]. Read it ergonomically with
 	/// [`waf_blocks_in`](Self::waf_blocks_in); the per-index sum equals [`waf_blocks`](Self::waf_blocks).
 	pub waf_blocks_by_category: [u64; WafCategory::ALL.len()],
+	/// WAF blocks that fired in anomaly-**scoring** mode (those carrying a
+	/// [`SecurityEvent::WafBlock`] `score`) — `<=` [`waf_blocks`](Self::waf_blocks). The rest
+	/// were single-signature first-match blocks.
+	pub waf_scored_blocks: u64,
+	/// The running sum of every scoring-mode block's aggregate anomaly score — a
+	/// severity-**weighted** measure of WAF attack pressure (a flood of high-weight injections
+	/// climbs faster than the same count of weak protocol oddities). Derive the mean
+	/// per-block severity with [`mean_anomaly_score`](Self::mean_anomaly_score).
+	pub waf_anomaly_score_total: u64,
 	/// Per-token rate-limit trips ([`SecurityEvent::RateLimited`]).
 	pub rate_limited: u64,
 	/// Challenges presented ([`SecurityEvent::ChallengeIssued`]).
@@ -262,6 +271,16 @@ impl SecurityMetrics {
 	#[must_use]
 	pub const fn waf_blocks_in(&self, category: WafCategory) -> u64 {
 		self.waf_blocks_by_category[category.index()]
+	}
+
+	/// The mean aggregate anomaly score across scoring-mode blocks —
+	/// `waf_anomaly_score_total / waf_scored_blocks`. Returns `None` until at least one scored
+	/// block has happened, so a gate that has never scored a block does not report a
+	/// misleading `0`. A rising mean signals attacks are getting more severe per block, not
+	/// just more frequent.
+	#[must_use]
+	pub fn mean_anomaly_score(&self) -> Option<f64> {
+		(self.waf_scored_blocks > 0).then(|| self.waf_anomaly_score_total as f64 / self.waf_scored_blocks as f64)
 	}
 
 	/// The share of decided challenges that were cleared — `passed / (passed + failed)`.
@@ -290,6 +309,8 @@ pub struct MetricsSink {
 struct MetricsCounters {
 	waf_blocks: AtomicU64,
 	waf_by_category: [AtomicU64; WafCategory::ALL.len()],
+	waf_scored_blocks: AtomicU64,
+	waf_anomaly_score_total: AtomicU64,
 	rate_limited: AtomicU64,
 	challenges_issued: AtomicU64,
 	challenges_passed: AtomicU64,
@@ -319,6 +340,8 @@ impl MetricsSink {
 		SecurityMetrics {
 			waf_blocks: c.waf_blocks.load(Ordering::Relaxed),
 			waf_blocks_by_category,
+			waf_scored_blocks: c.waf_scored_blocks.load(Ordering::Relaxed),
+			waf_anomaly_score_total: c.waf_anomaly_score_total.load(Ordering::Relaxed),
 			rate_limited: c.rate_limited.load(Ordering::Relaxed),
 			challenges_issued: c.challenges_issued.load(Ordering::Relaxed),
 			challenges_passed: c.challenges_passed.load(Ordering::Relaxed),
@@ -332,9 +355,14 @@ impl MetricsSink {
 
 impl SecurityEventSink for MetricsSink {
 	fn record(&self, event: &SecurityEvent) {
-		// A WAF block also bumps its per-category counter (the total is counted below).
-		if let SecurityEvent::WafBlock { category, .. } = event {
+		// A WAF block also bumps its per-category counter (the total is counted below); a
+		// scoring-mode block additionally accumulates the severity-weighted score it carried.
+		if let SecurityEvent::WafBlock { category, score, .. } = event {
 			self.inner.waf_by_category[category.index()].fetch_add(1, Ordering::Relaxed);
+			if let Some(score) = score {
+				self.inner.waf_scored_blocks.fetch_add(1, Ordering::Relaxed);
+				self.inner.waf_anomaly_score_total.fetch_add(u64::from(*score), Ordering::Relaxed);
+			}
 		}
 		let counter = match event {
 			SecurityEvent::WafBlock { .. } => &self.inner.waf_blocks,
@@ -463,6 +491,26 @@ mod tests {
 		assert_eq!(m.waf_blocks_in(WafCategory::Sqli), 1);
 		assert_eq!(m.waf_blocks_in(WafCategory::Xss), 1);
 		assert_eq!(m.waf_blocks_in(WafCategory::PathTraversal), 0);
+		// Both blocks were first-match (score None) — no scored-block accounting.
+		assert_eq!(m.waf_scored_blocks, 0);
+		assert_eq!(m.waf_anomaly_score_total, 0);
+		assert_eq!(m.mean_anomaly_score(), None);
+	}
+
+	#[test]
+	fn metrics_sink_accumulates_scored_block_severity() {
+		let sink = MetricsSink::new();
+		// A first-match block (score None) bumps the totals but not the scored accounting.
+		sink.record(&SecurityEvent::WafBlock { rule_id: "x", category: WafCategory::Xss, location: "query".to_owned(), score: None });
+		// Two scoring-mode blocks carrying aggregate scores 9 and 5.
+		sink.record(&SecurityEvent::WafBlock { rule_id: "y", category: WafCategory::Sqli, location: "query".to_owned(), score: Some(9) });
+		sink.record(&SecurityEvent::WafBlock { rule_id: "z", category: WafCategory::Ssrf, location: "query".to_owned(), score: Some(5) });
+
+		let m = sink.snapshot();
+		assert_eq!(m.waf_blocks, 3);
+		assert_eq!(m.waf_scored_blocks, 2);
+		assert_eq!(m.waf_anomaly_score_total, 14);
+		assert_eq!(m.mean_anomaly_score(), Some(7.0));
 	}
 
 	#[test]

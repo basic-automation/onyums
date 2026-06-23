@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-23 — onyums-skin Phase 3 WAF: surface anomaly score (event + metrics) + CodeInjection class (4 increments)
 
-Branch `routine/onyums-2026-06-23` → PR (base `master`). Last run (PR
+Branch `routine/onyums-2026-06-23` → PR
+[#13](https://github.com/basic-automation/onyums/pull/13) (base `master`). Last run (PR
 [#12](https://github.com/basic-automation/onyums/pull/12), merged; `master` head
 `ab2ccc4`) built the OWASP-CRS anomaly-scoring model (collect-all inspection, per-category
 weights, aggregate-score block mode) and set the NEXT STEP to (a) the heavy `wirefilter`

@@ -6,15 +6,27 @@
 //! per-circuit policy hook the host (onyums) wires to Arti's `RendRequest` /
 //! `StreamRequest`.
 //!
-//! **Status: Phase 1 (gate core) implemented.** The framework-agnostic HTTP gate is
-//! live and usable by any axum app — see [`Skin::secure_default`] for the one-line
-//! secure setup, or [`Skin::builder`] to tune it. It ships the [`Hashcash`] proof-of-
-//! work [`Challenge`] with a JS interstitial, stateless HMAC [`Clearance`] tokens, a
-//! [`PatienceChallenge`] no-JS fallback, a [`ChallengeChain`] fallback selector,
-//! token-keyed [`SkinRateLimit`], and the [`SkinLayer`] tower middleware that wires
-//! them together with single-use replay protection on solved puzzles. The Tor
-//! dimension ([`CircuitPolicy`], Phase 2) and the WAF (Phase 3) remain trait/skeleton
-//! stage; the architecture and full plan are pinned in this crate's `ROADMAP.md`.
+//! **Status: Phases 1–4 implemented.** See [`Skin::secure_default`] for the one-line
+//! secure setup, or [`Skin::builder`] to tune it.
+//!
+//! - **Phase 1 — gate core.** The [`Hashcash`] proof-of-work [`Challenge`] with a JS
+//!   interstitial, stateless HMAC [`Clearance`] tokens, a [`PatienceChallenge`] no-JS
+//!   fallback, a [`ChallengeChain`] fallback selector, token-keyed [`SkinRateLimit`],
+//!   and the [`SkinLayer`] tower middleware that wires them together with single-use
+//!   replay protection on solved puzzles.
+//! - **Phase 2 — Tor dimension.** A [`CircuitPolicy`] trait with per-circuit accounting
+//!   ([`AccountingCircuitPolicy`], [`CircuitStats`]) and [`AdaptiveDifficulty`] /
+//!   [`ShapeDifficulty`] PoW-difficulty control.
+//! - **Phase 3 — WAF.** A pure-Rust signature engine ([`Waf`]) over `regex` + `aho-corasick`
+//!   with a starter ruleset, percent-decode normalization, and OWASP-CRS-style
+//!   [`anomaly_score`] block mode.
+//! - **Phase 4 — observability.** Typed [`SecurityEvent`]s through a [`SecurityEventSink`]
+//!   ([`MetricsSink`]/[`SecurityMetrics`], [`FanoutSink`], [`TracingSink`]) and request-shape
+//!   baselining ([`ShapeBaseline`]).
+//!
+//! The Phase 5 frontier work (a `wirefilter` rule-expression front-end, JA4H
+//! fingerprinting, restricted-discovery orchestration) is tracked in this crate's
+//! `ROADMAP.md`, which pins the full architecture and plan.
 
 // Phase 2+ surface (CircuitPolicy, and not-yet-wired builder/limiter helpers) is public
 // API that downstreams and later phases consume, but unused within the crate today.

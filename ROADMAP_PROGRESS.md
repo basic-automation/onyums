@@ -7,6 +7,114 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-23 — onyums-skin Phase 3 WAF: surface anomaly score (event + metrics) + CodeInjection class (4 increments)
+
+Branch `routine/onyums-2026-06-23` → PR
+[#13](https://github.com/basic-automation/onyums/pull/13) (base `master`). Last run (PR
+[#12](https://github.com/basic-automation/onyums/pull/12), merged; `master` head
+`ab2ccc4`) built the OWASP-CRS anomaly-scoring model (collect-all inspection, per-category
+weights, aggregate-score block mode) and set the NEXT STEP to (a) the heavy `wirefilter`
+front-end and (b) a smaller follow-up: surface the anomaly score onto the `WafBlock`
+event/metrics. This run took the **smaller, fully routine-verifiable follow-up and finished
+it end-to-end**, then broadened the ruleset — all pure-Rust, no-Tor, **no new
+dependencies**. The `wirefilter` front-end was again deliberately deferred (see STOP
+REASON). Workspace stayed green and clippy-clean after every increment. Only
+`crates/onyums-skin/src/{waf/mod.rs, observe.rs, layer.rs}` changed; no onyums-server (root)
+code touched.
+
+**Increment 1 — surface the anomaly score onto `WafBlock`.** *Phase 3, "surface the anomaly
+score into the WafBlock SecurityEvent" open item.* Files: `src/waf/mod.rs`, `src/observe.rs`,
+`src/layer.rs`. In scoring mode a block was driven by the aggregate score of several
+signatures, but the emitted block discarded that number — a scored block was
+indistinguishable from a single-signature one. Added an optional `score: Option<u32>` to
+`WafMatch`: `inspect_scored` now computes the aggregate `anomaly_score` once and tags the
+representative (highest-weight) match with it; first-match blocks, the multiple-encoding hard
+block, and the per-signature `inspect_all` matches stay `None`. Threaded onto
+`SecurityEvent::WafBlock { score }` (populated by the layer from the match) and into the 403
+body. **3 unit tests** (score carried on a combined SQLi+XSS scored block; absent on a
+first-match block; absent on the scoring-mode multi-encoding hard block).
+
+**Increment 2 — CodeInjection category + broader ruleset.** *Phase 3, "broader OWASP-CRS
+ruleset" open item.* Files: `src/waf/mod.rs`. New `WafCategory::CodeInjection` (weight 5;
+ALL/name/weight/index updated — the per-category metric arrays in `observe.rs` size off
+`WafCategory::ALL.len()` so they grew automatically). Four conservative, high-signal
+server-side code/expression-injection rules: `code_log4shell_jndi` (`${jndi:`),
+`code_log4j_nested_lookup` (`${…${…` split/obfuscated lookup that evades a literal
+`${jndi:` filter), `code_php_object_inject` (`O:8:"…":n:{` unserialize POP-chain gadget),
+`code_ssti_arithmetic` (`${7*7}` template-injection probe). **2 unit tests** (each new rule
+attributes to CodeInjection and reports its id; an FP guard over benign
+brace/dollar/"code"-mentioning requests; the index bijection check now covers seven
+categories).
+
+**Increment 3 — meter scoring-mode blocks as weighted attack pressure.** *Phase 3, "surface
+the anomaly score into … metrics" open item.* Files: `src/observe.rs`. `MetricsSink` now
+reads the `WafBlock` `score` it was already matching: a scoring-mode block (score `Some`)
+bumps two new `SecurityMetrics` counters, leaving first-match blocks (score `None`)
+untouched. Added `waf_scored_blocks` (count of scoring-mode blocks, `<= waf_blocks`),
+`waf_anomaly_score_total` (running sum of their aggregate scores — a severity-weighted
+attack-pressure measure), and `mean_anomaly_score()` (`total/count`, `None` until the first
+scored block so a gate that never scored does not report a misleading `0`). **1 unit test**
+(two scored blocks of 9 and 5 → scored_blocks 2, total 14, mean 7.0) plus assertions on the
+existing per-variant test that first-match blocks leave the scored accounting at zero.
+
+**Increment 4 — end-to-end coverage through the live layer.** *Phase 3, hardening the
+increment-1/3 wiring.* Files: `src/layer.rs`. A `#[tokio::test]` driving a scoring-threshold
+`Waf` wired into the real `SkinService`: a request whose SQLi query (5) + XSS header (4) sum
+to 9 over threshold 8 returns `403`, the 403 body names `"anomaly score 9"`, and the
+`CapturingSink` received one `WafBlock` event carrying `score Some(9)` and the dominant SQLi
+category. Confirms the full path (`inspect_scored` → `WafMatch.score` →
+`waf_block_event`/`waf_block_response`) holds through `tower`, and that WAF inspection runs
+ahead of the clearance gate (the request is uncleared yet still blocked). **1 integration
+test.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **181 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 174+1 at last run start; **+7** across the four increments — 3+2+1+1).
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** throughout (no `#[allow]`
+  added; one let-chain retained in `inspect_scored`).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open (onyums-skin Phase 3 — WAF)
+- **DONE this run:** the "surface the anomaly score into the `WafBlock` SecurityEvent **and**
+  metrics" bullet is now fully closed (event `score`, 403 body, `waf_scored_blocks` /
+  `waf_anomaly_score_total` / `mean_anomaly_score`, end-to-end layer test); a new
+  CodeInjection rule class (Log4Shell / PHP object-inject / SSTI).
+- **OPEN (Phase 3):** the `wirefilter` rule-expression front-end (a heavier dep + a filter
+  language design — deferred again this run); further OWASP-CRS rule porting toward fuller
+  coverage.
+- **OPEN (Phase 4):** onyums-side consumption — wiring `FanoutSink`/`SecurityMetrics`/a
+  `ShapeDifficulty` into onyums' live Skin setup (touches the live-serve path this routine
+  cannot runtime-verify).
+- **BLOCKED:** skin Phase 1 `CaptchaChallenge` (the `captcha` crate license audit — an open
+  ROADMAP question).
+- **NOT STARTED:** onyums server Phase 0 (kill `ONION_NAME` singleton / readiness+shutdown
+  handle), Phase 1 (identity), Phase 3 (TLS-first/strict); skin Phase 5 (frontier).
+
+**STOP REASON:** Landed 4 verifiable increments (top of the 2–4 bar) as one coherent arc —
+the score now flows from `inspect_scored` onto the event, the 403 body, and the metrics, and
+is covered end-to-end through the live `SkinService`, plus a new CodeInjection rule class.
+All pure-Rust, no new deps, fully unit/integration-tested, green and clippy-clean, nothing
+half-landed. The remaining routine-verifiable Phase-3 piece — the `wirefilter` front-end — is
+a heavy new dependency plus a filter-language integration that two prior runs already flagged
+as a dedicated-night effort; starting it past 03:00 risks exactly the half-landed outcome the
+routine forbids. The other open work is either blocked (`CaptchaChallenge` license) or lives
+on the live-serve path this routine cannot runtime-verify (onyums Phase 0/2 wiring), so each
+deserves a dedicated start rather than a rushed fifth increment.
+
+**NEXT STEP:** Begin the **Phase-3 `wirefilter` rule-expression front-end** on a dedicated
+night — promote the pure-Rust `wirefilter` crate to `[workspace.dependencies]`, define a
+`Scheme` over the request fields the engine already normalizes (method/target/query/headers,
+plus the optional body), compile operator expressions into a `FilterRule`, and evaluate them
+alongside the existing `RegexSet` signatures, folding any filter hit into the same
+`WafMatch`/`anomaly_score`/metrics machinery (which now carries the score through to the
+event and the `MetricsSink`). Alternatively, if the live-serve path is in scope for a run,
+onyums Phase 2 can wire the now-complete `FanoutSink`/`MetricsSink`/`ShapeDifficulty` into
+onyums' served `Router`.
+
+---
+
 ## 2026-06-22 — onyums-skin Phase 3 WAF hardening: operator control + anomaly scoring (4 increments)
 
 Branch `routine/onyums-2026-06-22` → PR

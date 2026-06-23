@@ -750,6 +750,33 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn scoring_mode_block_surfaces_score_end_to_end() {
+		// A scoring-threshold WAF wired into the live service: a request tripping SQLi (5)
+		// in the query and XSS (4) in a header sums to 9 >= threshold 8, so it is blocked,
+		// the emitted event carries the aggregate score, and the 403 body names it.
+		let store = Arc::new(HmacClearanceStore::new(b"observe-score-secret".to_vec()));
+		let sink = CapturingSink::new();
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter().scoring_threshold(8))
+			.events(Arc::new(sink.clone()))
+			.build();
+		let mut svc = skin.into_layer().layer(Router::new().route("/", get(|| async { "app" })));
+
+		// Uncleared is fine: WAF inspection runs first, before the clearance gate.
+		let req = Request::builder().uri("/items?q=1%20OR%201=1").header("user-agent", "<script>x</script>").body(Body::empty()).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+		let body = axum::body::to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+		assert!(String::from_utf8_lossy(&body).contains("anomaly score 9"), "the 403 names the aggregate score, got {:?}", String::from_utf8_lossy(&body));
+
+		let events = sink.events();
+		assert_eq!(events.len(), 1);
+		assert!(matches!(&events[0], SecurityEvent::WafBlock { score: Some(9), category: crate::waf::WafCategory::Sqli, .. }), "the scored block event carries score 9 and names the dominant SQLi rule, got {events:?}");
+	}
+
 	#[test]
 	fn rate_limit_trip_emits_an_event_carrying_the_token() {
 		let (skin, store, sink) = observed_gate(1);

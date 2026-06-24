@@ -70,13 +70,18 @@ pub enum WafCategory {
 	/// (`user[$ne]=`). The operator is a literal *value in the request*, so detection needs
 	/// no client IP and ports directly over Tor.
 	NoSqlInjection,
+	/// LDAP injection: input that breaks out of an LDAP search filter — closing a clause and
+	/// opening a boolean group (`)(|`, `*)(uid=*`) to force an always-true filter or an
+	/// authentication bypass. The malicious filter syntax is a value in the request, so
+	/// detection is IP-free and ports over Tor unchanged.
+	LdapInjection,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 8] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection];
+	pub const ALL: [WafCategory; 9] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -89,6 +94,7 @@ impl WafCategory {
 			Self::Ssrf => "ssrf",
 			Self::CodeInjection => "code_injection",
 			Self::NoSqlInjection => "nosql_injection",
+			Self::LdapInjection => "ldap_injection",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -102,7 +108,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -121,6 +127,7 @@ impl WafCategory {
 			Self::CodeInjection => 5,
 			Self::ProtocolAnomaly => 6,
 			Self::NoSqlInjection => 7,
+			Self::LdapInjection => 8,
 		}
 	}
 }
@@ -596,6 +603,10 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
 		Rule { id: "nosqli_json_operator", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(ne|gt|gte|lt|lte|in|nin|regex|exists|where|expr|or|nor|and|not)"\s*:"# },
+		// --- LDAP injection (search-filter break-out; value inspection, no client IP) ---
+		Rule { id: "ldapi_filter_break", category: WafCategory::LdapInjection, pattern: r"\)\s*\(\s*[|&!]" },
+		Rule { id: "ldapi_wildcard_break", category: WafCategory::LdapInjection, pattern: r"[*]\s*\)\s*\(" },
+		Rule { id: "ldapi_bool_group", category: WafCategory::LdapInjection, pattern: r"(?i)\(\s*[|&]\s*\(\s*\w+\s*=" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -1082,8 +1093,38 @@ mod tests {
 	fn nosql_category_metadata_is_stable() {
 		assert_eq!(WafCategory::NoSqlInjection.name(), "nosql_injection");
 		assert_eq!(WafCategory::NoSqlInjection.weight(), WafCategory::Sqli.weight());
-		// The index is still a bijection over the (now eight) categories.
-		assert_eq!(WafCategory::ALL.len(), 8);
+		// The index is still a bijection over every category.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn ldap_injection_rules_match() {
+		let waf = Waf::starter();
+		// Filter break-out, wildcard break, and an always-true boolean group all attribute
+		// to the LdapInjection class.
+		assert_eq!(waf.inspect_str("user=*)(uid=*))(|(uid=*", "query").map(|m| m.category), Some(WafCategory::LdapInjection));
+		assert_eq!(waf.inspect_str("name=admin*)(cn=*)", "query").unwrap().rule_id, "ldapi_wildcard_break");
+		assert_eq!(waf.inspect_str("filter=(|(uid=admin)(uid=root))", "query").unwrap().rule_id, "ldapi_bool_group");
+	}
+
+	#[test]
+	fn ldap_injection_rules_keep_false_positives_low() {
+		// Parenthesised titles, alternation, and benign filter-like text must still pass —
+		// the rules require the paren-paren-operator order an LDAP break-out has, not the
+		// operator-between-groups order legitimate text uses.
+		let waf = Waf::starter();
+		for uri in ["/wiki/Album_(2020)", "/search?q=(cats)|(dogs)", "/docs/ldap-tutorial", "/math?f=(a)(b)"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn ldap_category_metadata_is_stable() {
+		assert_eq!(WafCategory::LdapInjection.name(), "ldap_injection");
+		assert_eq!(WafCategory::LdapInjection.weight(), WafCategory::Sqli.weight());
+		// The index is still a bijection over every category.
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}

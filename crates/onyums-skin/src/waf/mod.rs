@@ -75,13 +75,21 @@ pub enum WafCategory {
 	/// authentication bypass. The malicious filter syntax is a value in the request, so
 	/// detection is IP-free and ports over Tor unchanged.
 	LdapInjection,
+	/// XML external entity (XXE): an XML payload declaring an entity (`<!ENTITY`) — often an
+	/// *external* one (`SYSTEM`/`PUBLIC`) pointing at a local file or internal URL — or a
+	/// DOCTYPE carrying an inline DTD subset (`[ … ]`). Drives the server's XML parser to
+	/// read a file or make a request; the markup is a value in the request body/fields, so
+	/// detection needs no client IP. Keyed on `<!ENTITY` rather than `<!DOCTYPE` for the
+	/// external-reference rule, so a legitimate HTML/XHTML doctype (which uses `PUBLIC`/
+	/// `SYSTEM` without an entity) does not false-positive.
+	Xxe,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 9] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection];
+	pub const ALL: [WafCategory; 10] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -95,6 +103,7 @@ impl WafCategory {
 			Self::CodeInjection => "code_injection",
 			Self::NoSqlInjection => "nosql_injection",
 			Self::LdapInjection => "ldap_injection",
+			Self::Xxe => "xxe",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -108,7 +117,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -128,6 +137,7 @@ impl WafCategory {
 			Self::ProtocolAnomaly => 6,
 			Self::NoSqlInjection => 7,
 			Self::LdapInjection => 8,
+			Self::Xxe => 9,
 		}
 	}
 }
@@ -607,6 +617,10 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "ldapi_filter_break", category: WafCategory::LdapInjection, pattern: r"\)\s*\(\s*[|&!]" },
 		Rule { id: "ldapi_wildcard_break", category: WafCategory::LdapInjection, pattern: r"[*]\s*\)\s*\(" },
 		Rule { id: "ldapi_bool_group", category: WafCategory::LdapInjection, pattern: r"(?i)\(\s*[|&]\s*\(\s*\w+\s*=" },
+		// --- XML external entity (markup inspection; no client IP; HTML doctypes excluded) ---
+		Rule { id: "xxe_entity_decl", category: WafCategory::Xxe, pattern: r"(?i)<!entity\b" },
+		Rule { id: "xxe_entity_external", category: WafCategory::Xxe, pattern: r"(?i)<!entity[\s\S]{0,200}\b(system|public)\b" },
+		Rule { id: "xxe_doctype_dtd", category: WafCategory::Xxe, pattern: r"(?i)<!doctype[\s\S]{0,200}\[" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -1124,6 +1138,46 @@ mod tests {
 	fn ldap_category_metadata_is_stable() {
 		assert_eq!(WafCategory::LdapInjection.name(), "ldap_injection");
 		assert_eq!(WafCategory::LdapInjection.weight(), WafCategory::Sqli.weight());
+		// The index is still a bijection over every category.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn xxe_rules_match() {
+		let waf = Waf::starter();
+		// An external (SYSTEM) entity and a DOCTYPE carrying an inline DTD subset both
+		// attribute to the Xxe class. XXE payloads usually arrive in a request body, scanned
+		// with the same ruleset.
+		// (A SYSTEM URL pointing at /etc/passwd or file:// would trip the earlier
+		// traversal/SSRF rules first; use a neutral external DTD so the XXE rule is what fires.)
+		assert_eq!(blocked(&waf.inspect_body(br#"<!ENTITY xxe SYSTEM "ext-entity.dtd">"#)).category, WafCategory::Xxe);
+		// A DOCTYPE with an inline `[` subset but no entity reports the DTD-subset rule.
+		assert_eq!(waf.inspect_str(r"<!DOCTYPE r [<!ELEMENT r (#PCDATA)>]>", "body").unwrap().rule_id, "xxe_doctype_dtd");
+		// With the broad entity-declaration rule disabled, an external entity still trips the
+		// more specific SYSTEM/PUBLIC rule.
+		let specific = Waf::starter().disable_rule("xxe_entity_decl");
+		assert_eq!(specific.inspect_str(r#"<!ENTITY x SYSTEM "ext-entity.dtd">"#, "body").unwrap().rule_id, "xxe_entity_external");
+	}
+
+	#[test]
+	fn xxe_rules_keep_false_positives_low() {
+		// Legitimate HTML/XHTML doctypes (which use PUBLIC/SYSTEM but declare no entity) and
+		// benign XML-mentioning paths must still pass — the external rule is keyed on
+		// `<!ENTITY`, and the DTD rule needs an inline `[` subset HTML never carries.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.inspect_body(b"<!DOCTYPE html>"), Verdict::Allow);
+		assert_eq!(waf.inspect_body(br#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">"#), Verdict::Allow);
+		for uri in ["/docs/xml-tutorial", "/articles/entity-relationship-diagrams", "/blog/dtd-vs-xsd"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn xxe_category_metadata_is_stable() {
+		assert_eq!(WafCategory::Xxe.name(), "xxe");
+		assert_eq!(WafCategory::Xxe.weight(), WafCategory::Sqli.weight());
 		// The index is still a bijection over every category.
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);

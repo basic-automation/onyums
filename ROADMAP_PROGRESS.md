@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-24 — onyums-skin Phase 3 WAF: broaden ruleset (NoSQL/LDAP/XXE) + operator-tunable anomaly weights + wirefilter blocker (6 increments)
 
-Branch `routine/onyums-2026-06-24` → PR (base `master`). Last run (PR
+Branch `routine/onyums-2026-06-24` → PR
+[#15](https://github.com/basic-automation/onyums/pull/15) (base `master`). Last run (PR
 [#13](https://github.com/basic-automation/onyums/pull/13), merged; `master` head
 `3377e9e`) closed the "surface the anomaly score" item and set the NEXT STEP to the Phase-3
 `wirefilter` rule-expression front-end — the recurring deferral of three prior runs. This

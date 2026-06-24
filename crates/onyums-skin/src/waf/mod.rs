@@ -204,6 +204,14 @@ pub struct Waf {
 	/// match. `None` (default) is first-match-blocks. The multiple-encoding guard still hard
 	/// blocks independently of the threshold when armed.
 	scoring_threshold: Option<u32>,
+	/// Per-category anomaly weights for the scoring path, indexed by [`WafCategory::index`].
+	/// Initialized from [`WafCategory::weight`] and overridable per-category with
+	/// [`set_category_weight`](Self::set_category_weight), so an operator can tune one class's
+	/// contribution to the aggregate score (e.g. weigh a noisy protocol-anomaly signal less)
+	/// without touching the threshold — the OWASP-CRS per-rule severity knob, one level up.
+	/// Used by [`score`](Self::score) and the scoring [`inspect`](Self::inspect) path; the free
+	/// [`anomaly_score`] function keeps using the unmodified defaults.
+	weights: [u32; WafCategory::ALL.len()],
 }
 
 impl Waf {
@@ -217,7 +225,11 @@ impl Waf {
 		let set = RegexSet::new(rules.iter().map(|r| r.pattern))?;
 		let meta: Vec<(&'static str, WafCategory)> = rules.iter().map(|r| (r.id, r.category)).collect();
 		let enabled = vec![true; meta.len()];
-		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None })
+		let mut weights = [0u32; WafCategory::ALL.len()];
+		for cat in WafCategory::ALL {
+			weights[cat.index()] = cat.weight();
+		}
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -299,6 +311,37 @@ impl Waf {
 	pub fn scoring_threshold(mut self, threshold: u32) -> Self {
 		self.scoring_threshold = Some(threshold);
 		self
+	}
+
+	/// Override the anomaly **weight** a [`WafCategory`] contributes to the aggregate score in
+	/// [`scoring_threshold`](Self::scoring_threshold) mode, replacing its [`WafCategory::weight`]
+	/// default for this WAF. Lets an operator tune one attack class up or down relative to the
+	/// threshold — for example weighing a chatty protocol-anomaly signal less so it no longer
+	/// pushes borderline-clean requests over — without rebuilding the ruleset. Sticky and
+	/// idempotent; composes with [`disable_rule`](Self::disable_rule). Affects only the scoring
+	/// path (instance [`score`](Self::score) and scoring-mode [`inspect`](Self::inspect)); the
+	/// free [`anomaly_score`] function still uses the unmodified defaults.
+	#[must_use]
+	pub fn set_category_weight(mut self, category: WafCategory, weight: u32) -> Self {
+		self.weights[category.index()] = weight;
+		self
+	}
+
+	/// The anomaly weight this WAF currently assigns a [`WafCategory`] — its
+	/// [`WafCategory::weight`] default unless overridden by
+	/// [`set_category_weight`](Self::set_category_weight).
+	#[must_use]
+	pub fn category_weight(&self, category: WafCategory) -> u32 {
+		self.weights[category.index()]
+	}
+
+	/// Sum this WAF's (possibly overridden) per-category weights over a set of matches — the
+	/// instance counterpart of the free [`anomaly_score`] function, which always uses the
+	/// category defaults. This is the score the scoring-mode [`inspect`](Self::inspect)
+	/// compares against the threshold. Pair with [`inspect_all`](Self::inspect_all).
+	#[must_use]
+	pub fn score(&self, matches: &[WafMatch]) -> u32 {
+		matches.iter().map(|m| self.weights[m.category.index()]).sum()
 	}
 
 	/// Inspect a request body's bytes with the same rules and normalization as every
@@ -415,15 +458,16 @@ impl Waf {
 		if self.block_multi_encoded && let Some(m) = matches.iter().find(|m| m.rule_id == MULTI_ENCODING_RULE_ID) {
 			return Verdict::Block(m.clone());
 		}
-		let total = anomaly_score(&matches);
+		let total = self.score(&matches);
 		if total < threshold {
 			return Verdict::Allow;
 		}
 		// Name the most severe rule that drove the block; on a weight tie keep the earliest
 		// (inspection order is method → target → query → headers, lowest rule index first).
 		// Tag it with the aggregate score that crossed the threshold so a scored block is
-		// distinguishable downstream from a single-signature one.
-		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (m.category.weight(), std::cmp::Reverse(*i))).map(|(_, m)| {
+		// distinguishable downstream from a single-signature one. Severity uses this WAF's
+		// (possibly overridden) weights, consistent with the score that crossed the threshold.
+		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (self.category_weight(m.category), std::cmp::Reverse(*i))).map(|(_, m)| {
 			let mut m = m.clone();
 			m.score = Some(total);
 			m
@@ -493,7 +537,9 @@ impl Waf {
 /// empty slice (a clean request). An operator compares this against a chosen threshold to
 /// decide whether the *aggregate* of several signals — none necessarily blocking on its
 /// own under first-match — warrants a block, the OWASP-CRS anomaly-scoring model ported to
-/// this engine. Pair with [`Waf::inspect_all`].
+/// this engine. Pair with [`Waf::inspect_all`]. This uses the category *defaults*; for a WAF
+/// with per-category weight overrides ([`Waf::set_category_weight`]) use the instance method
+/// [`Waf::score`] instead, which is what the scoring-mode [`Waf::inspect`] path compares.
 #[must_use]
 pub fn anomaly_score(matches: &[WafMatch]) -> u32 {
 	matches.iter().map(|m| m.category.weight()).sum()
@@ -1026,6 +1072,51 @@ mod tests {
 		let waf = Waf::starter().disable_category(WafCategory::Sqli);
 		let all = waf.inspect_all(&parts("GET", "/items?q=1%20UNION%20SELECT%20pw"));
 		assert!(all.iter().all(|m| m.category != WafCategory::Sqli));
+	}
+
+	#[test]
+	fn category_weight_defaults_match_enum() {
+		// A fresh WAF assigns every category its enum-default weight.
+		let waf = Waf::starter();
+		for cat in WafCategory::ALL {
+			assert_eq!(waf.category_weight(cat), cat.weight());
+		}
+	}
+
+	#[test]
+	fn set_category_weight_overrides_instance_score() {
+		// Lower the protocol-anomaly weight; the instance score reflects it while the free
+		// `anomaly_score` (defaults) does not.
+		let waf = Waf::starter().set_category_weight(WafCategory::ProtocolAnomaly, 1);
+		assert_eq!(waf.category_weight(WafCategory::ProtocolAnomaly), 1);
+		let matches = vec![WafMatch { rule_id: "x", category: WafCategory::ProtocolAnomaly, location: "header:user-agent".to_owned(), score: None }];
+		assert_eq!(waf.score(&matches), 1);
+		assert_eq!(anomaly_score(&matches), WafCategory::ProtocolAnomaly.weight());
+	}
+
+	#[test]
+	fn tuned_weight_changes_scoring_block_decision() {
+		// A lone shellshock hit (default weight 3) blocks at threshold 3; raising the same
+		// category's weight requirement by tuning it down to 1 lets it pass under that
+		// threshold — the operator's severity knob, no threshold change.
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "() { :; }; echo".parse().unwrap());
+		assert!(matches!(Waf::starter().scoring_threshold(3).inspect(&p), Verdict::Block(_)));
+		let tuned = Waf::starter().scoring_threshold(3).set_category_weight(WafCategory::ProtocolAnomaly, 1);
+		assert_eq!(tuned.inspect(&p), Verdict::Allow);
+	}
+
+	#[test]
+	fn tuned_weight_carries_into_scored_block_score() {
+		// SQLi (5) in the query + XSS tuned up to 6 in a header = 11; the scored block's
+		// aggregate reflects the override, and the dominant (now-heavier XSS) rule is named.
+		let waf = Waf::starter().scoring_threshold(8).set_category_weight(WafCategory::Xss, 6);
+		let mut p = parts("GET", "/items?q=1%20OR%201=1");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let v = waf.inspect(&p);
+		let m = blocked(&v);
+		assert_eq!(m.score, Some(11));
+		assert_eq!(m.category, WafCategory::Xss);
 	}
 
 	#[test]

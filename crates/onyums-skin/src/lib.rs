@@ -57,7 +57,7 @@ pub use circuit::{
 	AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock
 };
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
-pub use difficulty::{AdaptiveDifficulty, ShapeDifficulty};
+pub use difficulty::{AdaptiveDifficulty, BotDifficulty, ShapeDifficulty};
 pub use fingerprint::Ja4hFingerprint;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};

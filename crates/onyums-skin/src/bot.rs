@@ -30,6 +30,12 @@ const NON_BROWSER_UA_TOKENS: &[&str] = &[
 	"httpclient", "okhttp", "axios", "node-fetch", "got (", "aiohttp", "httpx", "powershell", "winhttp", "lwp::",
 ];
 
+/// Substrings (matched case-insensitively against the `User-Agent`) that name a browser
+/// **automation / headless** framework. Distinct from [`NON_BROWSER_UA_TOKENS`]: these often
+/// ride a browser-shaped UA (a full Mozilla string) yet still self-identify, so they earn
+/// their own signal even when the request otherwise looks like a browser.
+const AUTOMATION_UA_TOKENS: &[&str] = &["headlesschrome", "phantomjs", "slimerjs", "selenium", "webdriver", "playwright", "puppeteer", "electron/", "cypress", "splash"];
+
 /// Default header count at or below which the request is flagged [`BotSignal::SparseHeaders`].
 /// A real browser sends well above this; a bare scripted request often sends only a handful.
 const DEFAULT_SPARSE_HEADER_THRESHOLD: usize = 4;
@@ -43,6 +49,9 @@ pub enum BotSignal {
 	NoUserAgent,
 	/// The `User-Agent` names a known non-browser HTTP client (see [`NON_BROWSER_UA_TOKENS`]).
 	NonBrowserUserAgent,
+	/// The `User-Agent` names a browser automation / headless framework (see
+	/// [`AUTOMATION_UA_TOKENS`]) — a strong bot signal even behind a browser-shaped UA.
+	AutomationUserAgent,
 	/// No `Accept` header — browsers always send one; many scripts omit it.
 	NoAccept,
 	/// No `Accept-Language` header — Tor Browser pins one; many scripts omit it.
@@ -55,15 +64,15 @@ pub enum BotSignal {
 
 impl BotSignal {
 	/// All signal variants, for iteration and table-sizing.
-	pub const ALL: [Self; 6] = [Self::NoUserAgent, Self::NonBrowserUserAgent, Self::NoAccept, Self::NoAcceptLanguage, Self::NoAcceptEncoding, Self::SparseHeaders];
+	pub const ALL: [Self; 7] = [Self::NoUserAgent, Self::NonBrowserUserAgent, Self::AutomationUserAgent, Self::NoAccept, Self::NoAcceptLanguage, Self::NoAcceptEncoding, Self::SparseHeaders];
 
-	/// The suspicion weight this signal contributes to a [`BotAssessment::score`]. The two
+	/// The suspicion weight this signal contributes to a [`BotAssessment::score`]. The
 	/// `User-Agent` signals are the strongest; the missing-`Accept-*` signals are weaker
 	/// because a few legitimate clients omit them. Weights are intentionally conservative.
 	#[must_use]
 	pub const fn weight(self) -> f64 {
 		match self {
-			Self::NonBrowserUserAgent => 0.6,
+			Self::NonBrowserUserAgent | Self::AutomationUserAgent => 0.6,
 			Self::NoUserAgent => 0.5,
 			Self::NoAccept => 0.25,
 			Self::SparseHeaders => 0.2,
@@ -77,6 +86,7 @@ impl BotSignal {
 		match self {
 			Self::NoUserAgent => "no User-Agent header",
 			Self::NonBrowserUserAgent => "User-Agent names a non-browser HTTP client",
+			Self::AutomationUserAgent => "User-Agent names a browser automation/headless framework",
 			Self::NoAccept => "no Accept header",
 			Self::NoAcceptLanguage => "no Accept-Language header",
 			Self::NoAcceptEncoding => "no Accept-Encoding header",
@@ -144,8 +154,13 @@ impl BotHeuristics {
 			None => signals.push(BotSignal::NoUserAgent),
 			Some(ua) => {
 				let lowered = ua.to_ascii_lowercase();
+				// A CLI/library UA and an automation-framework UA are distinct signals; a UA can
+				// in principle trip both (e.g. a custom tool that also embeds "webdriver").
 				if NON_BROWSER_UA_TOKENS.iter().any(|token| lowered.contains(token)) {
 					signals.push(BotSignal::NonBrowserUserAgent);
+				}
+				if AUTOMATION_UA_TOKENS.iter().any(|token| lowered.contains(token)) {
+					signals.push(BotSignal::AutomationUserAgent);
 				}
 			}
 		}
@@ -267,6 +282,43 @@ mod tests {
 			assert!(s.weight() > 0.0, "{s:?} weight");
 			assert!(!s.description().is_empty(), "{s:?} description");
 			assert_eq!(s.to_string(), s.description());
+		}
+	}
+
+	#[test]
+	fn headless_browser_is_flagged_as_automation_not_cli_tool() {
+		// HeadlessChrome rides a full browser-shaped UA + header set, so the only thing that
+		// gives it away is the automation token — and it must be AutomationUserAgent, not the
+		// CLI-tool NonBrowserUserAgent.
+		let a = BotHeuristics::new().assess(&parts(
+			browser().header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/120.0.0.0 Safari/537.36"),
+		));
+		// browser() already set a UA; appending leaves the original first — assess a fresh request.
+		let fresh = BotHeuristics::new().assess(&parts(
+			Request::builder()
+				.uri("/")
+				.header("host", "x.onion")
+				.header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 HeadlessChrome/120.0 Safari/537.36")
+				.header("accept", "text/html")
+				.header("accept-language", "en-US")
+				.header("accept-encoding", "gzip")
+				.header("connection", "keep-alive"),
+		));
+		assert!(fresh.signals.contains(&BotSignal::AutomationUserAgent));
+		assert!(!fresh.signals.contains(&BotSignal::NonBrowserUserAgent));
+		// Otherwise browser-shaped, so automation is essentially the sole driver.
+		assert!((fresh.score - BotSignal::AutomationUserAgent.weight()).abs() < f64::EPSILON);
+		// (the first `a` request just confirms a no-panic path with the appended UA)
+		let _ = a;
+	}
+
+	#[test]
+	fn automation_frameworks_are_detected() {
+		for ua in ["PhantomJS/2.1", "selenium webdriver", "Playwright/1.40", "Mozilla/5.0 Cypress", "Splash/3.5"] {
+			let assessed = BotHeuristics::new().assess(&parts(
+				Request::builder().uri("/").header("host", "x.onion").header("user-agent", ua).header("accept", "*/*").header("accept-language", "en").header("accept-encoding", "gzip").header("connection", "keep-alive"),
+			));
+			assert!(assessed.signals.contains(&BotSignal::AutomationUserAgent), "{ua} not detected");
 		}
 	}
 

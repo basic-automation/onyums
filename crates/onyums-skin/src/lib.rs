@@ -24,24 +24,33 @@
 //!   ([`MetricsSink`]/[`SecurityMetrics`], [`FanoutSink`], [`TracingSink`]) and request-shape
 //!   baselining ([`ShapeBaseline`]).
 //!
-//! The Phase 5 frontier work (a `wirefilter` rule-expression front-end, JA4H
-//! fingerprinting, restricted-discovery orchestration) is tracked in this crate's
-//! `ROADMAP.md`, which pins the full architecture and plan.
+//! - **Phase 5 — frontier (in progress).** JA4H-style HTTP request fingerprinting
+//!   ([`Ja4hFingerprint`]) — a cluster/identify key over the request shape that survives
+//!   the loss of IP and TLS — and heuristic request-shape bot detection ([`BotHeuristics`],
+//!   the only Cloudflare bot signal that survives Tor).
+//!
+//! The remaining Phase 5 work (a `wirefilter` rule-expression front-end,
+//! restricted-discovery orchestration, a pluggable EquiX PoW backend) is tracked in this
+//! crate's `ROADMAP.md`, which pins the full architecture and plan.
 
 // Phase 2+ surface (CircuitPolicy, and not-yet-wired builder/limiter helpers) is public
 // API that downstreams and later phases consume, but unused within the crate today.
 #![allow(dead_code)]
 
+pub mod bot;
 pub mod challenge;
 pub mod circuit;
 pub mod clearance;
 pub mod difficulty;
+pub mod fingerprint;
 pub mod layer;
 pub mod observe;
+pub mod profile;
 pub mod ratelimit;
 pub mod shape;
 pub mod waf;
 
+pub use bot::{BotAssessment, BotHeuristics, BotSignal};
 pub use challenge::{
 	Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
 };
@@ -49,9 +58,11 @@ pub use circuit::{
 	AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock
 };
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
-pub use difficulty::{AdaptiveDifficulty, ShapeDifficulty};
+pub use difficulty::{AdaptiveDifficulty, BotDifficulty, ShapeDifficulty};
+pub use fingerprint::Ja4hFingerprint;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};
+pub use profile::ClientProfile;
 pub use ratelimit::{Quota, SkinRateLimit};
 pub use shape::{RequestShape, ShapeBaseline};
 pub use waf::{Rule, Verdict, Waf, WafCategory, WafMatch, anomaly_score};

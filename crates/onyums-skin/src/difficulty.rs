@@ -17,7 +17,10 @@ use std::{
 	time::{Duration, Instant},
 };
 
+use axum::http::request::Parts;
+
 use crate::{
+	bot::BotHeuristics,
 	circuit::{Clock, SystemClock},
 	observe::{SecurityEvent, SecurityEventSink},
 	shape::{RequestShape, ShapeBaseline},
@@ -278,6 +281,127 @@ impl ShapeDifficulty {
 	}
 }
 
+/// Default bot-suspicion band: below `0.3` difficulty stays at baseline, at/above `0.9` it is
+/// maxed.
+const DEFAULT_LOW_BOT: f64 = 0.3;
+const DEFAULT_HIGH_BOT: f64 = 0.9;
+/// Default suspicion at/above which a [`SecurityEvent::BotFlagged`] is emitted.
+const DEFAULT_BOT_EMIT_THRESHOLD: f64 = 0.5;
+
+/// A PoW-difficulty controller driven by **request-shape bot suspicion**, the third signal
+/// alongside [`AdaptiveDifficulty`]'s raw rate and [`ShapeDifficulty`]'s deviation-from-baseline
+/// (see `ROADMAP.md` Phase 5 — heuristic bot detection as a difficulty input).
+///
+/// It owns a [`BotHeuristics`] scorer: each [`assess`](Self::assess) scores a request's shape
+/// in `[0.0, 1.0]` and maps it to a difficulty:
+/// - at or below `low_score` suspicion → `baseline` (a browser-shaped request costs nothing
+///   extra),
+/// - at or above `high_score` suspicion → `max` (an obviously scripted request pays full
+///   effort),
+/// - in between → linearly interpolated.
+///
+/// When suspicion reaches `emit_threshold`, a [`SecurityEvent::BotFlagged`] is recorded to the
+/// configured sink (if any). Unlike [`ShapeDifficulty`] there is no learning phase — the
+/// heuristics are stateless — so a no-JS browser (which still sends a full header set) reads as
+/// `0.0` and stays at `baseline` from the first request. Bot suspicion is an *input* to
+/// difficulty, never a hard block on its own.
+///
+/// `Send + Sync`; the host shares one instance and calls `assess` per request when minting a
+/// puzzle.
+pub struct BotDifficulty {
+	baseline: u32,
+	max: u32,
+	low_score: f64,
+	high_score: f64,
+	emit_threshold: f64,
+	heuristics: BotHeuristics,
+	sink: Option<Arc<dyn SecurityEventSink>>,
+}
+
+impl BotDifficulty {
+	/// A controller ramping from `baseline` to `max` difficulty as bot suspicion climbs across
+	/// the default `0.3..0.9` band, emitting a [`SecurityEvent::BotFlagged`] at suspicion
+	/// `>= 0.5`. `max` is clamped to at least `baseline`. Uses a default [`BotHeuristics`].
+	#[must_use]
+	pub fn new(baseline: u32, max: u32) -> Self {
+		Self {
+			baseline,
+			max: max.max(baseline),
+			low_score: DEFAULT_LOW_BOT,
+			high_score: DEFAULT_HIGH_BOT,
+			emit_threshold: DEFAULT_BOT_EMIT_THRESHOLD,
+			heuristics: BotHeuristics::new(),
+			sink: None,
+		}
+	}
+
+	/// Set the suspicion band: at or below `low` difficulty is `baseline`, at or above `high` it
+	/// is `max`. Both are clamped to `[0.0, 1.0]` and `high` is kept strictly above `low`.
+	#[must_use]
+	pub fn score_band(mut self, low: f64, high: f64) -> Self {
+		self.low_score = low.clamp(0.0, 1.0);
+		self.high_score = high.clamp(0.0, 1.0).max(self.low_score + f64::EPSILON);
+		self
+	}
+
+	/// Set the suspicion at/above which a [`SecurityEvent::BotFlagged`] is emitted (clamped to
+	/// `[0.0, 1.0]`).
+	#[must_use]
+	pub fn emit_threshold(mut self, threshold: f64) -> Self {
+		self.emit_threshold = threshold.clamp(0.0, 1.0);
+		self
+	}
+
+	/// Replace the internal [`BotHeuristics`] (e.g. one with a tuned sparse-header threshold).
+	#[must_use]
+	pub fn with_heuristics(mut self, heuristics: BotHeuristics) -> Self {
+		self.heuristics = heuristics;
+		self
+	}
+
+	/// Route emitted [`SecurityEvent::BotFlagged`] events to `sink`. Without one, flagged
+	/// requests still raise difficulty but emit no event.
+	#[must_use]
+	pub fn events(mut self, sink: Arc<dyn SecurityEventSink>) -> Self {
+		self.sink = Some(sink);
+		self
+	}
+
+	/// The shared heuristics, for inspection.
+	#[must_use]
+	pub const fn heuristics(&self) -> &BotHeuristics {
+		&self.heuristics
+	}
+
+	/// Score `parts` with the heuristics, emit a [`SecurityEvent::BotFlagged`] if its suspicion
+	/// is at/above `emit_threshold`, and return the PoW difficulty for that suspicion. The
+	/// per-request entry point.
+	pub fn assess(&self, parts: &Parts) -> u32 {
+		let assessment = self.heuristics.assess(parts);
+		if assessment.score >= self.emit_threshold
+			&& let Some(sink) = &self.sink
+		{
+			sink.record(&SecurityEvent::bot_flagged(&assessment));
+		}
+		self.difficulty_for(assessment.score)
+	}
+
+	/// Map a suspicion score to a difficulty along the configured band, without scoring a
+	/// request or emitting.
+	#[must_use]
+	pub fn difficulty_for(&self, score: f64) -> u32 {
+		if score <= self.low_score {
+			return self.baseline;
+		}
+		if score >= self.high_score {
+			return self.max;
+		}
+		let frac = (score - self.low_score) / (self.high_score - self.low_score);
+		let span = f64::from(self.max - self.baseline);
+		self.baseline + (frac * span).round() as u32
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use std::sync::Arc;
@@ -451,5 +575,92 @@ mod tests {
 		// high was forced above low, so a mid score still maps sanely (no NaN/panic).
 		let d = ctrl.difficulty_for(0.95);
 		assert_eq!(d, 10);
+	}
+
+	// --- BotDifficulty (bot-suspicion-driven) ---
+
+	fn browser_parts() -> Parts {
+		Request::builder()
+			.uri("/")
+			.header("host", "x.onion")
+			.header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0")
+			.header("accept", "text/html")
+			.header("accept-language", "en-US,en")
+			.header("accept-encoding", "gzip, deflate, br")
+			.header("connection", "keep-alive")
+			.body(())
+			.unwrap()
+			.into_parts()
+			.0
+	}
+
+	fn curl_parts() -> Parts {
+		Request::builder().uri("/").header("host", "x.onion").header("user-agent", "curl/8.0.1").header("accept", "*/*").body(()).unwrap().into_parts().0
+	}
+
+	#[test]
+	fn bot_difficulty_for_interpolates_across_band() {
+		let ctrl = BotDifficulty::new(0, 20).score_band(0.2, 0.8);
+		assert_eq!(ctrl.difficulty_for(0.1), 0); // below band → baseline
+		assert_eq!(ctrl.difficulty_for(0.2), 0); // at low edge → baseline
+		assert_eq!(ctrl.difficulty_for(0.5), 10); // midpoint → half of 20
+		assert_eq!(ctrl.difficulty_for(0.8), 20); // at high edge → max
+		assert_eq!(ctrl.difficulty_for(0.95), 20); // above band → max
+	}
+
+	#[test]
+	fn browser_request_stays_at_baseline_and_emits_nothing() {
+		let sink = CapturingSink::new();
+		let ctrl = BotDifficulty::new(2, 24).events(Arc::new(sink.clone()));
+		// A browser-shaped request scores 0.0 → baseline, no BotFlagged event.
+		assert_eq!(ctrl.assess(&browser_parts()), 2);
+		assert!(sink.is_empty());
+	}
+
+	#[test]
+	fn scripted_request_raises_difficulty_and_emits_bot_flagged() {
+		let sink = CapturingSink::new();
+		// curl scores ~1.0 (non-browser UA + no lang + no encoding + sparse) → max difficulty.
+		let ctrl = BotDifficulty::new(0, 20).events(Arc::new(sink.clone()));
+		assert_eq!(ctrl.assess(&curl_parts()), 20);
+		let events = sink.events();
+		assert_eq!(events.len(), 1);
+		match events[0] {
+			SecurityEvent::BotFlagged { score_permille, signal_count } => {
+				assert!(score_permille >= 900, "expected high suspicion, got {score_permille}");
+				assert!(signal_count >= 3, "expected several signals, got {signal_count}");
+			}
+			ref other => panic!("expected BotFlagged, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn bot_no_sink_still_raises_difficulty() {
+		let ctrl = BotDifficulty::new(0, 16); // no events()
+		assert_eq!(ctrl.assess(&curl_parts()), 16);
+	}
+
+	#[test]
+	fn emit_threshold_gates_events_independent_of_difficulty() {
+		let sink = CapturingSink::new();
+		// Emit only at near-certainty, but a low band so even mild suspicion maxes difficulty.
+		let ctrl = BotDifficulty::new(0, 8).score_band(0.0, 0.1).emit_threshold(0.99).events(Arc::new(sink.clone()));
+		// curl maxes difficulty...
+		assert_eq!(ctrl.assess(&curl_parts()), 8);
+		// ...and clears the 0.99 emit threshold (curl clamps to 1.0).
+		assert_eq!(sink.len(), 1);
+	}
+
+	#[test]
+	fn score_band_clamps_degenerate_input() {
+		// high <= low must not divide by zero; out-of-range clamps into [0,1].
+		let ctrl = BotDifficulty::new(0, 10).score_band(0.9, 0.1);
+		assert_eq!(ctrl.difficulty_for(0.95), 10);
+	}
+
+	#[test]
+	fn bot_max_clamped_to_at_least_baseline() {
+		let ctrl = BotDifficulty::new(10, 3);
+		assert_eq!(ctrl.assess(&curl_parts()), 10);
 	}
 }

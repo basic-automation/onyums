@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-25 — onyums-skin Phase 5 frontier: request-shape client intelligence (6 increments)
 
-Branch `routine/onyums-2026-06-25` → PR (base `master`, head `2930c13`). This run opened a
+Branch `routine/onyums-2026-06-25` → PR
+[#16](https://github.com/basic-automation/onyums/pull/16) (base `master`, head `2930c13`). This run opened a
 **new front: onyums-skin ROADMAP Phase 5 (frontier defenses)** — the request-shape
 client-intelligence layer, the strongest signal that survives Tor's loss of client IP, ASN,
 geo, and TLS fingerprint. Phases 1–4 are already implemented on `master`; the previously

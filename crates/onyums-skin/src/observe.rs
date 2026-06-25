@@ -110,6 +110,18 @@ pub enum SecurityEvent {
 		/// maximally novel. (`score * 1000`, rounded.)
 		score_permille: u16,
 	},
+	/// A request looked automated to the request-shape bot heuristics
+	/// ([`BotHeuristics`](crate::bot::BotHeuristics)). Like [`ShapeAnomaly`](Self::ShapeAnomaly)
+	/// this is a *signal*, not a block — a host emits it above a configured suspicion threshold
+	/// and feeds it into difficulty tuning. Carries the suspicion as per-mille (`0..=1000`) and
+	/// the number of signals that fired, so the event stays `Eq`/`Hash`-friendly; build it with
+	/// [`bot_flagged`](Self::bot_flagged).
+	BotFlagged {
+		/// Bot suspicion in per-mille: `0` = browser-shaped, `1000` = maximally scripted.
+		score_permille: u16,
+		/// How many distinct [`BotSignal`](crate::bot::BotSignal)s fired.
+		signal_count: u8,
+	},
 }
 
 impl SecurityEvent {
@@ -120,6 +132,16 @@ impl SecurityEvent {
 	pub fn shape_anomaly(score: f64) -> Self {
 		let score_permille = (score.clamp(0.0, 1.0) * 1000.0).round() as u16;
 		Self::ShapeAnomaly { score_permille }
+	}
+
+	/// Build a [`BotFlagged`](Self::BotFlagged) from a [`BotAssessment`](crate::bot::BotAssessment):
+	/// the suspicion score quantized to per-mille and the count of fired signals (saturating at
+	/// `u8::MAX`).
+	#[must_use]
+	pub fn bot_flagged(assessment: &crate::bot::BotAssessment) -> Self {
+		let score_permille = (assessment.score.clamp(0.0, 1.0) * 1000.0).round() as u16;
+		let signal_count = u8::try_from(assessment.signals.len()).unwrap_or(u8::MAX);
+		Self::BotFlagged { score_permille, signal_count }
 	}
 
 	/// A stable, lowercase event kind for logs and metric names (the variant, not its
@@ -135,6 +157,7 @@ impl SecurityEvent {
 			Self::ChallengeUnavailable => "challenge_unavailable",
 			Self::Circuit { .. } => "circuit_action",
 			Self::ShapeAnomaly { .. } => "shape_anomaly",
+			Self::BotFlagged { .. } => "bot_flagged",
 		}
 	}
 
@@ -148,7 +171,7 @@ impl SecurityEvent {
 				CircuitAction::Shutdown => Severity::Warning,
 				_ => Severity::Notice,
 			},
-			Self::RateLimited { .. } | Self::ChallengeFailed | Self::ChallengeUnavailable | Self::ShapeAnomaly { .. } => Severity::Notice,
+			Self::RateLimited { .. } | Self::ChallengeFailed | Self::ChallengeUnavailable | Self::ShapeAnomaly { .. } | Self::BotFlagged { .. } => Severity::Notice,
 			Self::ChallengeIssued { .. } | Self::ChallengePassed { .. } => Severity::Info,
 		}
 	}
@@ -263,6 +286,8 @@ pub struct SecurityMetrics {
 	pub circuit_actions: u64,
 	/// Request-shape anomalies flagged ([`SecurityEvent::ShapeAnomaly`]).
 	pub shape_anomalies: u64,
+	/// Requests flagged automated by the bot heuristics ([`SecurityEvent::BotFlagged`]).
+	pub bots_flagged: u64,
 }
 
 impl SecurityMetrics {
@@ -318,6 +343,7 @@ struct MetricsCounters {
 	challenges_unavailable: AtomicU64,
 	circuit_actions: AtomicU64,
 	shape_anomalies: AtomicU64,
+	bots_flagged: AtomicU64,
 }
 
 impl MetricsSink {
@@ -349,6 +375,7 @@ impl MetricsSink {
 			challenges_unavailable: c.challenges_unavailable.load(Ordering::Relaxed),
 			circuit_actions: c.circuit_actions.load(Ordering::Relaxed),
 			shape_anomalies: c.shape_anomalies.load(Ordering::Relaxed),
+			bots_flagged: c.bots_flagged.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -373,6 +400,7 @@ impl SecurityEventSink for MetricsSink {
 			SecurityEvent::ChallengeUnavailable => &self.inner.challenges_unavailable,
 			SecurityEvent::Circuit { .. } => &self.inner.circuit_actions,
 			SecurityEvent::ShapeAnomaly { .. } => &self.inner.shape_anomalies,
+			SecurityEvent::BotFlagged { .. } => &self.inner.bots_flagged,
 		};
 		counter.fetch_add(1, Ordering::Relaxed);
 	}
@@ -574,6 +602,29 @@ mod tests {
 		sink.record(&SecurityEvent::shape_anomaly(0.8));
 		sink.record(&SecurityEvent::shape_anomaly(0.95));
 		assert_eq!(sink.snapshot().shape_anomalies, 2);
+	}
+
+	#[test]
+	fn bot_flagged_quantizes_score_and_counts_signals() {
+		use crate::bot::{BotAssessment, BotSignal};
+		let assessment = BotAssessment { score: 0.75, signals: vec![BotSignal::NoUserAgent, BotSignal::NoAccept] };
+		let ev = SecurityEvent::bot_flagged(&assessment);
+		assert_eq!(ev, SecurityEvent::BotFlagged { score_permille: 750, signal_count: 2 });
+		assert_eq!(ev.kind(), "bot_flagged");
+		assert_eq!(ev.severity(), Severity::Notice);
+		// Out-of-range score clamps.
+		let maxed = SecurityEvent::bot_flagged(&BotAssessment { score: 1.5, signals: vec![] });
+		assert_eq!(maxed, SecurityEvent::BotFlagged { score_permille: 1000, signal_count: 0 });
+	}
+
+	#[test]
+	fn metrics_sink_tallies_bots_flagged() {
+		let sink = MetricsSink::new();
+		sink.record(&SecurityEvent::BotFlagged { score_permille: 800, signal_count: 3 });
+		sink.record(&SecurityEvent::BotFlagged { score_permille: 600, signal_count: 1 });
+		assert_eq!(sink.snapshot().bots_flagged, 2);
+		// Unrelated counters stay zero.
+		assert_eq!(sink.snapshot().shape_anomalies, 0);
 	}
 
 	#[test]

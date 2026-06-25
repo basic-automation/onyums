@@ -26,7 +26,8 @@
 //!
 //! - **Phase 5 — frontier (in progress).** JA4H-style HTTP request fingerprinting
 //!   ([`Ja4hFingerprint`]) — a cluster/identify key over the request shape that survives
-//!   the loss of IP and TLS.
+//!   the loss of IP and TLS — and heuristic request-shape bot detection ([`BotHeuristics`],
+//!   the only Cloudflare bot signal that survives Tor).
 //!
 //! The remaining Phase 5 work (a `wirefilter` rule-expression front-end,
 //! restricted-discovery orchestration, a pluggable EquiX PoW backend) is tracked in this
@@ -36,6 +37,7 @@
 // API that downstreams and later phases consume, but unused within the crate today.
 #![allow(dead_code)]
 
+pub mod bot;
 pub mod challenge;
 pub mod circuit;
 pub mod clearance;
@@ -47,6 +49,7 @@ pub mod ratelimit;
 pub mod shape;
 pub mod waf;
 
+pub use bot::{BotAssessment, BotHeuristics, BotSignal};
 pub use challenge::{
 	Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
 };

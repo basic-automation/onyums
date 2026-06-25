@@ -777,6 +777,47 @@ mod tests {
 		assert!(matches!(&events[0], SecurityEvent::WafBlock { score: Some(9), category: crate::waf::WafCategory::Sqli, .. }), "the scored block event carries score 9 and names the dominant SQLi rule, got {events:?}");
 	}
 
+	#[tokio::test]
+	async fn tuned_category_weight_flips_scoring_block_end_to_end() {
+		// A lone XSS header scores its default weight 4, under a threshold of 8, so a scoring
+		// WAF lets it past inspection (it is then merely challenged like any uncleared
+		// request — no WAF block). Raising the XSS weight to 8 via `set_category_weight` makes
+		// the same single hit reach the threshold, and it is now blocked end-to-end with the
+		// override reflected in both the 403 body and the emitted event — the operator's
+		// severity knob, no threshold change.
+		let xss_req = || Request::builder().uri("/").header("user-agent", "<script>x</script>").body(Body::empty()).unwrap();
+
+		// Baseline: default XSS weight 4 < threshold 8 → WAF does not block.
+		let base_sink = CapturingSink::new();
+		let base = Skin::builder()
+			.store(Arc::new(HmacClearanceStore::new(b"tune-base-secret".to_vec())))
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter().scoring_threshold(8))
+			.events(Arc::new(base_sink.clone()))
+			.build();
+		let mut base_svc = base.into_layer().layer(Router::new().route("/", get(|| async { "app" })));
+		let base_resp = base_svc.call(xss_req()).await.unwrap();
+		assert_ne!(base_resp.status(), StatusCode::FORBIDDEN, "below threshold, the WAF does not block");
+		assert!(base_sink.events().iter().all(|e| !matches!(e, SecurityEvent::WafBlock { .. })), "no WAF block at the default weight");
+
+		// Tuned: XSS weight 8 >= threshold 8 → the same request is now blocked.
+		let tuned_sink = CapturingSink::new();
+		let tuned = Skin::builder()
+			.store(Arc::new(HmacClearanceStore::new(b"tune-secret".to_vec())))
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter().scoring_threshold(8).set_category_weight(crate::waf::WafCategory::Xss, 8))
+			.events(Arc::new(tuned_sink.clone()))
+			.build();
+		let mut tuned_svc = tuned.into_layer().layer(Router::new().route("/", get(|| async { "app" })));
+		let tuned_resp = tuned_svc.call(xss_req()).await.unwrap();
+		assert_eq!(tuned_resp.status(), StatusCode::FORBIDDEN);
+		let body = axum::body::to_bytes(tuned_resp.into_body(), usize::MAX).await.unwrap();
+		assert!(String::from_utf8_lossy(&body).contains("anomaly score 8"), "the 403 names the tuned aggregate score, got {:?}", String::from_utf8_lossy(&body));
+		let events = tuned_sink.events();
+		assert_eq!(events.len(), 1);
+		assert!(matches!(&events[0], SecurityEvent::WafBlock { score: Some(8), category: crate::waf::WafCategory::Xss, .. }), "the tuned scored block carries score 8 and names XSS, got {events:?}");
+	}
+
 	#[test]
 	fn rate_limit_trip_emits_an_event_carrying_the_token() {
 		let (skin, store, sink) = observed_gate(1);

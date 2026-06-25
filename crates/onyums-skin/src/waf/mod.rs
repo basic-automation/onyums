@@ -65,13 +65,31 @@ pub enum WafCategory {
 	/// template-injection probes, and serialized-object (deserialization) gadgets. Pure
 	/// request-value inspection, so it ports over Tor unchanged.
 	CodeInjection,
+	/// NoSQL injection: MongoDB-style query-operator smuggling — a `$where` server-side JS
+	/// predicate, a JSON operator key (`{"$ne": …}`), or the HTTP-parameter operator form
+	/// (`user[$ne]=`). The operator is a literal *value in the request*, so detection needs
+	/// no client IP and ports directly over Tor.
+	NoSqlInjection,
+	/// LDAP injection: input that breaks out of an LDAP search filter — closing a clause and
+	/// opening a boolean group (`)(|`, `*)(uid=*`) to force an always-true filter or an
+	/// authentication bypass. The malicious filter syntax is a value in the request, so
+	/// detection is IP-free and ports over Tor unchanged.
+	LdapInjection,
+	/// XML external entity (XXE): an XML payload declaring an entity (`<!ENTITY`) — often an
+	/// *external* one (`SYSTEM`/`PUBLIC`) pointing at a local file or internal URL — or a
+	/// DOCTYPE carrying an inline DTD subset (`[ … ]`). Drives the server's XML parser to
+	/// read a file or make a request; the markup is a value in the request body/fields, so
+	/// detection needs no client IP. Keyed on `<!ENTITY` rather than `<!DOCTYPE` for the
+	/// external-reference rule, so a legitimate HTML/XHTML doctype (which uses `PUBLIC`/
+	/// `SYSTEM` without an entity) does not false-positive.
+	Xxe,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 7] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly];
+	pub const ALL: [WafCategory; 10] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -83,6 +101,9 @@ impl WafCategory {
 			Self::CommandInjection => "command_injection",
 			Self::Ssrf => "ssrf",
 			Self::CodeInjection => "code_injection",
+			Self::NoSqlInjection => "nosql_injection",
+			Self::LdapInjection => "ldap_injection",
+			Self::Xxe => "xxe",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 		}
 	}
@@ -96,7 +117,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -114,6 +135,9 @@ impl WafCategory {
 			Self::Ssrf => 4,
 			Self::CodeInjection => 5,
 			Self::ProtocolAnomaly => 6,
+			Self::NoSqlInjection => 7,
+			Self::LdapInjection => 8,
+			Self::Xxe => 9,
 		}
 	}
 }
@@ -180,6 +204,14 @@ pub struct Waf {
 	/// match. `None` (default) is first-match-blocks. The multiple-encoding guard still hard
 	/// blocks independently of the threshold when armed.
 	scoring_threshold: Option<u32>,
+	/// Per-category anomaly weights for the scoring path, indexed by [`WafCategory::index`].
+	/// Initialized from [`WafCategory::weight`] and overridable per-category with
+	/// [`set_category_weight`](Self::set_category_weight), so an operator can tune one class's
+	/// contribution to the aggregate score (e.g. weigh a noisy protocol-anomaly signal less)
+	/// without touching the threshold — the OWASP-CRS per-rule severity knob, one level up.
+	/// Used by [`score`](Self::score) and the scoring [`inspect`](Self::inspect) path; the free
+	/// [`anomaly_score`] function keeps using the unmodified defaults.
+	weights: [u32; WafCategory::ALL.len()],
 }
 
 impl Waf {
@@ -193,7 +225,11 @@ impl Waf {
 		let set = RegexSet::new(rules.iter().map(|r| r.pattern))?;
 		let meta: Vec<(&'static str, WafCategory)> = rules.iter().map(|r| (r.id, r.category)).collect();
 		let enabled = vec![true; meta.len()];
-		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None })
+		let mut weights = [0u32; WafCategory::ALL.len()];
+		for cat in WafCategory::ALL {
+			weights[cat.index()] = cat.weight();
+		}
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -275,6 +311,37 @@ impl Waf {
 	pub fn scoring_threshold(mut self, threshold: u32) -> Self {
 		self.scoring_threshold = Some(threshold);
 		self
+	}
+
+	/// Override the anomaly **weight** a [`WafCategory`] contributes to the aggregate score in
+	/// [`scoring_threshold`](Self::scoring_threshold) mode, replacing its [`WafCategory::weight`]
+	/// default for this WAF. Lets an operator tune one attack class up or down relative to the
+	/// threshold — for example weighing a chatty protocol-anomaly signal less so it no longer
+	/// pushes borderline-clean requests over — without rebuilding the ruleset. Sticky and
+	/// idempotent; composes with [`disable_rule`](Self::disable_rule). Affects only the scoring
+	/// path (instance [`score`](Self::score) and scoring-mode [`inspect`](Self::inspect)); the
+	/// free [`anomaly_score`] function still uses the unmodified defaults.
+	#[must_use]
+	pub fn set_category_weight(mut self, category: WafCategory, weight: u32) -> Self {
+		self.weights[category.index()] = weight;
+		self
+	}
+
+	/// The anomaly weight this WAF currently assigns a [`WafCategory`] — its
+	/// [`WafCategory::weight`] default unless overridden by
+	/// [`set_category_weight`](Self::set_category_weight).
+	#[must_use]
+	pub fn category_weight(&self, category: WafCategory) -> u32 {
+		self.weights[category.index()]
+	}
+
+	/// Sum this WAF's (possibly overridden) per-category weights over a set of matches — the
+	/// instance counterpart of the free [`anomaly_score`] function, which always uses the
+	/// category defaults. This is the score the scoring-mode [`inspect`](Self::inspect)
+	/// compares against the threshold. Pair with [`inspect_all`](Self::inspect_all).
+	#[must_use]
+	pub fn score(&self, matches: &[WafMatch]) -> u32 {
+		matches.iter().map(|m| self.weights[m.category.index()]).sum()
 	}
 
 	/// Inspect a request body's bytes with the same rules and normalization as every
@@ -391,15 +458,16 @@ impl Waf {
 		if self.block_multi_encoded && let Some(m) = matches.iter().find(|m| m.rule_id == MULTI_ENCODING_RULE_ID) {
 			return Verdict::Block(m.clone());
 		}
-		let total = anomaly_score(&matches);
+		let total = self.score(&matches);
 		if total < threshold {
 			return Verdict::Allow;
 		}
 		// Name the most severe rule that drove the block; on a weight tie keep the earliest
 		// (inspection order is method → target → query → headers, lowest rule index first).
 		// Tag it with the aggregate score that crossed the threshold so a scored block is
-		// distinguishable downstream from a single-signature one.
-		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (m.category.weight(), std::cmp::Reverse(*i))).map(|(_, m)| {
+		// distinguishable downstream from a single-signature one. Severity uses this WAF's
+		// (possibly overridden) weights, consistent with the score that crossed the threshold.
+		let dominant = matches.iter().enumerate().max_by_key(|(i, m)| (self.category_weight(m.category), std::cmp::Reverse(*i))).map(|(_, m)| {
 			let mut m = m.clone();
 			m.score = Some(total);
 			m
@@ -469,7 +537,9 @@ impl Waf {
 /// empty slice (a clean request). An operator compares this against a chosen threshold to
 /// decide whether the *aggregate* of several signals — none necessarily blocking on its
 /// own under first-match — warrants a block, the OWASP-CRS anomaly-scoring model ported to
-/// this engine. Pair with [`Waf::inspect_all`].
+/// this engine. Pair with [`Waf::inspect_all`]. This uses the category *defaults*; for a WAF
+/// with per-category weight overrides ([`Waf::set_category_weight`]) use the instance method
+/// [`Waf::score`] instead, which is what the scoring-mode [`Waf::inspect`] path compares.
 #[must_use]
 pub fn anomaly_score(matches: &[WafMatch]) -> u32 {
 	matches.iter().map(|m| m.category.weight()).sum()
@@ -585,6 +655,18 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
 		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
+		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
+		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
+		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
+		Rule { id: "nosqli_json_operator", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(ne|gt|gte|lt|lte|in|nin|regex|exists|where|expr|or|nor|and|not)"\s*:"# },
+		// --- LDAP injection (search-filter break-out; value inspection, no client IP) ---
+		Rule { id: "ldapi_filter_break", category: WafCategory::LdapInjection, pattern: r"\)\s*\(\s*[|&!]" },
+		Rule { id: "ldapi_wildcard_break", category: WafCategory::LdapInjection, pattern: r"[*]\s*\)\s*\(" },
+		Rule { id: "ldapi_bool_group", category: WafCategory::LdapInjection, pattern: r"(?i)\(\s*[|&]\s*\(\s*\w+\s*=" },
+		// --- XML external entity (markup inspection; no client IP; HTML doctypes excluded) ---
+		Rule { id: "xxe_entity_decl", category: WafCategory::Xxe, pattern: r"(?i)<!entity\b" },
+		Rule { id: "xxe_entity_external", category: WafCategory::Xxe, pattern: r"(?i)<!entity[\s\S]{0,200}\b(system|public)\b" },
+		Rule { id: "xxe_doctype_dtd", category: WafCategory::Xxe, pattern: r"(?i)<!doctype[\s\S]{0,200}\[" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -993,6 +1075,51 @@ mod tests {
 	}
 
 	#[test]
+	fn category_weight_defaults_match_enum() {
+		// A fresh WAF assigns every category its enum-default weight.
+		let waf = Waf::starter();
+		for cat in WafCategory::ALL {
+			assert_eq!(waf.category_weight(cat), cat.weight());
+		}
+	}
+
+	#[test]
+	fn set_category_weight_overrides_instance_score() {
+		// Lower the protocol-anomaly weight; the instance score reflects it while the free
+		// `anomaly_score` (defaults) does not.
+		let waf = Waf::starter().set_category_weight(WafCategory::ProtocolAnomaly, 1);
+		assert_eq!(waf.category_weight(WafCategory::ProtocolAnomaly), 1);
+		let matches = vec![WafMatch { rule_id: "x", category: WafCategory::ProtocolAnomaly, location: "header:user-agent".to_owned(), score: None }];
+		assert_eq!(waf.score(&matches), 1);
+		assert_eq!(anomaly_score(&matches), WafCategory::ProtocolAnomaly.weight());
+	}
+
+	#[test]
+	fn tuned_weight_changes_scoring_block_decision() {
+		// A lone shellshock hit (default weight 3) blocks at threshold 3; raising the same
+		// category's weight requirement by tuning it down to 1 lets it pass under that
+		// threshold — the operator's severity knob, no threshold change.
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "() { :; }; echo".parse().unwrap());
+		assert!(matches!(Waf::starter().scoring_threshold(3).inspect(&p), Verdict::Block(_)));
+		let tuned = Waf::starter().scoring_threshold(3).set_category_weight(WafCategory::ProtocolAnomaly, 1);
+		assert_eq!(tuned.inspect(&p), Verdict::Allow);
+	}
+
+	#[test]
+	fn tuned_weight_carries_into_scored_block_score() {
+		// SQLi (5) in the query + XSS tuned up to 6 in a header = 11; the scored block's
+		// aggregate reflects the override, and the dominant (now-heavier XSS) rule is named.
+		let waf = Waf::starter().scoring_threshold(8).set_category_weight(WafCategory::Xss, 6);
+		let mut p = parts("GET", "/items?q=1%20OR%201=1");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let v = waf.inspect(&p);
+		let m = blocked(&v);
+		assert_eq!(m.score, Some(11));
+		assert_eq!(m.category, WafCategory::Xss);
+	}
+
+	#[test]
 	fn category_weight_scale_is_ordered() {
 		// Critical injection classes weigh at least as much as protocol oddities.
 		assert!(WafCategory::Sqli.weight() >= WafCategory::Xss.weight());
@@ -1044,6 +1171,107 @@ mod tests {
 		let waf = Waf::starter();
 		for uri in ["/articles/json-${schema}-guide", "/pricing?total=7", "/docs/php-serialization-explained", "/blog/clean-code-tips"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn nosql_injection_rules_match() {
+		let waf = Waf::starter();
+		// MongoDB $where server-side JS, the JSON operator key, and the HTTP-parameter
+		// operator form all attribute to the NoSqlInjection class.
+		assert_eq!(waf.inspect_str(r#"{"$where": "this.a == this.b"}"#, "query").map(|m| m.category), Some(WafCategory::NoSqlInjection));
+		assert_eq!(waf.inspect_str(r#"{"username":{"$ne":null}}"#, "query").unwrap().rule_id, "nosqli_json_operator");
+		assert_eq!(waf.inspect_str("username[$ne]=&password[$ne]=", "query").unwrap().rule_id, "nosqli_param_operator");
+		assert_eq!(waf.inspect_str("age[$gt]=0", "query").unwrap().category, WafCategory::NoSqlInjection);
+	}
+
+	#[test]
+	fn nosql_injection_rules_keep_false_positives_low() {
+		// Benign requests mentioning prices, JSON, or array params must still pass.
+		let waf = Waf::starter();
+		for uri in ["/products?price[min]=10&price[max]=99", "/api/users?sort=name", "/blog/mongodb-vs-postgres", "/cart?items[0]=42"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn nosql_category_metadata_is_stable() {
+		assert_eq!(WafCategory::NoSqlInjection.name(), "nosql_injection");
+		assert_eq!(WafCategory::NoSqlInjection.weight(), WafCategory::Sqli.weight());
+		// The index is still a bijection over every category.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn ldap_injection_rules_match() {
+		let waf = Waf::starter();
+		// Filter break-out, wildcard break, and an always-true boolean group all attribute
+		// to the LdapInjection class.
+		assert_eq!(waf.inspect_str("user=*)(uid=*))(|(uid=*", "query").map(|m| m.category), Some(WafCategory::LdapInjection));
+		assert_eq!(waf.inspect_str("name=admin*)(cn=*)", "query").unwrap().rule_id, "ldapi_wildcard_break");
+		assert_eq!(waf.inspect_str("filter=(|(uid=admin)(uid=root))", "query").unwrap().rule_id, "ldapi_bool_group");
+	}
+
+	#[test]
+	fn ldap_injection_rules_keep_false_positives_low() {
+		// Parenthesised titles, alternation, and benign filter-like text must still pass —
+		// the rules require the paren-paren-operator order an LDAP break-out has, not the
+		// operator-between-groups order legitimate text uses.
+		let waf = Waf::starter();
+		for uri in ["/wiki/Album_(2020)", "/search?q=(cats)|(dogs)", "/docs/ldap-tutorial", "/math?f=(a)(b)"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn ldap_category_metadata_is_stable() {
+		assert_eq!(WafCategory::LdapInjection.name(), "ldap_injection");
+		assert_eq!(WafCategory::LdapInjection.weight(), WafCategory::Sqli.weight());
+		// The index is still a bijection over every category.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn xxe_rules_match() {
+		let waf = Waf::starter();
+		// An external (SYSTEM) entity and a DOCTYPE carrying an inline DTD subset both
+		// attribute to the Xxe class. XXE payloads usually arrive in a request body, scanned
+		// with the same ruleset.
+		// (A SYSTEM URL pointing at /etc/passwd or file:// would trip the earlier
+		// traversal/SSRF rules first; use a neutral external DTD so the XXE rule is what fires.)
+		assert_eq!(blocked(&waf.inspect_body(br#"<!ENTITY xxe SYSTEM "ext-entity.dtd">"#)).category, WafCategory::Xxe);
+		// A DOCTYPE with an inline `[` subset but no entity reports the DTD-subset rule.
+		assert_eq!(waf.inspect_str(r"<!DOCTYPE r [<!ELEMENT r (#PCDATA)>]>", "body").unwrap().rule_id, "xxe_doctype_dtd");
+		// With the broad entity-declaration rule disabled, an external entity still trips the
+		// more specific SYSTEM/PUBLIC rule.
+		let specific = Waf::starter().disable_rule("xxe_entity_decl");
+		assert_eq!(specific.inspect_str(r#"<!ENTITY x SYSTEM "ext-entity.dtd">"#, "body").unwrap().rule_id, "xxe_entity_external");
+	}
+
+	#[test]
+	fn xxe_rules_keep_false_positives_low() {
+		// Legitimate HTML/XHTML doctypes (which use PUBLIC/SYSTEM but declare no entity) and
+		// benign XML-mentioning paths must still pass — the external rule is keyed on
+		// `<!ENTITY`, and the DTD rule needs an inline `[` subset HTML never carries.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.inspect_body(b"<!DOCTYPE html>"), Verdict::Allow);
+		assert_eq!(waf.inspect_body(br#"<!DOCTYPE html PUBLIC "-//W3C//DTD XHTML 1.0 Strict//EN" "http://www.w3.org/TR/xhtml1/DTD/xhtml1-strict.dtd">"#), Verdict::Allow);
+		for uri in ["/docs/xml-tutorial", "/articles/entity-relationship-diagrams", "/blog/dtd-vs-xsd"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn xxe_category_metadata_is_stable() {
+		assert_eq!(WafCategory::Xxe.name(), "xxe");
+		assert_eq!(WafCategory::Xxe.weight(), WafCategory::Sqli.weight());
+		// The index is still a bijection over every category.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}
 	}
 

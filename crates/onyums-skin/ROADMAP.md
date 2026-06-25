@@ -219,8 +219,22 @@ Request inspection — 100% IP-free, the cleanest Cloudflare carry-over.
 
 - Pure-Rust engine: `wirefilter` for the rule/expression language, `regex` + `aho-corasick` for
   multi-signature matching, evaluated as a `tower` layer over request URI/method/headers/body.
-- A curated starter ruleset (SQLi / XSS / path traversal / protocol anomalies); not OWASP-CRS-
-  complete at first, but extensible with custom rules.
+  > **`wirefilter` dependency blocker (found 2026-06-24).** The only crates.io-published
+  > wirefilter is `wirefilter-engine` 0.6.1 (MIT, last released ~2019). It compiles on the
+  > current toolchain but transitively pulls in the **unmaintained `failure`** crate
+  > (RUSTSEC-2020-0036) plus a duplicate `syn 1.0` / `synstructure 0.12`, and the superseded
+  > `cidr 0.1`, `bitstring 0.1`, `memmem 0.1`, `indexmap 1.9`. For a crate whose thesis is a
+  > clean, audited, pure-Rust, copyleft-free tree, adding an unmaintained transitive dep to a
+  > *security* layer is a human sign-off decision, not a default. **Resolve before adopting:**
+  > (a) vendor/fork wirefilter onto a maintained error stack (drop `failure`), (b) accept the
+  > dep with an explicit `cargo-deny` advisory exception, or (c) keep the `regex` `RegexSet`
+  > engine and build a minimal pure-Rust filter front-end (the rule/expression language is the
+  > only thing wirefilter adds — signature matching is already covered). The starter ruleset and
+  > anomaly-scoring model below do not depend on this choice.
+- A curated starter ruleset (SQLi / XSS / path traversal / OS command injection / SSRF /
+  server-side code injection / NoSQL / LDAP / XXE / protocol anomalies); not OWASP-CRS-complete
+  at first, but extensible with custom rules, per-rule/category disabling, and operator-tunable
+  per-category anomaly weights.
 - No Go/cgo/FFI — the 100%-Rust commitment rules out a Coraza/ModSecurity binding outright, so
   OWASP-CRS coverage is reached by porting rules into the pure-Rust engine, never by linking a
   foreign one.
@@ -319,6 +333,10 @@ PoW crate, gated solely because it is LGPL-3.0, keeping the default build copyle
 - **WAF scope** — a hand-rolled pure-Rust ruleset will not reach OWASP-CRS parity quickly; set
   expectations. The 100%-Rust rule means there is no Coraza-FFI escape hatch, so CRS coverage is a
   rule-porting effort.
+- **`wirefilter` supply chain** — the published `wirefilter-engine` 0.6.1 drags in the
+  unmaintained `failure` crate (RUSTSEC-2020-0036) and several superseded deps (see the Phase 3
+  blocker note). Decide vendor-fork vs. advisory-exception vs. a minimal in-house filter
+  front-end before the rule-expression language adds this dependency.
 
 ---
 

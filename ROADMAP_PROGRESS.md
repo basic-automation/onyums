@@ -7,6 +7,131 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-24 — onyums-skin Phase 3 WAF: broaden ruleset (NoSQL/LDAP/XXE) + operator-tunable anomaly weights + wirefilter blocker (6 increments)
+
+Branch `routine/onyums-2026-06-24` → PR
+[#15](https://github.com/basic-automation/onyums/pull/15) (base `master`). Last run (PR
+[#13](https://github.com/basic-automation/onyums/pull/13), merged; `master` head
+`3377e9e`) closed the "surface the anomaly score" item and set the NEXT STEP to the Phase-3
+`wirefilter` rule-expression front-end — the recurring deferral of three prior runs. This
+run **investigated wirefilter concretely and found a real dependency blocker** (documented,
+increment 6), then advanced the *other* explicitly-listed Phase-3 work that needs no new
+dependency: three new IP-free attack classes (NoSQL / LDAP / XXE) and an operator-tunable
+anomaly-weight knob, each fully unit- and (for the weight knob) integration-tested. All
+pure-Rust, no-Tor, **no new dependencies**. Workspace stayed green and clippy-clean after
+every increment. Only `crates/onyums-skin/src/{waf/mod.rs, layer.rs}` and the skin
+`ROADMAP.md` changed; no onyums-server (root) code touched.
+
+**Increment 1 — NoSQL injection category.** *Phase 3, "broader OWASP-CRS ruleset."* Files:
+`src/waf/mod.rs`. New `WafCategory::NoSqlInjection` (weight 5, appended at ALL index 7 so
+existing category indices stay stable; the per-category metric arrays in `observe.rs` size
+off `WafCategory::ALL.len()` and grew automatically). Three conservative MongoDB-operator
+rules: `nosqli_mongo_where` (`$where` server-side JS), `nosqli_json_operator` (`{"$ne": …}`
+JSON operator key), `nosqli_param_operator` (`user[$ne]=` HTTP-parameter form). **3 unit
+tests** (each rule attributes + reports id; an FP guard over benign price/array/sort params;
+index bijection).
+
+**Increment 2 — LDAP injection category.** *Phase 3, "broader OWASP-CRS ruleset."* Files:
+`src/waf/mod.rs`. New `WafCategory::LdapInjection` (weight 5, ALL index 8). Three rules keyed
+on the paren-paren-operator order an LDAP break-out has (distinguishing it from the
+operator-between-groups order legitimate parenthesised text uses): `ldapi_filter_break`
+(`)(|`), `ldapi_wildcard_break` (`*)(`), `ldapi_bool_group` (`(|(uid=`). Also dropped the
+hardcoded `ALL.len()` assertions from the per-category metadata tests (they coupled each test
+to the total category count); the index-bijection check is retained. **3 unit tests** (rules
+match; FP guard over parenthesised titles / alternation / filter-like text).
+
+**Increment 3 — XXE (XML external entity) category.** *Phase 3, "broader OWASP-CRS
+ruleset."* Files: `src/waf/mod.rs`. New `WafCategory::Xxe` (weight 5, ALL index 9). Three
+rules: `xxe_entity_decl` (`<!ENTITY`), `xxe_entity_external` (`<!ENTITY … SYSTEM/PUBLIC` —
+the file-read / SSRF vector), `xxe_doctype_dtd` (`<!DOCTYPE … [` inline DTD subset). The
+external-reference rule is keyed on `<!ENTITY`, **not** `<!DOCTYPE`, so a legitimate
+HTML/XHTML doctype (which carries PUBLIC/SYSTEM with no entity) does not false-positive. **3
+unit tests** (external entity → Xxe; inline-DTD → `xxe_doctype_dtd`; the specific SYSTEM rule
+fires when the broad decl is disabled; FP guard over `<!DOCTYPE html>`, a full XHTML strict
+doctype, and XML-mentioning paths).
+
+**Increment 4 — operator-tunable per-category anomaly weights.** *Phase 3,
+"operator-tunable."* Files: `src/waf/mod.rs`. Added a per-`Waf` `weights: [u32;
+WafCategory::ALL.len()]` array (indexed by `WafCategory::index`, initialized from the enum
+defaults). New builder `set_category_weight(cat, weight)`, getter `category_weight(cat)`, and
+instance `Waf::score(&matches)` (counterpart of the free `anomaly_score`, which keeps the
+defaults). The scoring-mode `inspect`/`inspect_scored` path now sums via `self.score` and
+picks the dominant rule via `self.category_weight`, so a tuned weight changes both the block
+decision and the score/dominant-rule on the `WafMatch`. The OWASP-CRS per-rule severity knob,
+one level up. **4 unit tests** (defaults match enum; override changes instance score but not
+the free fn; tuned-down flips a block to allow; tuned-up carries into the scored aggregate +
+dominant category).
+
+**Increment 5 — end-to-end tuned-weight scoring block through the live layer.** *Phase 3,
+hardening increment 4.* Files: `src/layer.rs`. A `#[tokio::test]` driving the override
+through the real `SkinService`: a lone XSS header (default weight 4) under threshold 8 is not
+blocked (no `WafBlock` event, status ≠ 403); raising the XSS weight to 8 makes the same hit
+reach the threshold, blocked end-to-end with a 403 body naming "anomaly score 8" and a single
+`WafBlock` event carrying `score Some(8)` + the XSS category. Confirms the override flows
+through `tower` into both the response and the event stream, ahead of the clearance gate. **1
+integration test.**
+
+**Increment 6 — record the `wirefilter` dependency blocker.** *Phase 3, the recurring
+deferred NEXT STEP.* Files: `crates/onyums-skin/ROADMAP.md` (docs only). The only
+crates.io-published wirefilter is `wirefilter-engine` 0.6.1 (MIT, ~2019). It compiles on the
+current toolchain but transitively pulls in the **unmaintained `failure`** crate
+(RUSTSEC-2020-0036) plus a duplicate `syn 1.0` and the superseded `cidr 0.1` / `bitstring
+0.1` / `memmem 0.1` / `indexmap 1.9` (verified via a scratch `cargo add` + `cargo tree`). For
+a crate whose thesis is a clean, audited, pure-Rust, copyleft-free tree, adding an
+unmaintained transitive dep to a *security* layer is a human sign-off decision. Recorded the
+finding and three resolution options (vendor-fork dropping `failure` / accept with a
+`cargo-deny` advisory exception / build a minimal in-house filter front-end, since the
+`RegexSet` engine already covers signature matching and only the expression *language* is
+missing) in the Phase-3 description and the Risks list. Also refreshed the starter-ruleset
+description to list the now-implemented classes and operator controls.
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one pre-existing
+  `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **195 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 181+1 at last run; **+14** across the five code increments — 3+3+3+4+1).
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** throughout (no `#[allow]` added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open (onyums-skin Phase 3 — WAF)
+- **DONE this run:** NoSQL / LDAP / XXE attack classes (10 categories total now); operator-
+  tunable per-category anomaly weights with end-to-end layer coverage; the `wirefilter`
+  blocker investigated and documented with resolution options.
+- **OPEN / BLOCKED (Phase 3):** the `wirefilter` rule-expression front-end is **blocked** on a
+  human dependency decision (unmaintained `failure` via `wirefilter-engine` 0.6.1 — see
+  increment 6); further OWASP-CRS rule porting toward fuller coverage remains available.
+- **OPEN (Phase 4):** onyums-side consumption — wiring `FanoutSink`/`SecurityMetrics`/a
+  `ShapeDifficulty` into onyums' live Skin setup (touches the live-serve path this routine
+  cannot runtime-verify).
+- **BLOCKED:** skin Phase 1 `CaptchaChallenge` (the `captcha` crate license audit — an open
+  ROADMAP question).
+- **NOT STARTED:** onyums server Phase 0 (kill `ONION_NAME` singleton / readiness+shutdown
+  handle), Phase 1 (identity), Phase 3 (TLS-first/strict); skin Phase 5 (frontier).
+
+**STOP REASON:** Landed 6 increments (5 code + 1 docs) as one coherent arc — three new
+IP-free attack classes plus a genuine operator-tunable-severity capability with end-to-end
+coverage, all pure-Rust, no new deps, green and clippy-clean, nothing half-landed — and
+resolved the three-run-recurring wirefilter deferral by *investigating* it: it is blocked on
+a real supply-chain decision (unmaintained `failure` dep) that only a human can make, now
+documented with evidence and three concrete options. Stopping here rather than manufacturing a
+seventh: the remaining Phase-3 routine-verifiable work (wirefilter) is now explicitly blocked,
+and the other open items are either license-blocked (`CaptchaChallenge`) or live on the
+onyums serve path this routine cannot runtime-verify (Phase 0/2 wiring) — each deserves a
+dedicated start, not a rushed late add. It is ~02:42, well inside the clock, but the night's
+work is complete and verified.
+
+**NEXT STEP:** Decide the **`wirefilter` dependency question** (vendor-fork dropping
+`failure` / `cargo-deny` advisory exception / minimal in-house filter front-end over the
+existing `RegexSet` engine) — this unblocks the Phase-3 rule-expression language. If the
+answer is "build minimal in-house," that is itself a tractable pure-Rust routine increment:
+a small operator-expression parser (field op value, `and`/`or`) compiling to a predicate
+evaluated alongside the `RegexSet` signatures, folded into the same `WafMatch`/`score`
+machinery. Alternatively, if the live-serve path is in scope for a run, onyums Phase 2 can
+wire the now-complete `FanoutSink`/`MetricsSink`/`ShapeDifficulty` into onyums' served
+`Router`.
+
+---
+
 ## 2026-06-23 — onyums-skin Phase 3 WAF: surface anomaly score (event + metrics) + CodeInjection class (4 increments)
 
 Branch `routine/onyums-2026-06-23` → PR

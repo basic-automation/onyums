@@ -7,6 +7,124 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-25 — onyums-skin Phase 5 frontier: request-shape client intelligence (6 increments)
+
+Branch `routine/onyums-2026-06-25` → PR (base `master`, head `2930c13`). This run opened a
+**new front: onyums-skin ROADMAP Phase 5 (frontier defenses)** — the request-shape
+client-intelligence layer, the strongest signal that survives Tor's loss of client IP, ASN,
+geo, and TLS fingerprint. Phases 1–4 are already implemented on `master`; the previously
+in-progress Phase-3 `wirefilter` front-end stayed **deferred** (a heavy dep + filter-language
+design that three prior runs flagged as a dedicated-night effort, and last night's PR
+[#15](https://github.com/basic-automation/onyums/pull/15) — still **open/unmerged** — is
+mid-flight on `waf/mod.rs`/`layer.rs`, so touching those would conflict). This run's six
+increments are all **pure Rust, no-Tor, no new dependencies**, and land in **new modules
+plus `observe.rs`/`difficulty.rs`/`lib.rs`** — files PR #15 does *not* touch — so they sit
+cleanly alongside it. Workspace stayed green and clippy-clean after every increment.
+
+**Increment 1 — JA4H-style HTTP request fingerprinting.** *Phase 5, "JA4H-style HTTP
+fingerprinting".* Files: `src/fingerprint.rs` (new), `src/lib.rs`. `Ja4hFingerprint::from_parts`
+produces the canonical four-part JA4H key (`a_b_c_d`): a metadata prefix (method, HTTP
+version, cookie/referer flags, header count, primary Accept-Language) plus truncated SHA-256
+hashes of the header-name set, the sorted cookie field names, and the sorted cookie
+name=value pairs. The one documented deviation from packet-capture JA4H is the header-name
+component — axum/hyper lose wire order at parse time (the limitation `RequestShape` already
+documents), so `b` hashes the sorted header-name *set*; the cookie components are
+spec-faithful (JA4H sorts cookie fields regardless). Over the existing `sha2` dep. **12 unit
+tests.**
+
+**Increment 2 — heuristic request-shape bot detection.** *Phase 5, "Heuristic bot detection on
+request shape" — the only Cloudflare bot signal that survives Tor.* Files: `src/bot.rs` (new),
+`src/lib.rs`. `BotHeuristics::assess(&Parts)` returns a `BotAssessment` with a clamped
+suspicion score in `[0,1]` and the list of `BotSignal`s that fired (no User-Agent, a
+non-browser tool UA, missing Accept / Accept-Language / Accept-Encoding, an unusually small
+header set), each with a conservative weight and operator-facing description. Encoded as
+tests: a conventional browser request — including a no-JS "Safest" client, which still sends
+the full header set — scores `0.0`, and the score is a difficulty input, never a hard block.
+**9 unit tests.**
+
+**Increment 3 — `SecurityEvent::BotFlagged` + `bots_flagged` metric.** *Phase 5 ×
+observability.* Files: `src/observe.rs`. Gave the bot heuristics an observability surface
+mirroring `ShapeAnomaly`: a new `BotFlagged { score_permille, signal_count }` event (a signal,
+not a block), a `SecurityEvent::bot_flagged(&BotAssessment)` constructor (quantizes/clamps the
+score, saturates the count), wired through `kind()`/`severity()` (Notice) and a new atomic
+`SecurityMetrics::bots_flagged` counter in `MetricsSink`. Enum stays `#[non_exhaustive]`; the
+internal exhaustive matches were all updated. **2 unit tests.**
+
+**Increment 4 — `BotDifficulty` controller.** *Phase 5, bot suspicion as a PoW-difficulty
+input.* Files: `src/difficulty.rs`, `src/lib.rs`. The third difficulty signal alongside
+`AdaptiveDifficulty` (raw rate) and `ShapeDifficulty` (deviation-from-baseline):
+`BotDifficulty::assess(&Parts)` scores a request, maps suspicion to a PoW difficulty across a
+configurable band (default `0.3..0.9`), and emits `BotFlagged` past an emit threshold (default
+`0.5`). Builder mirrors `ShapeDifficulty` (`score_band`/`emit_threshold`/`with_heuristics`/
+`events`). No learning phase — the heuristics are stateless — so a no-JS browser reads `0.0`
+and stays at baseline from the first request. **7 unit tests.**
+
+**Increment 5 — `ClientProfile` unified identity.** *Phase 5, the "cluster/identify clients"
+surface.* Files: `src/profile.rs` (new), `src/lib.rs`. `ClientProfile::from_parts(&Parts,
+&BotHeuristics)` (plus a `_default`) derives all three signals in one pass — the JA4H
+fingerprint (stable cluster key via `cluster_key()`), the `RequestShape` feature vector, and
+the `BotAssessment` — the closest an onion service comes to a per-client identity with no IP.
+Every field is a signal, never a verdict. **4 unit tests.**
+
+**Increment 6 — automation/headless-browser UA detection.** *Phase 5, broaden bot coverage.*
+Files: `src/bot.rs`. New `BotSignal::AutomationUserAgent` (weight 0.6) for headless/automation
+frameworks (HeadlessChrome / PhantomJS / Selenium / WebDriver / Playwright / Puppeteer /
+Electron / Cypress / Splash / SlimerJS), which the CLI-tool list misses because they ride a
+full browser-shaped UA + header set. Kept distinct from `NonBrowserUserAgent` so the
+explanation stays accurate; `BotSignal::ALL` grows 6→7 (the metric arrays already size off
+`ALL.len()`). **2 unit tests.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums-skin`: **215 passed; 0 failed; 0 ignored** + **1 doc test passed**
+  (up from 181+1 at run start; **+34** across the six increments — 12+9+2+7+4+2 minus the
+  ALL-array-driven overlaps; final-suite count is authoritative).
+- `cargo clippy --workspace --all-targets`: **0 warnings** (no `#[allow]` added; the two new
+  modules and all edits are clippy-clean, root crate included).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open
+- **DONE this run (Phase 5):** JA4H-style fingerprinting (`Ja4hFingerprint`); request-shape bot
+  heuristics (`BotHeuristics`/`BotAssessment`/`BotSignal`, incl. automation-UA class); the
+  `BotFlagged` event + `bots_flagged` metric; the `BotDifficulty` controller; the
+  `ClientProfile` unified surface. The "JA4H-style HTTP fingerprinting" and "Heuristic bot
+  detection on request shape" Phase-5 bullets are substantially **implemented** (host wiring
+  into the live gate is the remaining onyums-side step).
+- **OPEN (Phase 5):** wiring `BotDifficulty`/`ClientProfile` into onyums' live Skin setup
+  (live-serve path this routine cannot runtime-verify); a pluggable **EquiX** PoW backend
+  behind an opt-in LGPL feature; restricted-discovery orchestration; multi-instance clearance
+  coordination; edge-rules & caching.
+- **OPEN (Phase 3, deferred again):** the `wirefilter` rule-expression front-end (heavy dep +
+  filter-language design — a dedicated night; also currently mid-flight in unmerged PR #15).
+- **BLOCKED:** skin Phase 1 `CaptchaChallenge` (the `captcha` crate license audit — an open
+  ROADMAP question).
+- **NOTE on PR #15:** last night's WAF run (NoSQL/LDAP/XXE classes + tunable weights) is still
+  open/unmerged; this run was branched from `master` and deliberately avoided its files
+  (`waf/mod.rs`, `layer.rs`), so the two PRs are independent apart from the expected
+  `ROADMAP_PROGRESS.md` prepend conflict, resolved at merge.
+
+**STOP REASON:** Landed 6 verifiable increments (above the 2–4 bar) as one coherent arc — the
+complete Phase-5 request-shape client-intelligence layer (fingerprint → bot heuristics →
+event/metric → difficulty controller → unified profile → broadened bot coverage), all pure
+Rust, no new deps, fully unit-tested, green and clippy-clean, nothing half-landed. This is a
+clean arc boundary: every remaining workable item is either a **dedicated-night effort** (the
+`wirefilter` front-end / an EquiX feature-gated backend — each a new heavy or license-gated
+dependency), lives on the **live-serve path this routine cannot runtime-verify** (wiring the
+new controllers into onyums' gate, restricted-discovery orchestration), or is **blocked**
+(`CaptchaChallenge` license). Starting any of those past the natural stopping point risks the
+half-landed outcome the routine forbids.
+
+**NEXT STEP:** Either (a) on a run where the live-serve path is in scope, wire `BotDifficulty`
+and/or `ClientProfile` into onyums' served `Router` / Skin gate so bot suspicion actually
+drives PoW effort and emits `BotFlagged` into the observability stream; or (b) on a dedicated
+night, add the pluggable **EquiX** PoW backend — promote the pure-Rust LGPL `equix` crate to
+`[workspace.dependencies]` as an optional dep behind an opt-in cargo feature, implement `Pow`
+for it, and keep the default build copyleft-free; or (c) the long-deferred Phase-3 `wirefilter`
+rule-expression front-end (best taken after PR #15 merges to avoid `waf/mod.rs` churn).
+
+---
+
 ## 2026-06-23 — onyums-skin Phase 3 WAF: surface anomaly score (event + metrics) + CodeInjection class (4 increments)
 
 Branch `routine/onyums-2026-06-23` → PR

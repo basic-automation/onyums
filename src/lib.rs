@@ -45,6 +45,9 @@ pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
+mod vanity;
+pub use vanity::{mine, mine_within, validate_prefix, VanityKey};
+
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{

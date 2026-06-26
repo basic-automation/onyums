@@ -15,6 +15,11 @@ tor-hsservice = { version = "0.43.0", features = ["full"] }
 tor-proto = { version = "0.43.0", features = ["full", "stream-ctrl"] }
 tor-rtcompat = { version = "0.43.0", features = ["full"] }
 tor-cert = "0.43.0"
+# Low-level arti crypto + onion-service identity types. Used by the Phase 1
+# vanity-address miner to derive the *exact* `.onion` address arti will serve
+# from a candidate ed25519 key (no second, divergent encoding). Pure Rust.
+tor-llcrypto = "0.43.0"
+tor-hscrypto = "0.43.0"
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.13", default-features = false }
 axum = { version = "0.8.9", features = ["http2"] }
@@ -63,6 +68,9 @@ tor-hsservice = { workspace = true }
 tor-proto = { workspace = true }
 tor-rtcompat = { workspace = true }
 tor-cert = { workspace = true }
+tor-llcrypto = { workspace = true }
+tor-hscrypto = { workspace = true }
+rand = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 onyums-skin = { workspace = true }

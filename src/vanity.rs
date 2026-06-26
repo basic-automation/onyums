@@ -108,6 +108,33 @@ fn address_for_seed(seed: &[u8; 32]) -> (OnionAddress, String) {
 	(OnionAddress::normalized(&rendered), rendered)
 }
 
+/// Derive the `.onion` address an existing 32-byte ed25519 secret *seed* will
+/// serve.
+///
+/// This is the compact "bring your own identity" check: given the secret seed of
+/// an onion service you already run, compute the address onyums would serve from
+/// it, so you can confirm a migration preserves your address *before* wiring the
+/// key into the keystore. Uses the same arti-canonical derivation as the miner.
+#[must_use]
+pub fn address_from_secret_seed(seed: &[u8; 32]) -> OnionAddress {
+	address_for_seed(seed).0
+}
+
+/// Derive the `.onion` address from a 64-byte *expanded* ed25519 secret key — the
+/// form arti's HS keystore (and C tor's `hs_ed25519_secret_key`) stores: the
+/// secret scalar followed by its hash prefix.
+///
+/// Unlike a 32-byte seed, an expanded key need not be derivable from any seed, so
+/// this is the path for migrating a key exported from an existing onion service.
+///
+/// # Errors
+/// Returns an error if the bytes are not a valid expanded ed25519 secret key.
+pub fn address_from_expanded_secret(bytes: [u8; 64]) -> Result<OnionAddress> {
+	let keypair = ExpandedKeypair::from_secret_key_bytes(bytes).ok_or_else(|| anyhow::anyhow!("invalid expanded ed25519 secret key"))?;
+	let hsid = HsId::from(HsIdKey::from(*keypair.public()));
+	Ok(OnionAddress::normalized(&hsid.display_unredacted().to_string()))
+}
+
 /// Draw one candidate key and return it iff its address begins with `prefix`.
 fn try_one(rng: &mut impl RngCore, prefix: &str) -> Option<VanityKey> {
 	let mut seed = [0_u8; 32];
@@ -306,6 +333,31 @@ mod tests {
 	#[test]
 	fn mine_parallel_rejects_bad_prefix() {
 		assert!(mine_parallel("NOT_BASE32", 2).is_err());
+	}
+
+	#[test]
+	fn byo_secret_seed_derives_the_mined_address() {
+		// A mined key's stored seed, fed back through the public BYO helper, must
+		// yield the exact address it was mined for.
+		let key = mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
+		let derived = address_from_secret_seed(&key.secret_key_bytes());
+		assert_eq!(&derived, key.address());
+	}
+
+	#[test]
+	fn byo_expanded_secret_derives_the_mined_address() {
+		// The 64-byte expanded form (the keystore/C-tor migration shape) must derive
+		// the same address as the compact seed it came from.
+		let key = mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
+		let derived = address_from_expanded_secret(key.expanded_secret_key_bytes()).expect("valid expanded secret");
+		assert_eq!(&derived, key.address());
+	}
+
+	#[test]
+	fn byo_distinct_seeds_yield_distinct_addresses() {
+		let a = address_from_secret_seed(&[1_u8; 32]);
+		let b = address_from_secret_seed(&[2_u8; 32]);
+		assert_ne!(a, b, "different secret seeds must produce different addresses");
 	}
 
 	#[test]

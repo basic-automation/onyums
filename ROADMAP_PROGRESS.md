@@ -7,6 +7,119 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-26 — onyums server Phase 1 identity: vanity mining + address helpers (4 increments)
+
+Branch `routine/onyums-2026-06-26` → PR https://github.com/basic-automation/onyums/pull/17 (base `master`). Crate alternation: the
+previous run (2026-06-25, PR #16) advanced **onyums-skin** Phase 5, so per the
+never-twice-in-a-row rule this run targets the **onyums server**. It opens onyums
+ROADMAP **Phase 1 (stable identity)**, taking the pure-Rust, Tor-free identity
+helpers the routine flags as the offline-verifiable onyums work — vanity-address
+mining (the most self-contained Phase 1 item) plus the address-helper surface
+(validated parse, URLs, `Onion-Location`) and the offline BYO-key import check.
+All four increments are unit-tested with no live Tor. Workspace stayed green and
+clippy-clean throughout.
+
+**Increment 1 — vanity `.onion` address mining (core).** *onyums Phase 1, "Vanity
+address mining".* Files: `Cargo.toml`, `Cargo.lock`, `src/lib.rs`, `src/vanity.rs`
+(new). A v3 onion address *is* the base32 encoding of the service's ed25519 public
+key plus checksum and version; the miner draws candidate keypairs until the derived
+address starts with a desired prefix. The derivation reuses arti's own `HsId`
+formatting (`tor-hscrypto`), so a mined address is *exactly* the one arti will serve
+— no second, divergent encoding. We avoid arti's `Keypair::generate` (pinned to a
+different `rand_core` major than the workspace `rand`) by drawing a 32-byte ed25519
+seed from the workspace CSPRNG and building the keypair via `Keypair::from_bytes`;
+that seed *is* the importable secret. `VanityKey` exposes the 32-byte seed and the
+64-byte expanded form (arti keystore shape); its `Debug` redacts the secret. Public
+API: `mine` (unbounded), `mine_within` (bounded, never blocks), `validate_prefix`
+(rejects non-base32 prefixes that could never match). New pure-Rust workspace deps:
+`tor-llcrypto`, `tor-hscrypto` (0.43.0, already transitive); `rand` added to the
+onyums package. **8 unit tests.**
+
+**Increment 2 — parallel multi-core vanity mining.** *onyums Phase 1, "Vanity
+address mining … parallelized across cores".* Files: `src/lib.rs`, `src/vanity.rs`.
+`mine_parallel(prefix, threads)` over `std::thread::scope` (no new deps, no
+`Arc`/`'static` bound — workers borrow the prefix and a shared `AtomicBool`
+stop-flag off the stack); first match wins, the flag stops the rest, the scope joins
+them all. `threads == 0` uses all cores via `available_parallelism` (fallback 1).
+The ed25519 derivation dominating each attempt is CPU-bound and embarrassingly
+parallel, so this is the only practical way to mine prefixes longer than a couple of
+characters. **3 unit tests** (parallel find + secret reproduces address; auto thread
+count; bad-prefix rejection).
+
+**Increment 3 — validated `OnionAddress::parse` + URL / `Onion-Location` helpers.**
+*onyums Phase 1, "Address helpers — typed `OnionAddress`, QR / `Onion-Location`
+header emission".* Files: `src/lib.rs`. `OnionAddress::parse` is a *validating*
+constructor (vs the trusting `normalized`): it confirms a string is a real v3 onion
+address — length, base32 alphabet, checksum, version — by round-tripping through
+arti's `HsId` parser, then returns the canonical lowercase form (trims whitespace,
+rejects schemes/paths/subdomains). Added `https_url` / `http_url` (onyums serves
+HTTPS with a port-80 redirect) and `onion_location` / `onion_location_header` (the
+value and ready-to-insert `(name, value)` pair for the `Onion-Location` header a
+clearnet site emits to advertise its onion to Tor Browser). No new deps. **3 unit
+tests** (parse accepts a mined address + canonicalizes + trims; rejects
+non-onion / bare name / subdomain / corrupted checksum; URL + header formatting).
+
+**Increment 4 — BYO-key address derivation (offline import check).** *onyums Phase 1,
+"Bring-your-own identity key".* Files: `src/lib.rs`, `src/vanity.rs`. The
+offline-verifiable slice of BYO import: compute the address an existing secret key
+will serve so an operator can confirm a migration preserves their address *before*
+the key is wired into the keystore (the keystore-placement step is the later
+live-Tor slice). `address_from_secret_seed(&[u8; 32])` for compact seeds;
+`address_from_expanded_secret([u8; 64])` for the expanded form arti's keystore and
+C tor's `hs_ed25519_secret_key` store (covers keys not derivable from any seed;
+validates and rejects an invalid expanded key). Both reuse the arti-canonical
+derivation. No new deps. **3 unit tests** (seed and expanded forms both derive a
+mined key's address; distinct seeds give distinct addresses).
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums --lib -- --skip test_serve`: **31 passed; 0 failed; 0 ignored**
+  (1 filtered out = `test_serve`). Up from 8 at run start (17 new tests).
+- `cargo test -p onyums-skin`: **229 passed; 0 failed** + **1 doctest passed**
+  (untouched this run; sanity check).
+- `cargo clippy --workspace --all-targets`: **0 warnings** (two warnings fixed
+  directly during the run — `case_sensitive_file_extension_comparisons` in a test
+  assertion → `strip_suffix`; `filter_map().next()` → `find_map`; no `#[allow]` added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design.
+
+### Done vs. open
+- **onyums Phase 1 (stable identity): STARTED.** DONE (offline): vanity mining
+  (single + parallel); typed `OnionAddress::parse` validation + URL / `Onion-Location`
+  helpers; BYO-key address derivation (the import *verification* surface).
+- OPEN (onyums Phase 1): **QR emission** (needs a pure-Rust QR dep — `qrcode`; deferred
+  rather than rushed at wrap to vet license/feature surface). The **live-Tor**
+  identity slices: actually placing a mined / BYO key into the keystore so the
+  launched service serves that address; `.ephemeral()` opt-down vs persistent
+  keystore default — both touch the serve/keystore-config path this routine cannot
+  runtime-verify.
+- OPEN (onyums Phase 2, carried from 2026-06-18 run 3): drive `AccountingCircuitPolicy`
+  from `handle_stream_request`; Under Attack Mode builder toggle; feed Skin's
+  adaptive-difficulty signal. (The per-circuit id prerequisite is now satisfied —
+  `ConnectionInfo.circuit_id` is populated — so this is unblocked for a future
+  onyums run.)
+- NOT STARTED: onyums Phase 3 (TLS-first/strict, `StreamHandler`), Phase 4
+  (observability/multi-service).
+
+**STOP REASON:** Landed 4 verifiable increments (top of the 2–4 bar), a cohesive
+onyums Phase 1 identity-helpers slice — all pure-Rust and fully unit-tested offline.
+The remaining workable onyums items are either a **new-dependency add** (QR via the
+`qrcode` crate — better to vet its license and default-feature surface deliberately
+than bolt it on at wrap) or sit on the **live-Tor serve/keystore path this routine
+cannot runtime-verify** (keystore placement of a mined/BYO key; `.ephemeral()`).
+Per crate alternation this was an onyums run; the next run is owed **onyums-skin**.
+Everything is green, clippy-clean, and nothing is half-landed.
+
+**NEXT STEP (onyums, for a later run):** (1) QR-code emission for the address as a
+self-contained helper, adding the pure-Rust `qrcode` crate with `default-features =
+false` (string/unicode + SVG renderers, no `image`/FFI). (2) Wire a mined / BYO key
+into the launched service's keystore (`.identity(VanityKey)` / `.import_key(...)` on
+the builder) plus the `.ephemeral()` opt-down — the live-Tor slice that turns the
+offline helpers into a served address; verify what is offline-checkable and treat
+the serve path as "not run." Phase 2's `CircuitPolicy` wiring is also now unblocked.
+
+---
+
 ## 2026-06-25 — onyums-skin Phase 5 frontier: request-shape client intelligence (6 increments)
 
 Branch `routine/onyums-2026-06-25` → PR

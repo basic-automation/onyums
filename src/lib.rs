@@ -45,6 +45,9 @@ pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
+mod vanity;
+pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};
+
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
@@ -65,9 +68,29 @@ pub struct OnionAddress(String);
 impl OnionAddress {
 	/// Normalize a raw onion service name to exactly one trailing `.onion`
 	/// suffix, handling a bare name, a single suffix, or accidental repetition.
+	///
+	/// This *trusts* its input — it only fixes the suffix and does not check that
+	/// the name is a real v3 onion address. Use it for names that came from arti
+	/// itself (the launched service). For operator- or user-supplied strings,
+	/// prefer the validating [`Self::parse`].
 	#[must_use]
 	pub fn normalized(name: &str) -> Self {
 		Self(format!("{}.onion", name.trim_end_matches(".onion")))
+	}
+
+	/// Parse and *validate* a v3 `.onion` address.
+	///
+	/// Unlike [`Self::normalized`], this confirms the string is a real v3 onion
+	/// name — correct length, base32 alphabet, checksum, and version — by
+	/// round-tripping it through arti's own `HsId` parser, then returns the
+	/// canonical lowercase form. The input must be a bare `<base32>.onion` host
+	/// (no scheme, path, or subdomain); surrounding whitespace is trimmed.
+	///
+	/// # Errors
+	/// Returns an error if the string is not a valid v3 onion address.
+	pub fn parse(address: &str) -> Result<Self> {
+		let hsid: tor_hscrypto::pk::HsId = address.trim().parse().map_err(|e| anyhow::anyhow!("invalid v3 onion address: {e}"))?;
+		Ok(Self::normalized(&hsid.display_unredacted().to_string()))
 	}
 
 	/// The full address, including the `.onion` suffix.
@@ -81,6 +104,38 @@ impl OnionAddress {
 	#[must_use]
 	pub fn host(&self) -> &str {
 		&self.0
+	}
+
+	/// The canonical HTTPS URL for this service.
+	///
+	/// onyums serves HTTPS on port 443 (with a port-80 → HTTPS redirect), so this
+	/// is the URL clients should use.
+	#[must_use]
+	pub fn https_url(&self) -> String {
+		format!("https://{}/", self.0)
+	}
+
+	/// The plain-HTTP URL (port 80). onyums redirects this to [`Self::https_url`].
+	#[must_use]
+	pub fn http_url(&self) -> String {
+		format!("http://{}/", self.0)
+	}
+
+	/// The value for an [`Onion-Location`] response header (or its
+	/// `<meta http-equiv="onion-location">` equivalent): the canonical onion URL a
+	/// clearnet site emits to point Tor Browser at its onion equivalent.
+	///
+	/// [`Onion-Location`]: https://community.torproject.org/onion-services/advanced/onion-location/
+	#[must_use]
+	pub fn onion_location(&self) -> String {
+		self.https_url()
+	}
+
+	/// The `(name, value)` pair for the `Onion-Location` response header, ready to
+	/// insert into a response. The name is lowercase, as is conventional for HTTP/2.
+	#[must_use]
+	pub fn onion_location_header(&self) -> (&'static str, String) {
+		("onion-location", self.onion_location())
 	}
 }
 
@@ -645,6 +700,50 @@ mod tests {
 		assert_eq!(address.to_string(), "abcdef.onion");
 		let owned: String = address.into();
 		assert_eq!(owned, "abcdef.onion");
+	}
+
+	#[test]
+	fn parse_accepts_a_valid_mined_address_and_canonicalizes() {
+		// Mining yields a guaranteed-valid v3 address; `parse` must accept it and
+		// round-trip to the same canonical form.
+		let key = vanity::mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
+		let canonical = key.address().as_str();
+		let parsed = OnionAddress::parse(canonical).expect("a mined address must validate");
+		assert_eq!(&parsed, key.address());
+		// Surrounding whitespace is tolerated.
+		let parsed_padded = OnionAddress::parse(&format!("  {canonical}  ")).expect("whitespace should be trimmed");
+		assert_eq!(&parsed_padded, key.address());
+	}
+
+	#[test]
+	fn parse_rejects_invalid_addresses() {
+		let key = vanity::mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
+		let valid = key.address().as_str();
+
+		// Not an onion domain at all.
+		assert!(OnionAddress::parse("example.com").is_err());
+		// A bare name with no suffix is not accepted by the strict parser.
+		assert!(OnionAddress::parse("abcdef").is_err());
+		// A subdomain in front of a valid address is rejected.
+		assert!(OnionAddress::parse(&format!("www.{valid}")).is_err());
+
+		// Corrupt the public-key region (first base32 char) so the checksum no
+		// longer matches — a single flip is overwhelmingly likely to be rejected.
+		let mut chars: Vec<char> = valid.chars().collect();
+		chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
+		let corrupted: String = chars.into_iter().collect();
+		assert!(OnionAddress::parse(&corrupted).is_err(), "a corrupted checksum must be rejected");
+	}
+
+	#[test]
+	fn url_and_onion_location_helpers_format_correctly() {
+		let address = OnionAddress::normalized("abcdef");
+		assert_eq!(address.https_url(), "https://abcdef.onion/");
+		assert_eq!(address.http_url(), "http://abcdef.onion/");
+		assert_eq!(address.onion_location(), "https://abcdef.onion/");
+		let (name, value) = address.onion_location_header();
+		assert_eq!(name, "onion-location");
+		assert_eq!(value, "https://abcdef.onion/");
 	}
 
 	#[tokio::test]

@@ -9,7 +9,7 @@ STOP REASON, and the next step.
 
 ## 2026-06-26 — onyums server Phase 1 identity: vanity mining + address helpers (4 increments)
 
-Branch `routine/onyums-2026-06-26` → PR (base `master`). Crate alternation: the
+Branch `routine/onyums-2026-06-26` → PR https://github.com/basic-automation/onyums/pull/17 (base `master`). Crate alternation: the
 previous run (2026-06-25, PR #16) advanced **onyums-skin** Phase 5, so per the
 never-twice-in-a-row rule this run targets the **onyums server**. It opens onyums
 ROADMAP **Phase 1 (stable identity)**, taking the pure-Rust, Tor-free identity

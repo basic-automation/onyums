@@ -46,7 +46,7 @@ use onyums_skin::CircuitId;
 
 mod circuit_gate;
 mod vanity;
-pub use vanity::{mine, mine_within, validate_prefix, VanityKey};
+pub use vanity::{mine, mine_parallel, mine_within, validate_prefix, VanityKey};
 
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
 use rcgen::generate_simple_self_signed;

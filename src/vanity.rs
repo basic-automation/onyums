@@ -19,6 +19,8 @@
 //! live network. Wiring a mined key into the launched service's keystore is a
 //! later, live-Tor slice; this module produces the key material and the address.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use anyhow::{bail, Result};
 use rand::RngCore;
 use safelog::DisplayRedacted;
@@ -158,6 +160,52 @@ pub fn mine_within(prefix: &str, max_attempts: u64) -> Result<Option<VanityKey>>
 	Ok(None)
 }
 
+/// One mining worker: draw candidates until it finds a match or another worker
+/// signals (via `found`) that it already has one.
+fn mine_worker(prefix: &str, found: &AtomicBool) -> Option<VanityKey> {
+	let mut rng = rand::rng();
+	loop {
+		if found.load(Ordering::Relaxed) {
+			return None;
+		}
+		if let Some(key) = try_one(&mut rng, prefix) {
+			// Tell the other workers to stop; the search is over.
+			found.store(true, Ordering::Relaxed);
+			return Some(key);
+		}
+	}
+}
+
+/// Mine a vanity onion address across multiple threads, returning the first match
+/// any worker finds.
+///
+/// `threads` is the worker count; pass `0` to use all available cores
+/// ([`std::thread::available_parallelism`], falling back to 1). The ed25519
+/// derivation that dominates each attempt is CPU-bound and embarrassingly
+/// parallel, so throughput scales close to linearly with cores — the whole point
+/// of mining anything longer than a couple of characters. Unbounded, like
+/// [`mine`]: a long prefix can still run for a very long time.
+///
+/// # Errors
+/// Returns an error if `prefix` is not a valid onion-address prefix (see
+/// [`validate_prefix`]).
+pub fn mine_parallel(prefix: &str, threads: usize) -> Result<VanityKey> {
+	validate_prefix(prefix)?;
+	let threads = if threads == 0 { std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get) } else { threads };
+
+	let found = AtomicBool::new(false);
+	// `scope` lets the workers borrow `prefix` and `found` directly off the stack
+	// and joins them all before returning, so no `Arc` or `'static` bound is needed.
+	let winner = std::thread::scope(|s| {
+		let handles: Vec<_> = (0..threads).map(|_| s.spawn(|| mine_worker(prefix, &found))).collect();
+		handles.into_iter().find_map(|h| h.join().ok().flatten())
+	});
+
+	// One worker only returns `None` after another set `found`, so an unbounded
+	// search over a valid prefix always yields at least one winner.
+	winner.ok_or_else(|| anyhow::anyhow!("vanity mining ended without a match"))
+}
+
 #[cfg(test)]
 mod tests {
 	use std::str::FromStr;
@@ -235,6 +283,29 @@ mod tests {
 		let hsid = HsId::from(HsIdKey::from(*expanded.public()));
 		let rendered = hsid.display_unredacted().to_string();
 		assert_eq!(OnionAddress::normalized(&rendered), *key.address());
+	}
+
+	#[test]
+	fn mine_parallel_finds_match() {
+		let key = mine_parallel("a", 4).expect("should find a 1-char match across 4 threads");
+		let base32 = key.address().as_str().strip_suffix(".onion").unwrap();
+		assert!(base32.starts_with('a'), "address {} should start with 'a'", key.address());
+		// The returned secret must really control the returned address.
+		let (rebuilt, _) = address_for_seed(&key.secret_key_bytes());
+		assert_eq!(&rebuilt, key.address());
+	}
+
+	#[test]
+	fn mine_parallel_zero_threads_uses_all_cores() {
+		// `0` means "auto" — must still validate and find a match, never panic.
+		let key = mine_parallel("a", 0).expect("auto thread count should find a match");
+		let base32 = key.address().as_str().strip_suffix(".onion").unwrap();
+		assert!(base32.starts_with('a'));
+	}
+
+	#[test]
+	fn mine_parallel_rejects_bad_prefix() {
+		assert!(mine_parallel("NOT_BASE32", 2).is_err());
 	}
 
 	#[test]

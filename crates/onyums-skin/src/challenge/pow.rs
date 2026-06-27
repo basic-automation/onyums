@@ -84,8 +84,9 @@ impl Pow for Hashcash {
 }
 
 /// Count the number of leading zero bits across `bytes`, most-significant byte
-/// first.
-fn leading_zero_bits(bytes: &[u8]) -> u32 {
+/// first. Shared with alternate [`Pow`] backends (e.g. the optional EquiX one) so
+/// every algorithm reads `difficulty` as the same leading-zero-bit effort target.
+pub(crate) fn leading_zero_bits(bytes: &[u8]) -> u32 {
 	let mut count = 0;
 	for &b in bytes {
 		if b == 0 {

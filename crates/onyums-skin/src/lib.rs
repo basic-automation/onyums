@@ -51,6 +51,8 @@ pub mod shape;
 pub mod waf;
 
 pub use bot::{BotAssessment, BotHeuristics, BotSignal};
+#[cfg(feature = "equix")]
+pub use challenge::equix::EquiX;
 pub use challenge::{
 	Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
 };

@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-27 — onyums-skin Phase 5 frontier: opt-in EquiX proof-of-work backend (4 increments)
 
-Branch `routine/onyums-2026-06-27` → PR _(URL recorded below on open)_ (base `master`).
+Branch `routine/onyums-2026-06-27` → PR
+[#18](https://github.com/basic-automation/onyums/pull/18) (base `master`).
 **Crate alternation:** the previous run (2026-06-26, PR
 [#17](https://github.com/basic-automation/onyums/pull/17)) advanced the **onyums server**
 (Phase 1 identity), so per the alternation rule this run targets **onyums-skin**. All four

@@ -26,12 +26,14 @@
 //!
 //! - **Phase 5 — frontier (in progress).** JA4H-style HTTP request fingerprinting
 //!   ([`Ja4hFingerprint`]) — a cluster/identify key over the request shape that survives
-//!   the loss of IP and TLS — and heuristic request-shape bot detection ([`BotHeuristics`],
-//!   the only Cloudflare bot signal that survives Tor).
+//!   the loss of IP and TLS — heuristic request-shape bot detection ([`BotHeuristics`],
+//!   the only Cloudflare bot signal that survives Tor), and an opt-in EquiX PoW backend
+//!   (Tor's own Equi-X puzzle via the pure-Rust `equix` crate, behind the LGPL-gated
+//!   `equix` feature; `Hashcash` remains the default `Pow`).
 //!
 //! The remaining Phase 5 work (a `wirefilter` rule-expression front-end,
-//! restricted-discovery orchestration, a pluggable EquiX PoW backend) is tracked in this
-//! crate's `ROADMAP.md`, which pins the full architecture and plan.
+//! restricted-discovery orchestration, multi-instance clearance coordination) is tracked
+//! in this crate's `ROADMAP.md`, which pins the full architecture and plan.
 
 // Phase 2+ surface (CircuitPolicy, and not-yet-wired builder/limiter helpers) is public
 // API that downstreams and later phases consume, but unused within the crate today.

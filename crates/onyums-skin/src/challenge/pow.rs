@@ -694,6 +694,22 @@ mod challenge_tests {
 		}
 	}
 
+	#[cfg(feature = "equix")]
+	#[test]
+	fn equix_backend_works_as_a_full_pow_challenge() {
+		use crate::challenge::equix::EquiX;
+
+		// EquiX is a drop-in `Pow`, so all the `PowChallenge` glue — signed puzzle
+		// envelope, the query carrier, single-use replay protection, difficulty — must
+		// work over it unchanged, with no hashcash-specific assumptions.
+		let chal = PowChallenge::new(EquiX::new(), b"sec".to_vec(), 4);
+		let (puzzle, envelope) = chal.make_puzzle(None);
+		let solution = EquiX::new().solve(&puzzle);
+		let query = format!("puzzle={envelope}&nonce={}", URL_SAFE_NO_PAD.encode(&solution));
+		assert!(chal.verify(&parts_with_query(&query)), "a solved EquiX submission clears the gate");
+		assert!(!chal.verify(&parts_with_query(&query)), "the same EquiX solution cannot be replayed");
+	}
+
 	#[test]
 	fn hashcash_supplies_a_browser_solver() {
 		// The default backend carries a real SHA-256 solver page.

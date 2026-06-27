@@ -9,6 +9,8 @@ use axum::{http::request::Parts, response::Response};
 
 use crate::clearance::ClearanceLevel;
 
+#[cfg(feature = "equix")]
+pub mod equix;
 pub mod patience;
 pub mod pow;
 

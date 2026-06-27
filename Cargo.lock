@@ -2876,6 +2876,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64",
+ "equix",
  "governor",
  "hmac",
  "http-body-util",

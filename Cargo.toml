@@ -45,6 +45,12 @@ governor = "0.10.1"
 # onyums-skin WAF (Phase 3) — pure Rust signature matching. `regex` pulls in
 # `aho-corasick` internally for literal prefiltering (both MIT/Apache, no FFI).
 regex = "1.11.1"
+# onyums-skin Phase 5 optional PoW backend — Tor's own Equi-X puzzle, pure Rust.
+# LGPL-3.0, so it is gated behind onyums-skin's opt-in `equix` cargo feature to keep
+# the default build copyleft-free. `default-features = false` selects HashX's portable
+# interpreter (no runtime code generation / executable pages); the optional pure-Rust
+# JIT is reachable via the `equix/compiler` feature. No FFI in any configuration.
+equix = { version = "0.6.2", default-features = false }
 
 [package]
 name = "onyums"

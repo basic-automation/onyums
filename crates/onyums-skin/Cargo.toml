@@ -21,6 +21,17 @@ regex = { workspace = true }
 http-body-util = { workspace = true }
 tower-service = { workspace = true }
 tower-layer = { workspace = true }
+# Phase 5 optional PoW backend (Tor's Equi-X). Pure Rust, but LGPL-3.0, so it is
+# gated behind the `equix` feature below to keep the default build copyleft-free.
+equix = { workspace = true, optional = true }
+
+[features]
+# Opt-in EquiX proof-of-work backend ([`challenge::equix::EquiX`]). Off by default:
+# enabling it pulls in the LGPL-3.0 `equix` crate. Pure Rust either way.
+equix = ["dep:equix"]
+# Reach EquiX's pure-Rust runtime JIT (faster client-side solving, at the cost of
+# executable memory pages). Implies the `equix` backend.
+equix-compiler = ["equix", "equix/compiler"]
 
 [dev-dependencies]
 tokio = { workspace = true }

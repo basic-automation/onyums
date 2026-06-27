@@ -273,6 +273,13 @@ The research-grade, Tor-specific bets — none have prior art in this environmen
 - **Pluggable PoW backend** — `EquiX`, Tor's own puzzle via the pure-Rust `equix` crate, behind an
   opt-in (LGPL) cargo feature. RandomX "useful-work" mining stays excluded: it would require C++
   FFI, and was independently rejected on Tor-WASM and reputation grounds.
+  > **Implemented (2026-06-27).** `challenge::equix::EquiX` implements `Pow` behind the opt-in
+  > `equix` feature (`equix` 0.6.2, `default-features = false` → portable HashX interpreter; the
+  > pure-Rust JIT is reachable via `equix-compiler`). A single Equi-X solution is fixed-cost, so
+  > the backend layers an SHA-256 leading-zero-bit *effort* check over the proof (as Tor's PoW
+  > protocol does), making `difficulty` read identically to `Hashcash` and the Adaptive/Shape
+  > controllers drive it unchanged. Default build stays copyleft-free. No browser solver (needs
+  > WASM); `Hashcash` remains the JS-interactive default.
 - **Multi-instance coordination** — share a clearance-signing secret across Onionbalance backends so
   a token minted at one backend is honored at another.
 - **Edge-rules & caching** — local response cache and transform/redirect middleware (low effort;

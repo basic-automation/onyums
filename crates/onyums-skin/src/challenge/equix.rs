@@ -33,7 +33,7 @@
 //! future WASM interstitial; [`Hashcash`](super::pow::Hashcash) stays the JS-interactive
 //! default.
 
-use equix::{EquiXBuilder, RuntimeOption, SolutionByteArray};
+use equix::{EquiXBuilder, Runtime, RuntimeOption, SolutionByteArray};
 use rand::RngCore;
 use sha2::{Digest, Sha256};
 
@@ -67,10 +67,45 @@ impl Default for EquiX {
 }
 
 impl EquiX {
-	/// A new EquiX backend using the portable HashX interpreter.
+	/// A new EquiX backend using the portable HashX interpreter — the same as
+	/// [`EquiX::default`], and the recommended default (no executable memory pages).
 	#[must_use]
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// A new EquiX backend pinned to the portable HashX interpreter
+	/// ([`RuntimeOption::InterpretOnly`]). Explicit alias for [`EquiX::new`] for call
+	/// sites that pair it with [`EquiX::with_runtime`].
+	#[must_use]
+	pub fn interpret_only() -> Self {
+		Self::with_runtime(RuntimeOption::InterpretOnly)
+	}
+
+	/// A new EquiX backend using `runtime`. The pure-Rust JIT
+	/// ([`RuntimeOption::CompileOnly`] / [`RuntimeOption::TryCompile`]) is only compiled
+	/// in under the `equix-compiler` feature; without it, `CompileOnly` builds fail and
+	/// `TryCompile` falls back to the interpreter.
+	#[must_use]
+	pub fn with_runtime(runtime: RuntimeOption) -> Self {
+		Self { runtime }
+	}
+
+	/// The HashX runtime option this backend is configured with. Note this is the
+	/// *requested* option; the runtime actually selected for a given challenge (after any
+	/// compiler fallback) is reported by [`EquiX::effective_runtime`].
+	#[must_use]
+	pub fn runtime_option(&self) -> RuntimeOption {
+		self.runtime
+	}
+
+	/// The HashX runtime `equix` actually selects for `challenge` under this backend's
+	/// configuration — the way to confirm the JIT engaged (or fell back to the
+	/// interpreter). Returns `None` for the rare challenge HashX rejects on program
+	/// constraints.
+	#[must_use]
+	pub fn effective_runtime(&self, challenge: &[u8]) -> Option<Runtime> {
+		self.builder().build(challenge).ok().map(|instance| instance.runtime())
 	}
 
 	/// The `equix` builder configured for this backend's runtime.
@@ -221,5 +256,38 @@ mod tests {
 	fn new_puzzle_draws_distinct_seeds() {
 		let pow = EquiX::new();
 		assert_ne!(pow.new_puzzle(0).seed, pow.new_puzzle(0).seed);
+	}
+
+	#[test]
+	fn default_and_new_are_interpret_only() {
+		assert_eq!(EquiX::new().runtime_option(), RuntimeOption::InterpretOnly);
+		assert_eq!(EquiX::default().runtime_option(), RuntimeOption::InterpretOnly);
+		assert_eq!(EquiX::interpret_only().runtime_option(), RuntimeOption::InterpretOnly);
+	}
+
+	#[test]
+	fn with_runtime_records_the_requested_option() {
+		assert_eq!(EquiX::with_runtime(RuntimeOption::TryCompile).runtime_option(), RuntimeOption::TryCompile);
+		assert_eq!(EquiX::with_runtime(RuntimeOption::CompileOnly).runtime_option(), RuntimeOption::CompileOnly);
+	}
+
+	#[test]
+	fn interpret_only_reports_interpreter_as_effective_runtime() {
+		// The configured option must actually reach the `equix` builder, not just be
+		// stored: an InterpretOnly backend resolves to the interpreter for a real
+		// challenge. (A fixed challenge string here is known to build successfully.)
+		let pow = EquiX::interpret_only();
+		assert_eq!(pow.effective_runtime(b"onyums-skin equix runtime probe"), Some(Runtime::Interpret));
+	}
+
+	#[cfg(feature = "equix-compiler")]
+	#[test]
+	fn try_compile_backend_still_solves_and_verifies() {
+		// With the JIT compiled in, the TryCompile path must remain functionally
+		// equivalent to the interpreter for solve/verify.
+		let pow = EquiX::with_runtime(RuntimeOption::TryCompile);
+		let puzzle = pow.new_puzzle(0);
+		let solution = pow.solve(&puzzle);
+		assert!(pow.verify(&puzzle, &solution));
 	}
 }

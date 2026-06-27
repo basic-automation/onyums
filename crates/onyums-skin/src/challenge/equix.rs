@@ -29,9 +29,11 @@
 //! # Browser clients
 //!
 //! Equi-X has no JavaScript solver here (a browser solver needs WASM, which Tor
-//! "Safer"/"Safest" disable). This backend targets native or programmatic clients, or a
-//! future WASM interstitial; [`Hashcash`](super::pow::Hashcash) stays the JS-interactive
-//! default.
+//! "Safer"/"Safest" disable), so it leaves [`Pow::interstitial_template`] at the default
+//! `None` — a [`PowChallenge`](super::pow::PowChallenge) over EquiX degrades to a static
+//! "compatible client required" page rather than borrowing the hashcash solver. This
+//! backend targets native or programmatic clients, or a future WASM interstitial;
+//! [`Hashcash`](super::pow::Hashcash) stays the JS-interactive default.
 
 use equix::{EquiXBuilder, Runtime, RuntimeOption, SolutionByteArray};
 use rand::RngCore;
@@ -256,6 +258,13 @@ mod tests {
 	fn new_puzzle_draws_distinct_seeds() {
 		let pow = EquiX::new();
 		assert_ne!(pow.new_puzzle(0).seed, pow.new_puzzle(0).seed);
+	}
+
+	#[test]
+	fn equix_has_no_browser_solver() {
+		// EquiX must keep the trait-default `None`: a browser can't solve it without WASM,
+		// so a PowChallenge over it degrades rather than serving a mismatched solver.
+		assert!(EquiX::new().interstitial_template().is_none());
 	}
 
 	#[test]

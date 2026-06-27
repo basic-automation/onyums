@@ -37,6 +37,19 @@ pub trait Pow: Send + Sync {
 	fn new_puzzle(&self, difficulty: u32) -> Puzzle;
 	/// Verify a client's solution against a puzzle.
 	fn verify(&self, puzzle: &Puzzle, solution: &[u8]) -> bool;
+	/// The self-contained interstitial HTML that solves a puzzle of *this* algorithm in
+	/// the browser and submits the nonce, or `None` if the algorithm has no in-browser
+	/// solver. The page must contain the `__SEED__`, `__DIFFICULTY__`, `__PUZZLE__`, and
+	/// `__SUBMIT__` placeholders, which [`PowChallenge`] fills in per puzzle.
+	///
+	/// Defaults to `None`: a backend whose solver can't run in a stock Tor Browser — e.g.
+	/// EquiX, which would need WebAssembly (disabled at "Safer"/"Safest") — must *not*
+	/// borrow another algorithm's interstitial, or the browser would compute a solution
+	/// the server can never verify and loop forever. [`Hashcash`] overrides this with a
+	/// dependency-free SHA-256 solver.
+	fn interstitial_template(&self) -> Option<&'static str> {
+		None
+	}
 }
 
 /// Default PoW: SHA-256 hashcash (leading-zero-bits over `seed || solution`).
@@ -80,6 +93,10 @@ impl Pow for Hashcash {
 
 	fn verify(&self, puzzle: &Puzzle, solution: &[u8]) -> bool {
 		leading_zero_bits(&Self::digest(puzzle, solution)) >= puzzle.difficulty
+	}
+
+	fn interstitial_template(&self) -> Option<&'static str> {
+		Some(INTERSTITIAL)
 	}
 }
 
@@ -272,9 +289,15 @@ impl<P: Pow> PowChallenge<P> {
 		Some((Puzzle { seed, difficulty }, expires))
 	}
 
-	/// Render the JS interstitial that solves `puzzle` and submits the nonce.
+	/// Render the JS interstitial that solves `puzzle` and submits the nonce, using the
+	/// backend's own solver page. A backend with no in-browser solver
+	/// ([`Pow::interstitial_template`] is `None`, e.g. EquiX) degrades to a static
+	/// "compatible client required" page rather than serving a mismatched solver.
 	fn interstitial(&self, puzzle: &Puzzle, envelope: &str) -> Response {
-		let body = INTERSTITIAL.replace("__SEED__", &hex(&puzzle.seed)).replace("__DIFFICULTY__", &puzzle.difficulty.to_string()).replace("__PUZZLE__", envelope).replace("__SUBMIT__", &self.submit_path);
+		let Some(template) = self.pow.interstitial_template() else {
+			return (StatusCode::OK, Html(NO_BROWSER_SOLVER.to_owned())).into_response();
+		};
+		let body = template.replace("__SEED__", &hex(&puzzle.seed)).replace("__DIFFICULTY__", &puzzle.difficulty.to_string()).replace("__PUZZLE__", envelope).replace("__SUBMIT__", &self.submit_path);
 		(StatusCode::OK, Html(body)).into_response()
 	}
 }
@@ -341,6 +364,26 @@ fn unix_secs(t: SystemTime) -> u64 {
 fn from_unix_secs(secs: u64) -> SystemTime {
 	UNIX_EPOCH + Duration::from_secs(secs)
 }
+
+/// Fallback interstitial for a [`Pow`] backend with no in-browser solver
+/// ([`Pow::interstitial_template`] returns `None`, e.g. EquiX, which would need WASM —
+/// disabled at Tor "Safer"/"Safest"). It states a compatible client is required rather
+/// than shipping a solver that would loop forever against a mismatched verifier; a
+/// [`ChallengeChain`](crate::challenge::ChallengeChain) is still the route to a working
+/// no-JS fallback.
+const NO_BROWSER_SOLVER: &str = r#"<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proof-of-work required</title>
+</head>
+<body>
+<h1>Proof-of-work required</h1>
+<p>This service is protected by a proof-of-work challenge that this browser cannot solve automatically. A compatible client is required to continue.</p>
+</body>
+</html>
+"#;
 
 /// The no-dependency interstitial: a self-contained SHA-256 hashcash solver in plain JS.
 /// Placeholders (`__SEED__`, `__DIFFICULTY__`, `__PUZZLE__`, `__SUBMIT__`) are filled in
@@ -635,5 +678,59 @@ mod challenge_tests {
 		// A never-seen shape deviates fully → difficulty jumps to the controller max.
 		let novel = Request::builder().uri("/wp-login.php").header("user-agent", "curl/8.4").body(()).unwrap().into_parts().0;
 		assert_eq!(chal.make_puzzle(Some(&novel)).0.difficulty, 18);
+	}
+
+	/// A [`Pow`] backend with no in-browser solver: relies on the trait's default
+	/// `interstitial_template` (`None`). Stands in for EquiX without pulling its feature.
+	struct NoBrowserPow;
+
+	impl Pow for NoBrowserPow {
+		fn new_puzzle(&self, difficulty: u32) -> Puzzle {
+			Puzzle { seed: [0u8; 32], difficulty }
+		}
+
+		fn verify(&self, _puzzle: &Puzzle, _solution: &[u8]) -> bool {
+			false
+		}
+	}
+
+	#[test]
+	fn hashcash_supplies_a_browser_solver() {
+		// The default backend carries a real SHA-256 solver page.
+		let template = Hashcash.interstitial_template().expect("Hashcash has a browser solver");
+		assert!(template.contains("function sha256"), "the Hashcash template embeds its own SHA-256 solver");
+		assert!(NoBrowserPow.interstitial_template().is_none(), "the trait default is no in-browser solver");
+	}
+
+	#[tokio::test]
+	async fn hashcash_interstitial_embeds_the_solver_and_envelope() {
+		use http_body_util::BodyExt;
+
+		let chal = challenge();
+		let Gate::Present(resp) = chal.issue(&parts_with_query("")) else {
+			panic!("PoW challenge must present the interstitial");
+		};
+		let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+		assert!(body.contains("function sha256"), "the issued page carries the hashcash solver");
+		assert!(!body.contains("__SEED__"), "placeholders are filled, not left literal");
+		// The submission route the solver posts back to is wired in.
+		assert!(body.contains("/.skin/pow"));
+	}
+
+	#[tokio::test]
+	async fn backend_without_solver_degrades_to_a_static_page() {
+		use http_body_util::BodyExt;
+
+		// A PoW challenge over a solver-less backend must NOT borrow the hashcash solver
+		// (which the browser could solve but this backend would never verify); it serves
+		// the "compatible client required" fallback instead.
+		let chal = PowChallenge::new(NoBrowserPow, b"sec".to_vec(), 4);
+		let Gate::Present(resp) = chal.issue(&parts_with_query("")) else {
+			panic!("a solver-less PoW challenge still presents a page");
+		};
+		assert_eq!(resp.status(), StatusCode::OK);
+		let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+		assert!(!body.contains("function sha256"), "must not ship a solver the verifier can't honour");
+		assert!(body.contains("compatible client is required"));
 	}
 }

@@ -231,6 +231,15 @@ Request inspection — 100% IP-free, the cleanest Cloudflare carry-over.
   > engine and build a minimal pure-Rust filter front-end (the rule/expression language is the
   > only thing wirefilter adds — signature matching is already covered). The starter ruleset and
   > anomaly-scoring model below do not depend on this choice.
+  >
+  > **Pursuing (c) — AST + evaluator landed (2026-06-28).** `filter::FilterExpr` is a typed
+  > boolean expression tree (`Field` ∈ {method, path, query, header} — the Tor-surviving
+  > dimensions — × `StrOp` ∈ {eq, not_eq, contains, starts/ends_with, regex `Matches`, `Exists`},
+  > combined with `And`/`Or`/`Not`/`Always`/`Never`) evaluated directly against `Parts`. No parser
+  > dependency, no `failure`, no advisory exception — it replaces only wirefilter's *expression*
+  > layer. Absent fields are false except `Exists` (WAF-safe). 9 unit tests. The **string-syntax
+  > parser is the next slice**; this AST is what such a parser targets and what operator-tunable
+  > WAF/edge rule conditions evaluate.
 - A curated starter ruleset (SQLi / XSS / path traversal / OS command injection / SSRF /
   server-side code injection / NoSQL / LDAP / XXE / protocol anomalies); not OWASP-CRS-complete
   at first, but extensible with custom rules, per-rule/category disabling, and operator-tunable
@@ -282,8 +291,33 @@ The research-grade, Tor-specific bets — none have prior art in this environmen
   > WASM); `Hashcash` remains the JS-interactive default.
 - **Multi-instance coordination** — share a clearance-signing secret across Onionbalance backends so
   a token minted at one backend is honored at another.
+  > **Implemented (2026-06-28).** `HmacClearanceStore::derived(secret, context)` derives the
+  > signing key as `HMAC-SHA256(secret, "onyums-skin/clearance-signing/v1" ‖ context)`, so every
+  > backend configured with the same passphrase + context produces the identical 256-bit key and
+  > honors each other's tokens — no raw-key distribution, domain-separated by context.
+  > `with_verify_key` adds verify-only keys so a backend mints under a new secret while still
+  > accepting tokens from fleet members on a previous one (zero-downtime rotation); `verify` tries
+  > the primary then each extra key, and still rejects an unrelated secret. Pure `hmac`+`sha2`, no
+  > new dependency. 5 unit tests (cross-honoring, context separation, rotation accept, mint-under-
+  > primary, unknown-key-still-rejected).
 - **Edge-rules & caching** — local response cache and transform/redirect middleware (low effort;
   onyums already ships the HTTP→HTTPS upgrade as one such rule).
+  > **Transform/redirect half implemented (2026-06-28).** `edge::EdgeRules` is an ordered
+  > match→action engine (`EdgeMatch`: path/prefix/method/host/header + All/AnyOf combinators +
+  > `Expr(FilterExpr)` for the full filter language;
+  > `EdgeAction`: redirect / block / set-or-remove response header) evaluated to a decision-only
+  > `EdgeDecision` ahead of the gate — pure request logic, no IP signals, fully offline-testable.
+  > `EdgeRules::https_upgrade()` expresses the canonical HTTP→HTTPS upgrade as one rule (the host
+  > installs it on its plaintext listener, since Skin sees no scheme in `Parts`).
+  > **Response cache half implemented (2026-06-28).** `cache::ResponseCache` is a bounded,
+  > TTL-expiring in-process cache keyed on `(method, host, path+query)` — pure request logic, no
+  > IP — over the crate's injectable `Clock` (deterministic expiry tests). Only `GET`/`HEAD` are
+  > cacheable; `cache_control_ttl` reads the origin `Cache-Control` so `no-store`/`no-cache`/
+  > `private` is never cached and `max-age` is honoured; a full cache purges expired entries then
+  > evicts the nearest-to-expiry one. Over an onion service this is a latency win (a rendezvous
+  > round-trip is expensive), not the bandwidth/CDN win Skin's non-goals exclude. **The Phase 5
+  > edge-rules & caching item is now implemented** (both halves); wiring either into `SkinLayer`
+  > is a follow-up host-integration slice.
 
 ---
 

@@ -7,6 +7,109 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-28 — onyums-skin Phase 5 frontier: edge-rules + caching, multi-instance coordination, WAF filter front-end (5 increments)
+
+Branch `routine/onyums-2026-06-28` → PR
+[#20](https://github.com/basic-automation/onyums/pull/20) (base `master`).
+**Crate alternation:** the previous run (2026-06-27 run 2, PR
+[#19](https://github.com/basic-automation/onyums/pull/19)) advanced the **onyums server**
+(Phase 1 QR + Phase 3 TLS), so per the alternation rule this run targets **onyums-skin**.
+(Master's newest *merged* progress entry is the 2026-06-27 onyums-skin EquiX run, PR #18, but
+the genuinely most-recent run is the onyums #19 branch — so skin is owed this run.) All five
+increments are pure Rust, no live-Tor path, fully unit-testable offline, and clear most of the
+remaining **onyums-skin ROADMAP Phase 5 frontier** queue: edge-rules & caching, multi-instance
+coordination, and the documented resolution to the `wirefilter` Phase-3 blocker. Branched
+cleanly from `master`.
+
+**Increment 1 — edge-rules engine (transform/redirect half).** *Phase 5, "Edge-rules &
+caching".* Files: `src/edge.rs` (new), `src/lib.rs`, `crates/onyums-skin/ROADMAP.md`. Edge
+rules are pure request logic — the cleanest Cloudflare carry-over — so they port to Tor with no
+IP signal and run ahead of the gate (a redirect/block never mints a clearance). `EdgeRules` is
+an ordered list of `EdgeRule`s (`EdgeMatch` + `EdgeAction`): matchers Any/Path/PathPrefix/
+Method/Host/HeaderPresent/HeaderEquals + All/AnyOf (Host reads URI authority then Host header,
+case-insensitive — the onion address); actions Redirect (`{host}`/`{path}`/`{path_and_query}`
+template) / Block / SetHeader / RemoveHeader. `evaluate` returns a decision-only `EdgeDecision`
+(first redirect/block short-circuits; header transforms accumulate into `Forward`), mirroring
+`Gate`/`CircuitAction` so it is offline-testable; `into_response`/`apply_response_headers`
+apply it. `EdgeRules::https_upgrade()` expresses the canonical HTTP→HTTPS upgrade as one rule
+(host installs on its plaintext listener; Skin sees no scheme in `Parts`). **13 unit tests.**
+
+**Increment 2 — local response cache (caching half).** *Phase 5, "Edge-rules & caching".*
+Files: `src/cache.rs` (new), `src/lib.rs`, `ROADMAP.md`. `ResponseCache` is a bounded,
+TTL-expiring `Mutex<HashMap>` keyed on `(method, host, path+query)` — pure request logic, no IP
+— generic over the crate's injectable `Clock` for deterministic expiry tests (reusing
+`ManualClock`). `CacheKey::from_parts` lowercases the host; `CachedResponse` rebuilds an axum
+`Response`. `store` declines zero-capacity / zero-TTL / non-cacheable methods (only GET/HEAD),
+refreshing a key never counts against capacity, and a full cache purges expired then evicts the
+nearest-to-expiry entry; `get` drops a stale entry on miss; `cache_control_ttl` reads the origin
+`Cache-Control` (`no-store`/`no-cache`/`private` → never cache; positive `max-age` honoured). A
+latency win over a rendezvous round-trip, not the CDN win Skin's non-goals exclude. **11 unit
+tests.** *Both halves of the Phase 5 edge-rules & caching item are now implemented.*
+
+**Increment 3 — multi-instance clearance coordination.** *Phase 5, "Multi-instance
+coordination".* Files: `src/clearance.rs`, `ROADMAP.md`. Because `HmacClearanceStore` keeps no
+state, an Onionbalance fleet honors each other's tokens by sharing a signing key.
+`HmacClearanceStore::derived(secret, context)` derives the key as `HMAC-SHA256(secret,
+"onyums-skin/clearance-signing/v1" ‖ context)` — deterministic + domain-separated, so backends
+distribute a config passphrase, not a raw 32-byte key. `with_verify_key` adds verify-only keys
+so a backend mints under a new secret while still accepting tokens from members on a previous
+one (zero-downtime rotation); `verify` checks the primary then each extra key (constant-time per
+key) and still rejects an unrelated secret. Pure `hmac`+`sha2`, **no new dependency**. **5 unit
+tests.**
+
+**Increment 4 — minimal filter-expression front-end.** *Phase 3 WAF, resolution path (c) for
+the `wirefilter` supply-chain blocker.* Files: `src/filter.rs` (new), `src/lib.rs`, `ROADMAP.md`.
+Rather than vendor-fork `wirefilter-engine` (drags unmaintained `failure`, RUSTSEC-2020-0036) or
+take an advisory exception, this is the in-house front-end: signature matching is already covered
+by the WAF's regex/aho-corasick, so only wirefilter's *expression* layer is needed, and that is a
+typed AST + recursive evaluator with no parser dependency. `FilterExpr` is a boolean tree over
+Tor-surviving fields (`Field` ∈ method/path/query/header × `StrOp` ∈ eq/not_eq/contains/starts/
+ends_with/regex `Matches`/`Exists`) combined with And/Or/Not (`std::ops::Not` → `!expr`)/Always/
+Never, evaluated against `Parts`. Absent fields are false except `Exists` (WAF-safe); the
+"absent-or-not-x" idiom is documented. Pure `regex` (already a dep). **9 unit tests.** The
+string-syntax parser is the next slice — this AST is its target.
+
+**Increment 5 — `EdgeMatch::Expr` integration.** *Phase 5 edge-rules × Phase 3 filter.* Files:
+`src/edge.rs`, `ROADMAP.md`. Wired `FilterExpr` into `EdgeMatch` as an `Expr` variant so an edge
+rule's condition can be any filter expression (regex, contains, query/header predicates), not
+just the dedicated matchers — making the filter front-end immediately useful to the edge engine.
+`EdgeMatch::matches` delegates to `FilterExpr::evaluate`. **1 unit test.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (27.09s incremental; one pre-existing transitive-dep
+  future-incompat note for `proc-macro-error2`, not from our code — same as prior runs).
+- `cargo test -p onyums-skin`: **270 passed; 0 failed; 0 ignored** (final; baseline at run start
+  was 232 + 1 doctest). Net +38 unit tests (13+11+5+9+1, less one that supersedes none). Doctest:
+  **1 passed**.
+- `cargo clippy -p onyums-skin --all-targets`: **no warnings** (fixed two directly along the way —
+  a needless `&` on the left operand, and `not` confusable-with-trait resolved by implementing
+  `std::ops::Not` — never `#[allow]`).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design; nothing
+  this run touched the live-serve path.
+
+### Done vs. open (onyums-skin Phase 5)
+- DONE this run: edge-rules & caching (both halves); multi-instance coordination; the
+  filter-expression AST/evaluator (wirefilter blocker resolution path c, AST slice).
+- OPEN: the filter **string-syntax parser** (next slice — tokenizer + Pratt/recursive-descent
+  targeting `FilterExpr`); **restricted-discovery orchestration** (bridges Arti client-auth into
+  Skin policy — needs Arti types and is host-integration, a poor offline-verifiable fit for a skin
+  run); wiring `EdgeRules`/`ResponseCache` into `SkinLayer` (host-integration slice).
+- NOT a skin concern: onyums server Phases 1/3/4 (the other crate; advanced last run, PR #19).
+
+**STOP REASON:** Landed 5 verifiable increments (above the 2–4 bar) forming one coherent arc that
+clears most of the Phase-5 frontier queue. The remaining skin items are either a fresh larger
+piece better isolated as its own increment (the filter string parser), or host-integration that
+is not offline-verifiable on a skin run (restricted-discovery needs Arti; `SkinLayer` wiring hits
+the live-serve path). Workspace is green; every increment is committed and nothing is half-landed.
+
+**NEXT STEP:** *(skin, when alternation next allows)* Build the filter **string-syntax parser** —
+a tokenizer + recursive-descent/Pratt parser producing `FilterExpr` from an operator-authored
+rule string (e.g. `method eq "POST" and path ~ "^/admin"`), so WAF/edge rules become config-
+driven. *(onyums, next run by alternation)* Continue the server roadmap (Phase 1 identity / Phase
+3 handlers) per its own progress tail.
+
+---
+
 ## 2026-06-27 (run 2) — onyums server Phase 1 QR + Phase 3 TLS-first strict mode (4 increments)
 
 Branch `routine/onyums-2026-06-27-2` → PR

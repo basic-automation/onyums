@@ -7,6 +7,120 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-27 (run 2) — onyums server Phase 1 QR + Phase 3 TLS-first strict mode (4 increments)
+
+Branch `routine/onyums-2026-06-27-2` → PR (base `master`). **Crate alternation:**
+the previous run (2026-06-27, PR
+[#18](https://github.com/basic-automation/onyums/pull/18)) advanced **onyums-skin**
+(Phase 5 EquiX), so per the never-twice-in-a-row rule this run targets the **onyums
+server**. It closes the last offline-verifiable item of Phase 1 (identity) and opens
+Phase 3 (TLS-first transport) with a complete `Tls::Strict` slice — all pure-Rust,
+unit-tested with no live Tor. Workspace stayed green and clippy-clean throughout.
+(Same-day rerun of the routine, hence the `-2` branch suffix; the earlier 2026-06-27
+run was the skin EquiX one.)
+
+**Increment 1 — QR-code emission for the address.** *onyums Phase 1, "Address
+helpers — typed `OnionAddress`, QR / `Onion-Location` header emission".* Files:
+`Cargo.toml`, `Cargo.lock`, `src/lib.rs`. Added `OnionAddress::qr_svg()` (a
+standalone `<svg>` document string) and `qr_terminal()` (Unicode half-block art via
+`unicode::Dense1x2`), both encoding `https_url()` so a Tor Browser user can scan the
+address instead of typing 56 base32 characters. New pure-Rust workspace dep `qrcode`
+0.14.1 with `default-features = false` — the heavy `image` raster renderer is
+disabled, leaving only the always-available unicode renderer and the pure-string
+`svg` renderer; `cargo tree` confirms no `image`/`png` pulled, no FFI. Added `#
+Panics` docs (the encode `.expect()` is unreachable for a fixed-shape onion URL) to
+clear `clippy::missing_panics_doc`. **3 unit tests** (well-formed SVG; deterministic
++ address-sensitive encoding; multi-line terminal art). This finishes the
+offline-verifiable Phase 1 identity helpers.
+
+**Increment 2 — `Tls` mode + strict HSTS enforcement.** *onyums Phase 3, "TLS-first,
+with optional strict enforcement".* Files: `src/lib.rs`, `src/tls_policy.rs` (new).
+Added a `Tls` transport-mode knob to the builder (`.tls(Tls::Strict)`): `Tls::Upgrade`
+(default, today's self-signed + port-80→HTTPS redirect) vs `Tls::Strict` (HTTPS
+responses carry an HSTS header so a conforming client never silently downgrades). New
+pure `tls_policy` module mirrors the `circuit_gate` pattern — the transport decision
+factored into offline-testable data + helpers (`Tls`, HSTS constants,
+`hsts_header()`). HSTS is applied via `apply_hsts()`, a plain `Router` transform (an
+`axum::middleware::map_response` layer) testable with `tower::ServiceExt::oneshot`,
+no live Tor. The directive is `max-age=63072000; includeSubDomains` (no `preload` —
+it does not apply to a `.onion` host). **6 unit tests** (3 in `tls_policy`: default
+mode, HSTS gating, well-formed directive; 3 in lib: strict adds / upgrade omits the
+header via oneshot; builder defaults to Upgrade).
+
+**Increment 3 — strict mode rejects plaintext port 80 in the serve path.** *onyums
+Phase 3, same item.* Files: `src/lib.rs`, `src/tls_policy.rs`. Added
+`tls_policy::port_action(port, tls) -> PortAction` (`ServeTls` for 443 in any mode;
+`RedirectToHttps` for 80 under Upgrade only; `Reject` for 80 under Strict and every
+non-HTTP port) and threaded `Tls` through the rendezvous loop (`serve_circuits` →
+`handle_circuit_streams` → `handle_stream_request`), replacing the inline port match
+with `port_action`. Under `Tls::Strict` the port-80 arm resolves to `Reject`, so
+there is no plaintext redirect handler at all — plaintext circuits are torn down
+rather than answered. The decision is unit-tested offline; the live loop only
+executes it. **3 unit tests** (443 always TLS; 80 upgrades-or-rejects by mode;
+non-HTTP ports always rejected).
+
+**Increment 4 — document the TLS opt-down + address helpers.** *Cross-cutting DX,
+"document the secure defaults loudly … make the opt-downs explicit and visible".*
+Files: `README.md`. New "TLS-first transport" section (Upgrade vs Strict, framed as
+an opt *down* in client tolerance — TLS is always on) and "Address helpers" section
+(`OnionAddress` URL helpers, `onion_location_header()`, the new QR emitters, the
+validating `parse`, vanity mining); `.tls(Tls::Strict)` added to the opt-down list in
+the Skin example. Docs-only — `src/` does not `include_str!` the README, so the code
+blocks are not compiled (verified); examples were checked against the public API by
+hand. No new tests.
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each code increment; the
+  one pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not
+  ours).
+- `cargo test -p onyums --lib -- --skip test_serve`: **43 passed; 0 failed; 0
+  ignored** (1 filtered out = `test_serve`). Up from 31 at run start (12 new tests:
+  3 QR + 6 TLS/HSTS + 3 `port_action`).
+- `cargo test -p onyums-skin` (sanity, untouched this run): **232 passed; 0 failed**
+  + **1 doctest passed** — no regression.
+- `cargo clippy --workspace --all-targets`: **0 warnings** (two `missing_panics_doc`
+  on the QR helpers fixed directly with `# Panics` sections; no `#[allow]` added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by
+  design.
+
+### Done vs. open
+- **onyums Phase 1 (stable identity):** the **offline-verifiable helpers are now
+  complete** — vanity mining (single + parallel), typed `OnionAddress::parse`, URL /
+  `Onion-Location` helpers, BYO-key address derivation (prior runs) **plus QR
+  emission (this run).** OPEN (live-Tor): keystore placement of a mined/BYO key so
+  the launched service serves that address; `.ephemeral()` opt-down. These touch the
+  serve/keystore path this routine cannot runtime-verify.
+- **onyums Phase 3 (TLS-first): STARTED.** DONE (offline): the `Tls::Upgrade` /
+  `Tls::Strict` mode, `.tls()` builder, HSTS emission, and strict-mode plaintext
+  rejection via the pure `port_action` decision (wired into the live loop, which is
+  not runtime-verified). OPEN: **`Tls::Provided` BYO cert** (CA-signed `.onion`
+  certs — needs an enum redesign because a cert payload is non-`Copy`, plus a
+  decision on its plaintext semantics); the `StreamHandler` trait + arbitrary
+  port→handler mapping; single-onion-service mode.
+- OPEN (onyums Phase 2, carried): drive `AccountingCircuitPolicy` from
+  `handle_stream_request`; **Under Attack Mode** builder toggle; feed Skin's
+  adaptive-difficulty signal. (Circuit-id prerequisite satisfied; unblocked.)
+- NOT STARTED: onyums Phase 4 (observability/multi-service).
+
+**STOP REASON:** Landed 4 verifiable increments (top of the 2–4 bar) — a cohesive
+Phase-3 strict-TLS arc plus the Phase-1 QR closer, all pure-Rust and unit-tested
+offline. The remaining workable onyums items each need a **deliberate design
+decision** rather than a rushed late increment: `Tls::Provided` requires reworking
+the `Tls` enum to carry a non-`Copy` cert payload (and a call on its plaintext
+behaviour); the `StreamHandler` trait is a Phase-3 surface design; Under Attack Mode
+and the `CircuitPolicy` drive sit on the live circuit path. Per crate alternation
+this was an onyums run; the next run is owed **onyums-skin**. Everything is green,
+clippy-clean, and nothing is half-landed.
+
+**NEXT STEP (onyums, for a later run):** Implement `Tls::Provided(cert)` — split the
+loop-threaded transport concern into a small `Copy` plaintext-policy so the `Tls`
+enum can carry the (non-`Copy`) cert/key, have `tls_acceptor` use the provided cert
+instead of generating a self-signed one, and decide port-80 behaviour for BYO mode;
+unit-test the acceptor build offline. Then the `StreamHandler` trait surface
+(arbitrary port→handler) and the Phase-2 Under Attack Mode / `CircuitPolicy` drive.
+
+---
+
 ## 2026-06-27 — onyums-skin Phase 5 frontier: opt-in EquiX proof-of-work backend (4 increments)
 
 Branch `routine/onyums-2026-06-27` → PR

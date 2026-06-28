@@ -231,6 +231,15 @@ Request inspection — 100% IP-free, the cleanest Cloudflare carry-over.
   > engine and build a minimal pure-Rust filter front-end (the rule/expression language is the
   > only thing wirefilter adds — signature matching is already covered). The starter ruleset and
   > anomaly-scoring model below do not depend on this choice.
+  >
+  > **Pursuing (c) — AST + evaluator landed (2026-06-28).** `filter::FilterExpr` is a typed
+  > boolean expression tree (`Field` ∈ {method, path, query, header} — the Tor-surviving
+  > dimensions — × `StrOp` ∈ {eq, not_eq, contains, starts/ends_with, regex `Matches`, `Exists`},
+  > combined with `And`/`Or`/`Not`/`Always`/`Never`) evaluated directly against `Parts`. No parser
+  > dependency, no `failure`, no advisory exception — it replaces only wirefilter's *expression*
+  > layer. Absent fields are false except `Exists` (WAF-safe). 9 unit tests. The **string-syntax
+  > parser is the next slice**; this AST is what such a parser targets and what operator-tunable
+  > WAF/edge rule conditions evaluate.
 - A curated starter ruleset (SQLi / XSS / path traversal / OS command injection / SSRF /
   server-side code injection / NoSQL / LDAP / XXE / protocol anomalies); not OWASP-CRS-complete
   at first, but extensible with custom rules, per-rule/category disabling, and operator-tunable

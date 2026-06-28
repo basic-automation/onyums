@@ -48,6 +48,7 @@ pub mod circuit;
 pub mod clearance;
 pub mod difficulty;
 pub mod edge;
+pub mod filter;
 pub mod fingerprint;
 pub mod layer;
 pub mod observe;
@@ -71,6 +72,7 @@ pub use circuit::{
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
 pub use difficulty::{AdaptiveDifficulty, BotDifficulty, ShapeDifficulty};
 pub use edge::{apply_response_headers, render_location, EdgeAction, EdgeDecision, EdgeMatch, EdgeRule, EdgeRules, HeaderMutation};
+pub use filter::{all, any, Field, FilterExpr, StrOp};
 pub use fingerprint::Ja4hFingerprint;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};

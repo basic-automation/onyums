@@ -137,6 +137,45 @@ impl OnionAddress {
 	pub fn onion_location_header(&self) -> (&'static str, String) {
 		("onion-location", self.onion_location())
 	}
+
+	/// Render a scannable QR code of the service's canonical HTTPS URL as a
+	/// standalone SVG document string.
+	///
+	/// The QR encodes [`Self::https_url`] — the URL a client should actually open
+	/// — so a Tor Browser user can scan it instead of typing 56 base32 characters
+	/// by hand. The output is pure text (an `<svg>` document); onyums pulls in no
+	/// raster-image dependency for this (`qrcode` is built with its `image`
+	/// renderer disabled), keeping the tree pure Rust.
+	///
+	/// # Panics
+	/// Never in practice: the encoded data is a fixed-shape onion URL (~70 bytes),
+	/// far below the smallest QR version's capacity, so encoding cannot fail.
+	#[must_use]
+	pub fn qr_svg(&self) -> String {
+		use qrcode::{render::svg, QrCode};
+		// The encoded data is a fixed-shape onion URL (~70 bytes), far below the
+		// capacity of even the smallest QR version, so construction cannot fail.
+		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
+		code.render::<svg::Color>().min_dimensions(256, 256).quiet_zone(true).build()
+	}
+
+	/// Render a scannable QR code of the service's canonical HTTPS URL as Unicode
+	/// text suitable for printing to a terminal.
+	///
+	/// Like [`Self::qr_svg`] but rendered with half-block characters
+	/// (`unicode::Dense1x2`), so an operator can print the address as a QR code
+	/// straight to the console — e.g. right after the service reports ready. Each
+	/// QR row maps to one line of output.
+	///
+	/// # Panics
+	/// Never in practice, for the same reason as [`Self::qr_svg`]: an onion URL
+	/// always fits in a QR code.
+	#[must_use]
+	pub fn qr_terminal(&self) -> String {
+		use qrcode::{render::unicode, QrCode};
+		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
+		code.render::<unicode::Dense1x2>().quiet_zone(true).build()
+	}
 }
 
 impl std::fmt::Display for OnionAddress {
@@ -744,6 +783,39 @@ mod tests {
 		let (name, value) = address.onion_location_header();
 		assert_eq!(name, "onion-location");
 		assert_eq!(value, "https://abcdef.onion/");
+	}
+
+	#[test]
+	fn qr_svg_is_a_wellformed_svg_document() {
+		let address = OnionAddress::normalized("abcdef");
+		let svg = address.qr_svg();
+		assert!(svg.starts_with("<?xml") || svg.starts_with("<svg"), "should be an SVG document, got: {}", &svg[..svg.len().min(40)]);
+		assert!(svg.contains("<svg"), "missing <svg> element");
+		assert!(svg.contains("</svg>"), "missing closing </svg>");
+		// A real QR renders dark modules as filled rects/paths — a blank/degenerate
+		// document would have none.
+		assert!(svg.contains("path") || svg.contains("rect"), "SVG has no QR modules");
+	}
+
+	#[test]
+	fn qr_encoding_is_deterministic_and_address_sensitive() {
+		let a = OnionAddress::normalized("abcdef");
+		let b = OnionAddress::normalized("ghijkl");
+		// Deterministic: same address → identical QR (encoding has no randomness).
+		assert_eq!(a.qr_svg(), a.qr_svg());
+		assert_eq!(a.qr_terminal(), a.qr_terminal());
+		// Address-sensitive: a different URL is encoded into a different QR.
+		assert_ne!(a.qr_svg(), b.qr_svg());
+		assert_ne!(a.qr_terminal(), b.qr_terminal());
+	}
+
+	#[test]
+	fn qr_terminal_is_multiline_block_art() {
+		let address = OnionAddress::normalized("abcdef");
+		let term = address.qr_terminal();
+		assert!(!term.is_empty(), "terminal QR must not be empty");
+		// Dense1x2 emits one line per two QR rows; a real code is many lines tall.
+		assert!(term.lines().count() > 5, "terminal QR should span multiple lines");
 	}
 
 	#[tokio::test]

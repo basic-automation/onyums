@@ -284,6 +284,13 @@ The research-grade, Tor-specific bets — none have prior art in this environmen
   a token minted at one backend is honored at another.
 - **Edge-rules & caching** — local response cache and transform/redirect middleware (low effort;
   onyums already ships the HTTP→HTTPS upgrade as one such rule).
+  > **Transform/redirect half implemented (2026-06-28).** `edge::EdgeRules` is an ordered
+  > match→action engine (`EdgeMatch`: path/prefix/method/host/header + All/AnyOf combinators;
+  > `EdgeAction`: redirect / block / set-or-remove response header) evaluated to a decision-only
+  > `EdgeDecision` ahead of the gate — pure request logic, no IP signals, fully offline-testable.
+  > `EdgeRules::https_upgrade()` expresses the canonical HTTP→HTTPS upgrade as one rule (the host
+  > installs it on its plaintext listener, since Skin sees no scheme in `Parts`). **Remaining: the
+  > local response cache half.**
 
 ---
 

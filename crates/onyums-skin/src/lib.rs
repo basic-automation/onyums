@@ -27,9 +27,11 @@
 //! - **Phase 5 — frontier (in progress).** JA4H-style HTTP request fingerprinting
 //!   ([`Ja4hFingerprint`]) — a cluster/identify key over the request shape that survives
 //!   the loss of IP and TLS — heuristic request-shape bot detection ([`BotHeuristics`],
-//!   the only Cloudflare bot signal that survives Tor), and an opt-in EquiX PoW backend
+//!   the only Cloudflare bot signal that survives Tor), an opt-in EquiX PoW backend
 //!   (Tor's own Equi-X puzzle via the pure-Rust `equix` crate, behind the LGPL-gated
-//!   `equix` feature; `Hashcash` remains the default `Pow`).
+//!   `equix` feature; `Hashcash` remains the default `Pow`), and pure-request-logic
+//!   [`EdgeRules`] (match → redirect / block / header-transform, ahead of the gate; the
+//!   HTTP→HTTPS upgrade expressed as one rule).
 //!
 //! The remaining Phase 5 work (a `wirefilter` rule-expression front-end,
 //! restricted-discovery orchestration, multi-instance clearance coordination) is tracked
@@ -44,6 +46,7 @@ pub mod challenge;
 pub mod circuit;
 pub mod clearance;
 pub mod difficulty;
+pub mod edge;
 pub mod fingerprint;
 pub mod layer;
 pub mod observe;
@@ -65,6 +68,7 @@ pub use circuit::{
 };
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
 pub use difficulty::{AdaptiveDifficulty, BotDifficulty, ShapeDifficulty};
+pub use edge::{apply_response_headers, render_location, EdgeAction, EdgeDecision, EdgeMatch, EdgeRule, EdgeRules, HeaderMutation};
 pub use fingerprint::Ja4hFingerprint;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};

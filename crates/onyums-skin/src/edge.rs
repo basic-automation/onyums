@@ -69,6 +69,10 @@ pub enum EdgeMatch {
 	All(Vec<EdgeMatch>),
 	/// At least one sub-matcher matches (logical OR). Empty → does not match.
 	AnyOf(Vec<EdgeMatch>),
+	/// The request satisfies a [filter expression](crate::filter::FilterExpr) — the full
+	/// boolean/comparison language (regex, contains, query/header predicates) for conditions
+	/// richer than the dedicated variants above.
+	Expr(crate::filter::FilterExpr),
 }
 
 impl EdgeMatch {
@@ -85,6 +89,7 @@ impl EdgeMatch {
 			EdgeMatch::HeaderEquals(name, want) => parts.headers.get(name).is_some_and(|v| v.as_bytes() == want.as_bytes()),
 			EdgeMatch::All(subs) => subs.iter().all(|s| s.matches(parts)),
 			EdgeMatch::AnyOf(subs) => subs.iter().any(|s| s.matches(parts)),
+			EdgeMatch::Expr(expr) => expr.evaluate(parts),
 		}
 	}
 }
@@ -387,6 +392,23 @@ mod tests {
 		let equals = EdgeMatch::HeaderEquals(HeaderName::from_static("x-flag"), "on".into());
 		assert!(equals.matches(&parts(Request::builder().uri("/").header("x-flag", "on"))));
 		assert!(!equals.matches(&parts(Request::builder().uri("/").header("x-flag", "off"))));
+	}
+
+	#[test]
+	fn expr_matcher_uses_the_full_filter_language() {
+		use crate::filter::Field;
+		// A condition richer than the dedicated variants: POST whose query contains `debug`.
+		let rules = EdgeRules::new().push(
+			EdgeMatch::Expr(Field::method().eq("POST").and(Field::query().contains("debug"))),
+			EdgeAction::Block(StatusCode::FORBIDDEN),
+		);
+		assert!(rules.evaluate(&parts(Request::builder().method("POST").uri("/x?debug=1"))).is_short_circuit());
+		assert!(!rules.evaluate(&parts(Request::builder().method("POST").uri("/x?ok=1"))).is_short_circuit());
+		assert!(!rules.evaluate(&parts(Request::builder().method("GET").uri("/x?debug=1"))).is_short_circuit());
+		// A regex predicate is reachable too.
+		let regex_rule = EdgeRules::new().push(EdgeMatch::Expr(Field::path().matches(r"^/item/\d+$").unwrap()), EdgeAction::Block(StatusCode::NOT_FOUND));
+		assert!(regex_rule.evaluate(&parts(Request::builder().uri("/item/42"))).is_short_circuit());
+		assert!(!regex_rule.evaluate(&parts(Request::builder().uri("/item/abc"))).is_short_circuit());
 	}
 
 	#[test]

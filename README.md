@@ -80,6 +80,7 @@ async fn main() {
 		// The secure-default gate is ALREADY ON. Use these only to tune or relax it:
 		// .skin(Skin::secure_default())        // tune via Skin::builder() (difficulty, store, WAF, ...)
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits & Under-Attack mode
+		// .tls(Tls::Strict)                     // make TLS non-negotiable (reject plaintext, emit HSTS)
 		// .no_skin()                            // opt out of the gate entirely
 		.serve()
 		.await
@@ -92,6 +93,62 @@ async fn main() {
 ```
 
 The full Skin API (clearance tokens, the challenge chain, the WAF, per-circuit `CircuitPolicy`, adaptive difficulty, and security metrics/events) is re-exported under `onyums::onyums_skin`. The design and roadmap live in [`crates/onyums-skin/ROADMAP.md`](crates/onyums-skin/ROADMAP.md).
+
+****
+
+## TLS-first transport
+
+Onyums treats encrypted, certificate-authenticated transport as the standard, never as optional cruft to strip away — even though Tor already encrypts the channel, end-to-end TLS adds independent cryptographic authentication and unlocks the browser **secure-context** semantics real apps depend on (WebCrypto, service workers, `Secure` / `__Host-` cookies, HTTP/2, no mixed-content downgrades). The knob is *how strictly* TLS is enforced, never whether it is on:
+
+- **`Tls::Upgrade` (default)** — an auto-generated self-signed cert, and plaintext HTTP on port 80 is transparently redirected (`301`) to HTTPS. A client that arrives over plain HTTP is pointed at the secure URL rather than refused.
+- **`Tls::Strict`** — TLS is non-negotiable. Plaintext circuits are **rejected outright** (there is no port-80 redirect handler at all), and every HTTPS response carries an `Strict-Transport-Security` header (`max-age=63072000; includeSubDomains`) so a conforming client never silently downgrades.
+
+```rust
+use onyums::{OnionService, Tls, routing::get, Router};
+
+#[tokio::main]
+async fn main() {
+	let app = Router::new().route("/", get(|| async { "Hello, World!" }));
+
+	let handle = OnionService::builder()
+		.router(app)
+		.nickname("my_onion")
+		.tls(Tls::Strict) // opt DOWN in client tolerance — TLS is always on
+		.serve()
+		.await
+		.unwrap();
+
+	println!("Onion Address: {}", handle.onion_address());
+	handle.ready().await;
+	handle.shutdown().await;
+}
+```
+
+`.tls(Tls::Strict)` is an explicit opt **down** in client tolerance, never an opt *up* into TLS: TLS is on in every mode.
+
+****
+
+## Address helpers
+
+`handle.onion_address()` returns a typed `OnionAddress`, not a bare string, with the helpers an onion app actually needs:
+
+```rust
+use onyums::OnionAddress;
+
+let address = OnionAddress::normalized("examplehostname");
+
+assert_eq!(address.https_url(), "https://examplehostname.onion/");
+
+// `Onion-Location` header pair, for a clearnet site advertising its onion:
+let (name, value) = address.onion_location_header();
+assert_eq!(name, "onion-location");
+
+// A scannable QR of the HTTPS URL — print it to a terminal, or embed the SVG.
+let _terminal_qr = address.qr_terminal(); // Unicode half-block art
+let _svg_qr = address.qr_svg();           // standalone <svg> document
+```
+
+`OnionAddress::parse` is the validating constructor for operator- or user-supplied strings (it round-trips through arti's own v3 address parser — length, base32 alphabet, checksum, and version are all checked). Vanity-address mining (`onyums::mine` / `mine_parallel`) generates keys until the derived address matches a desired prefix, parallelized across cores.
 
 ****
 

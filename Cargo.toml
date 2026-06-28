@@ -20,6 +20,11 @@ tor-cert = "0.43.0"
 # from a candidate ed25519 key (no second, divergent encoding). Pure Rust.
 tor-llcrypto = "0.43.0"
 tor-hscrypto = "0.43.0"
+# Phase 1 identity — pure-Rust QR encoding for the `.onion` address (terminal +
+# SVG renderers). `default-features = false` drops the `image` renderer (and its
+# heavy `image`/`png` tree); only the always-available unicode renderer and the
+# pure-string `svg` renderer are kept. No FFI.
+qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
 tokio = { version = "1.52.3", features = ["full"] }
 tokio-util = { version = "0.7.13", default-features = false }
 axum = { version = "0.8.9", features = ["http2"] }
@@ -76,6 +81,7 @@ tor-rtcompat = { workspace = true }
 tor-cert = { workspace = true }
 tor-llcrypto = { workspace = true }
 tor-hscrypto = { workspace = true }
+qrcode = { workspace = true }
 rand = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }

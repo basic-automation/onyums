@@ -45,7 +45,9 @@ pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
+mod tls_policy;
 mod vanity;
+pub use tls_policy::Tls;
 pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};
 
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
@@ -432,6 +434,22 @@ fn apply_skin(app: Router, skin: SkinChoice) -> Router {
 	}
 }
 
+/// Add the HSTS response header to every served response when the [`Tls`] mode
+/// enforces it ([`Tls::Strict`]), so a conforming client never silently
+/// downgrades from HTTPS. A no-op under [`Tls::Upgrade`].
+///
+/// Like [`apply_skin`], this is a plain `Router` transform so it is testable with
+/// `tower::ServiceExt::oneshot` and no live Tor network.
+fn apply_hsts(app: Router, tls: Tls) -> Router {
+	match tls_policy::hsts_header(tls) {
+		Some((name, value)) => app.layer(axum::middleware::map_response(move |mut response: axum::response::Response| async move {
+			response.headers_mut().insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value));
+			response
+		})),
+		None => app,
+	}
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -441,6 +459,7 @@ pub struct OnionServiceBuilder {
 	router: Option<Router>,
 	nickname: Option<String>,
 	skin: SkinChoice,
+	tls: Tls,
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
 }
 
@@ -467,6 +486,19 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub fn skin(mut self, skin: Skin) -> Self {
 		self.skin = SkinChoice::Custom(Box::new(skin));
+		self
+	}
+
+	/// Set the TLS transport posture (onyums ROADMAP Phase 3).
+	///
+	/// Defaults to [`Tls::Upgrade`] — auto self-signed cert with plaintext HTTP
+	/// (port 80) transparently redirected to HTTPS. Pass [`Tls::Strict`] to make
+	/// TLS non-negotiable: plaintext circuits are rejected outright (no port-80
+	/// handler) and HTTPS responses carry an HSTS header. This is an explicit opt
+	/// *down* in client tolerance, never an opt *up* into TLS — TLS is always on.
+	#[must_use]
+	pub const fn tls(mut self, tls: Tls) -> Self {
+		self.tls = tls;
 		self
 	}
 
@@ -518,6 +550,12 @@ impl OnionServiceBuilder {
 		// with `no_skin`. `Router::layer` keeps the `Router` type, so the rest of the
 		// serve path is unchanged.
 		let app = apply_skin(app, self.skin);
+
+		// Phase 3 TLS-first: in strict mode every HTTPS response carries an HSTS
+		// header so a conforming client never silently downgrades. A no-op under
+		// the default `Tls::Upgrade`. (The strict-mode port-80 rejection is applied
+		// in the rendezvous loop's port dispatch.)
+		let app = apply_hsts(app, self.tls);
 
 		// The per-circuit Tor-layer gate. Secure-by-default but non-disruptive: an
 		// accept-all accounting policy unless the caller supplied a tuned one.
@@ -816,6 +854,33 @@ mod tests {
 		assert!(!term.is_empty(), "terminal QR must not be empty");
 		// Dense1x2 emits one line per two QR rows; a real code is many lines tall.
 		assert!(term.lines().count() > 5, "terminal QR should span multiple lines");
+	}
+
+	#[tokio::test]
+	async fn strict_tls_adds_hsts_header() {
+		use tower::ServiceExt as _;
+
+		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Strict);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		let hsts = response.headers().get("strict-transport-security").expect("strict mode must emit HSTS");
+		assert_eq!(hsts, "max-age=63072000; includeSubDomains");
+	}
+
+	#[tokio::test]
+	async fn upgrade_tls_omits_hsts_header() {
+		use tower::ServiceExt as _;
+
+		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Upgrade);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		assert!(response.headers().get("strict-transport-security").is_none(), "upgrade mode must not emit HSTS");
+	}
+
+	#[test]
+	fn builder_defaults_to_upgrade_tls() {
+		let builder = OnionServiceBuilder::default();
+		assert_eq!(builder.tls, Tls::Upgrade);
+		let builder = builder.tls(Tls::Strict);
+		assert_eq!(builder.tls, Tls::Strict);
 	}
 
 	#[tokio::test]

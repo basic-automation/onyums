@@ -67,39 +67,79 @@ pub trait ClearanceStore: Send + Sync {
 	fn verify(&self, token: &str) -> Option<Clearance>;
 }
 
+/// Domain-separation label for [`HmacClearanceStore::derived`]: binds a derived signing
+/// key to this crate and key version, so the same shared secret used elsewhere (or a future
+/// key format) cannot collide with a clearance-signing key.
+const DERIVE_LABEL: &[u8] = b"onyums-skin/clearance-signing/v1";
+
 /// Default [`ClearanceStore`]: a stateless token signed with HMAC-SHA256.
 ///
 /// The token wire form is `base64url(payload).base64url(tag)`, where the payload is
 /// `id|issued|expires|level` (all ASCII) and the tag is
 /// `HMAC-SHA256(secret, payload)`. Verification is constant-time
 /// ([`Mac::verify_slice`]) and checks expiry against the wall clock. No server-side
-/// state is kept, so the secret is the only thing that must be protected — and shared
-/// across instances for multi-backend honoring (ROADMAP Phase 5).
+/// state is kept, so the secret is the only thing that must be protected.
+///
+/// **Multi-instance honoring & rotation (ROADMAP Phase 5).** Because verification needs only
+/// the secret, an Onionbalance fleet honors each other's tokens by sharing one signing key.
+/// Two ways to coordinate:
+/// - [`derived`](Self::derived): every backend derives the *same* signing key from one shared
+///   secret (a config passphrase) plus a context label — no need to distribute a raw 32-byte
+///   key, and the derivation is domain-separated.
+/// - [`with_verify_key`](Self::with_verify_key): add verify-only keys so a backend mints with
+///   the new key while still accepting tokens minted under a previous key — zero-downtime key
+///   rotation across the fleet.
 ///
 /// The minted `id` is a fresh random 128-bit value, suitable as the rate-limiter key
 /// and as a `jti` for a future single-use replay cache.
 #[derive(Clone)]
 pub struct HmacClearanceStore {
+	/// The key used to **mint** (and to verify) tokens.
 	secret: Vec<u8>,
+	/// Additional keys accepted on **verify** only, tried after [`secret`](Self::secret).
+	/// Used for key rotation / honoring tokens from backends on an older key.
+	extra_verify: Vec<Vec<u8>>,
 }
 
 impl HmacClearanceStore {
 	/// Build a store over an explicit signing secret (any length).
 	pub fn new(secret: impl Into<Vec<u8>>) -> Self {
-		Self { secret: secret.into() }
+		Self { secret: secret.into(), extra_verify: Vec::new() }
+	}
+
+	/// Build a store whose signing key is **derived** from a shared `secret` and a `context`
+	/// label via `HMAC-SHA256(secret, DERIVE_LABEL ‖ context)`. The derivation is
+	/// deterministic, so every Onionbalance backend configured with the same `secret` and
+	/// `context` produces the *identical* 256-bit signing key and thus honors each other's
+	/// tokens — without distributing a raw key. The `context` (e.g. the service name or a key
+	/// epoch) gives domain separation between unrelated deployments or rotation generations.
+	#[must_use]
+	pub fn derived(secret: &[u8], context: &[u8]) -> Self {
+		Self::new(derive_key(secret, context))
 	}
 
 	/// Build a store over a freshly generated random 256-bit secret. The secret is
 	/// process-local; restart or multi-instance setups that must honor each other's
-	/// tokens should use [`new`](Self::new) with a shared secret instead.
+	/// tokens should use [`new`](Self::new) or [`derived`](Self::derived) with a shared
+	/// secret instead.
 	#[must_use]
 	pub fn generate() -> Self {
 		let mut secret = vec![0u8; 32];
 		rand::rng().fill_bytes(&mut secret);
-		Self { secret }
+		Self { secret, extra_verify: Vec::new() }
 	}
 
-	/// `HMAC-SHA256(secret, payload)`.
+	/// Add a verify-only key, returning `self` for chaining. Tokens minted under this key
+	/// (e.g. by a fleet member on a previous secret, or before a rotation) still verify, but
+	/// this store keeps minting under its primary [`secret`](Self::secret). Add several to
+	/// span an entire rotation window.
+	#[must_use]
+	pub fn with_verify_key(mut self, secret: impl Into<Vec<u8>>) -> Self {
+		self.extra_verify.push(secret.into());
+		self
+	}
+
+	/// `HMAC-SHA256(secret, payload)` under the primary signing key.
 	fn tag(&self, payload: &[u8]) -> Vec<u8> {
 		let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a key of any length");
 		mac.update(payload);
@@ -129,10 +169,12 @@ impl ClearanceStore for HmacClearanceStore {
 		let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
 		let tag = URL_SAFE_NO_PAD.decode(tag_b64).ok()?;
 
-		// Constant-time signature check before trusting any field.
-		let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a key of any length");
-		mac.update(&payload);
-		mac.verify_slice(&tag).ok()?;
+		// Constant-time signature check before trusting any field. Try the primary key, then
+		// any verify-only keys (rotation / multi-backend honoring); accept on the first match.
+		let signed = verify_tag(&self.secret, &payload, &tag) || self.extra_verify.iter().any(|key| verify_tag(key, &payload, &tag));
+		if !signed {
+			return None;
+		}
 
 		let payload = std::str::from_utf8(&payload).ok()?;
 		let mut fields = payload.split('|');
@@ -151,6 +193,23 @@ impl ClearanceStore for HmacClearanceStore {
 
 		Some(Clearance { id: TokenId(id), issued, expires, level })
 	}
+}
+
+/// Constant-time check that `tag` is `HMAC-SHA256(secret, payload)`.
+fn verify_tag(secret: &[u8], payload: &[u8], tag: &[u8]) -> bool {
+	let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts a key of any length");
+	mac.update(payload);
+	mac.verify_slice(tag).is_ok()
+}
+
+/// Derive a 256-bit signing key from a shared `secret` and a `context` label:
+/// `HMAC-SHA256(secret, DERIVE_LABEL ‖ context)`. Deterministic and domain-separated, so
+/// every backend with the same inputs gets the same key. See [`HmacClearanceStore::derived`].
+fn derive_key(secret: &[u8], context: &[u8]) -> Vec<u8> {
+	let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC accepts a key of any length");
+	mac.update(DERIVE_LABEL);
+	mac.update(context);
+	mac.finalize().into_bytes().to_vec()
 }
 
 /// Seconds since the Unix epoch, saturating at 0 for pre-epoch times (which never
@@ -224,5 +283,57 @@ mod tests {
 		assert!(store.verify("").is_none());
 		assert!(store.verify("no-dot-here").is_none());
 		assert!(store.verify("!!!.@@@").is_none());
+	}
+
+	#[test]
+	fn derived_stores_from_one_shared_secret_honor_each_others_tokens() {
+		// Two Onionbalance backends configured with the same passphrase + context derive the
+		// same signing key, so a token minted at one verifies at the other.
+		let backend_a = HmacClearanceStore::derived(b"fleet-passphrase", b"my-service");
+		let backend_b = HmacClearanceStore::derived(b"fleet-passphrase", b"my-service");
+		let token = backend_a.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		assert!(backend_b.verify(&token).is_some(), "a sibling backend must honor the token");
+	}
+
+	#[test]
+	fn derived_key_is_domain_separated_by_context() {
+		// The same passphrase under a different context yields a different key → no honoring.
+		let svc1 = HmacClearanceStore::derived(b"fleet-passphrase", b"service-1");
+		let svc2 = HmacClearanceStore::derived(b"fleet-passphrase", b"service-2");
+		let token = svc1.mint(ClearanceLevel::Captcha, Duration::from_secs(300));
+		assert!(svc1.verify(&token).is_some());
+		assert!(svc2.verify(&token).is_none(), "a different context must not honor the token");
+	}
+
+	#[test]
+	fn verify_only_key_accepts_tokens_from_a_previous_secret() {
+		// Rotation: the fleet moves to `new`, but a backend still on `old` minted this token.
+		// A rotated store mints under `new` yet lists `old` as a verify-only key.
+		let old = HmacClearanceStore::new(b"old-secret".to_vec());
+		let rotated = HmacClearanceStore::new(b"new-secret".to_vec()).with_verify_key(b"old-secret".to_vec());
+		let old_token = old.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		assert!(rotated.verify(&old_token).is_some(), "the old key is still accepted during rotation");
+	}
+
+	#[test]
+	fn rotated_store_mints_only_under_the_primary_key() {
+		// A store with primary `new` + verify-only `old` mints tokens an old-only backend
+		// rejects (it mints under `new`), while a new-only backend accepts them.
+		let old_only = HmacClearanceStore::new(b"old-secret".to_vec());
+		let new_only = HmacClearanceStore::new(b"new-secret".to_vec());
+		let rotated = HmacClearanceStore::new(b"new-secret".to_vec()).with_verify_key(b"old-secret".to_vec());
+		let token = rotated.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		assert!(new_only.verify(&token).is_some(), "minted under the new (primary) key");
+		assert!(old_only.verify(&token).is_none(), "not minted under the old key");
+	}
+
+	#[test]
+	fn unknown_key_still_rejected_with_verify_keys_present() {
+		// Adding verify keys must not turn the store into an accept-all: a token from an
+		// unrelated secret is still rejected.
+		let store = HmacClearanceStore::new(b"primary".to_vec()).with_verify_key(b"secondary".to_vec());
+		let stranger = HmacClearanceStore::new(b"stranger".to_vec());
+		let token = stranger.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		assert!(store.verify(&token).is_none());
 	}
 }

@@ -282,6 +282,15 @@ The research-grade, Tor-specific bets — none have prior art in this environmen
   > WASM); `Hashcash` remains the JS-interactive default.
 - **Multi-instance coordination** — share a clearance-signing secret across Onionbalance backends so
   a token minted at one backend is honored at another.
+  > **Implemented (2026-06-28).** `HmacClearanceStore::derived(secret, context)` derives the
+  > signing key as `HMAC-SHA256(secret, "onyums-skin/clearance-signing/v1" ‖ context)`, so every
+  > backend configured with the same passphrase + context produces the identical 256-bit key and
+  > honors each other's tokens — no raw-key distribution, domain-separated by context.
+  > `with_verify_key` adds verify-only keys so a backend mints under a new secret while still
+  > accepting tokens from fleet members on a previous one (zero-downtime rotation); `verify` tries
+  > the primary then each extra key, and still rejects an unrelated secret. Pure `hmac`+`sha2`, no
+  > new dependency. 5 unit tests (cross-honoring, context separation, rotation accept, mint-under-
+  > primary, unknown-key-still-rejected).
 - **Edge-rules & caching** — local response cache and transform/redirect middleware (low effort;
   onyums already ships the HTTP→HTTPS upgrade as one such rule).
   > **Transform/redirect half implemented (2026-06-28).** `edge::EdgeRules` is an ordered

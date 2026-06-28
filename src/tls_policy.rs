@@ -31,6 +31,36 @@ pub enum Tls {
 	Strict,
 }
 
+/// What the rendezvous loop should do with a BEGIN cell for a given port under a
+/// given [`Tls`] mode. The pure, offline-testable counterpart to the live port
+/// dispatch in `handle_stream_request`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PortAction {
+	/// Accept the stream and serve it over TLS + HTTP (the axum app). Port 443.
+	ServeTls,
+	/// Accept the stream and answer with a `301` redirect to the HTTPS URL.
+	/// Port 80 under [`Tls::Upgrade`] only.
+	RedirectToHttps,
+	/// Reject the stream and tear down the circuit. Any non-HTTP port, plus
+	/// port 80 under [`Tls::Strict`] (plaintext is non-negotiable there).
+	Reject,
+}
+
+/// Decide what to do with a stream for `port` under the chosen `tls` mode.
+///
+/// Port 443 is always served over TLS. Port 80 is upgraded to HTTPS under
+/// [`Tls::Upgrade`] but **rejected** under [`Tls::Strict`] (no plaintext handler
+/// at all). Every other port is rejected — the built-in handler is HTTP-only;
+/// arbitrary-port `StreamHandler`s are a later Phase 3 slice.
+#[must_use]
+pub const fn port_action(port: u16, tls: Tls) -> PortAction {
+	match (port, tls) {
+		(443, _) => PortAction::ServeTls,
+		(80, Tls::Upgrade) => PortAction::RedirectToHttps,
+		_ => PortAction::Reject,
+	}
+}
+
 /// The HSTS response-header name.
 pub const HSTS_HEADER_NAME: &str = "strict-transport-security";
 
@@ -56,6 +86,26 @@ mod tests {
 	#[test]
 	fn default_mode_is_upgrade() {
 		assert_eq!(Tls::default(), Tls::Upgrade);
+	}
+
+	#[test]
+	fn port_443_is_always_served_over_tls() {
+		assert_eq!(port_action(443, Tls::Upgrade), PortAction::ServeTls);
+		assert_eq!(port_action(443, Tls::Strict), PortAction::ServeTls);
+	}
+
+	#[test]
+	fn port_80_upgrades_by_default_but_is_rejected_when_strict() {
+		assert_eq!(port_action(80, Tls::Upgrade), PortAction::RedirectToHttps);
+		assert_eq!(port_action(80, Tls::Strict), PortAction::Reject);
+	}
+
+	#[test]
+	fn non_http_ports_are_always_rejected() {
+		for port in [0_u16, 22, 25, 8080, 9735, 65535] {
+			assert_eq!(port_action(port, Tls::Upgrade), PortAction::Reject, "port {port} should be rejected (upgrade)");
+			assert_eq!(port_action(port, Tls::Strict), PortAction::Reject, "port {port} should be rejected (strict)");
+		}
 	}
 
 	#[test]

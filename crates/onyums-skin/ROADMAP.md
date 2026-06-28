@@ -289,8 +289,16 @@ The research-grade, Tor-specific bets — none have prior art in this environmen
   > `EdgeAction`: redirect / block / set-or-remove response header) evaluated to a decision-only
   > `EdgeDecision` ahead of the gate — pure request logic, no IP signals, fully offline-testable.
   > `EdgeRules::https_upgrade()` expresses the canonical HTTP→HTTPS upgrade as one rule (the host
-  > installs it on its plaintext listener, since Skin sees no scheme in `Parts`). **Remaining: the
-  > local response cache half.**
+  > installs it on its plaintext listener, since Skin sees no scheme in `Parts`).
+  > **Response cache half implemented (2026-06-28).** `cache::ResponseCache` is a bounded,
+  > TTL-expiring in-process cache keyed on `(method, host, path+query)` — pure request logic, no
+  > IP — over the crate's injectable `Clock` (deterministic expiry tests). Only `GET`/`HEAD` are
+  > cacheable; `cache_control_ttl` reads the origin `Cache-Control` so `no-store`/`no-cache`/
+  > `private` is never cached and `max-age` is honoured; a full cache purges expired entries then
+  > evicts the nearest-to-expiry one. Over an onion service this is a latency win (a rendezvous
+  > round-trip is expensive), not the bandwidth/CDN win Skin's non-goals exclude. **The Phase 5
+  > edge-rules & caching item is now implemented** (both halves); wiring either into `SkinLayer`
+  > is a follow-up host-integration slice.
 
 ---
 

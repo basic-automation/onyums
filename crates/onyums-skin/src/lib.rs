@@ -42,6 +42,7 @@
 #![allow(dead_code)]
 
 pub mod bot;
+pub mod cache;
 pub mod challenge;
 pub mod circuit;
 pub mod clearance;
@@ -56,6 +57,7 @@ pub mod shape;
 pub mod waf;
 
 pub use bot::{BotAssessment, BotHeuristics, BotSignal};
+pub use cache::{cache_control_ttl, is_cacheable_method, CacheKey, CachedResponse, ResponseCache};
 #[cfg(feature = "equix")]
 pub use ::equix::{Runtime, RuntimeOption};
 #[cfg(feature = "equix")]

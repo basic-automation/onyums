@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-28 — onyums-skin Phase 5 frontier: edge-rules + caching, multi-instance coordination, WAF filter front-end (5 increments)
 
-Branch `routine/onyums-2026-06-28` → PR _(opened at wrap; URL recorded below)_ (base `master`).
+Branch `routine/onyums-2026-06-28` → PR
+[#20](https://github.com/basic-automation/onyums/pull/20) (base `master`).
 **Crate alternation:** the previous run (2026-06-27 run 2, PR
 [#19](https://github.com/basic-automation/onyums/pull/19)) advanced the **onyums server**
 (Phase 1 QR + Phase 3 TLS), so per the alternation rule this run targets **onyums-skin**.

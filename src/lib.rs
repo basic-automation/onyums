@@ -45,7 +45,9 @@ pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
+mod tls_policy;
 mod vanity;
+pub use tls_policy::Tls;
 pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};
 
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
@@ -137,6 +139,45 @@ impl OnionAddress {
 	pub fn onion_location_header(&self) -> (&'static str, String) {
 		("onion-location", self.onion_location())
 	}
+
+	/// Render a scannable QR code of the service's canonical HTTPS URL as a
+	/// standalone SVG document string.
+	///
+	/// The QR encodes [`Self::https_url`] — the URL a client should actually open
+	/// — so a Tor Browser user can scan it instead of typing 56 base32 characters
+	/// by hand. The output is pure text (an `<svg>` document); onyums pulls in no
+	/// raster-image dependency for this (`qrcode` is built with its `image`
+	/// renderer disabled), keeping the tree pure Rust.
+	///
+	/// # Panics
+	/// Never in practice: the encoded data is a fixed-shape onion URL (~70 bytes),
+	/// far below the smallest QR version's capacity, so encoding cannot fail.
+	#[must_use]
+	pub fn qr_svg(&self) -> String {
+		use qrcode::{render::svg, QrCode};
+		// The encoded data is a fixed-shape onion URL (~70 bytes), far below the
+		// capacity of even the smallest QR version, so construction cannot fail.
+		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
+		code.render::<svg::Color>().min_dimensions(256, 256).quiet_zone(true).build()
+	}
+
+	/// Render a scannable QR code of the service's canonical HTTPS URL as Unicode
+	/// text suitable for printing to a terminal.
+	///
+	/// Like [`Self::qr_svg`] but rendered with half-block characters
+	/// (`unicode::Dense1x2`), so an operator can print the address as a QR code
+	/// straight to the console — e.g. right after the service reports ready. Each
+	/// QR row maps to one line of output.
+	///
+	/// # Panics
+	/// Never in practice, for the same reason as [`Self::qr_svg`]: an onion URL
+	/// always fits in a QR code.
+	#[must_use]
+	pub fn qr_terminal(&self) -> String {
+		use qrcode::{render::unicode, QrCode};
+		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
+		code.render::<unicode::Dense1x2>().quiet_zone(true).build()
+	}
 }
 
 impl std::fmt::Display for OnionAddress {
@@ -205,7 +246,7 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 /// drives accept / per-stream reject / whole-circuit teardown. Each circuit's streams
 /// are handled on a dedicated task so circuits run concurrently, and the circuit's
 /// accounting is dropped via [`CircuitPolicy::forget`] once its stream drains.
-async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: Arc<dyn CircuitPolicy>) -> Result<()> {
+async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: Arc<dyn CircuitPolicy>, tls: Tls) -> Result<()> {
 	event!(Level::INFO, "Waiting for incoming rendezvous circuits...");
 	let allocator = Arc::new(CircuitIdAllocator::new());
 	while let Some(rend_request) = rend_requests.next().await {
@@ -238,7 +279,7 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 		let address = address.clone();
 		let policy = policy.clone();
 		tokio::spawn(async move {
-			handle_circuit_streams(streams, id, app, tls_acceptor, address, policy.as_ref()).await;
+			handle_circuit_streams(streams, id, app, tls_acceptor, address, policy.as_ref(), tls).await;
 			// The circuit has drained; drop its accounting so the policy's map does not
 			// grow without bound (there is no per-stream close hook).
 			policy.forget(&id);
@@ -250,7 +291,7 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 
 /// Handles every stream on one accepted rendezvous circuit, consulting the policy per
 /// stream and spawning a task to serve each one the policy admits.
-async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: &dyn CircuitPolicy) {
+async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: &dyn CircuitPolicy, tls: Tls) {
 	while let Some(stream_request) = streams.next().await {
 		let stream_span = span!(Level::INFO, "onyums - incoming_stream");
 		let _stream_guard = stream_span.enter();
@@ -266,7 +307,7 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 				let tls_acceptor = tls_acceptor.clone();
 				let address = address.clone();
 				tokio::spawn(async move {
-					if let Err(err) = handle_stream_request(stream_request, tls_acceptor, app, &address, id).await {
+					if let Err(err) = handle_stream_request(stream_request, tls_acceptor, app, &address, id, tls).await {
 						event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
 					}
 				});
@@ -393,6 +434,22 @@ fn apply_skin(app: Router, skin: SkinChoice) -> Router {
 	}
 }
 
+/// Add the HSTS response header to every served response when the [`Tls`] mode
+/// enforces it ([`Tls::Strict`]), so a conforming client never silently
+/// downgrades from HTTPS. A no-op under [`Tls::Upgrade`].
+///
+/// Like [`apply_skin`], this is a plain `Router` transform so it is testable with
+/// `tower::ServiceExt::oneshot` and no live Tor network.
+fn apply_hsts(app: Router, tls: Tls) -> Router {
+	match tls_policy::hsts_header(tls) {
+		Some((name, value)) => app.layer(axum::middleware::map_response(move |mut response: axum::response::Response| async move {
+			response.headers_mut().insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value));
+			response
+		})),
+		None => app,
+	}
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -402,6 +459,7 @@ pub struct OnionServiceBuilder {
 	router: Option<Router>,
 	nickname: Option<String>,
 	skin: SkinChoice,
+	tls: Tls,
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
 }
 
@@ -428,6 +486,19 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub fn skin(mut self, skin: Skin) -> Self {
 		self.skin = SkinChoice::Custom(Box::new(skin));
+		self
+	}
+
+	/// Set the TLS transport posture (onyums ROADMAP Phase 3).
+	///
+	/// Defaults to [`Tls::Upgrade`] — auto self-signed cert with plaintext HTTP
+	/// (port 80) transparently redirected to HTTPS. Pass [`Tls::Strict`] to make
+	/// TLS non-negotiable: plaintext circuits are rejected outright (no port-80
+	/// handler) and HTTPS responses carry an HSTS header. This is an explicit opt
+	/// *down* in client tolerance, never an opt *up* into TLS — TLS is always on.
+	#[must_use]
+	pub const fn tls(mut self, tls: Tls) -> Self {
+		self.tls = tls;
 		self
 	}
 
@@ -480,6 +551,12 @@ impl OnionServiceBuilder {
 		// serve path is unchanged.
 		let app = apply_skin(app, self.skin);
 
+		// Phase 3 TLS-first: in strict mode every HTTPS response carries an HSTS
+		// header so a conforming client never silently downgrades. A no-op under
+		// the default `Tls::Upgrade`. (The strict-mode port-80 rejection is applied
+		// in the rendezvous loop's port dispatch.)
+		let app = apply_hsts(app, self.tls);
+
 		// The per-circuit Tor-layer gate. Secure-by-default but non-disruptive: an
 		// accept-all accounting policy unless the caller supplied a tuned one.
 		let policy: Arc<dyn CircuitPolicy> = self.circuit_policy.unwrap_or_else(|| Arc::new(AccountingCircuitPolicy::new()));
@@ -491,13 +568,14 @@ impl OnionServiceBuilder {
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
 		let loop_address = address.clone();
+		let tls = self.tls;
 		let task = tokio::spawn(async move {
 			let rend_requests = Box::pin(request_stream);
 			tokio::select! {
 				() = loop_cancel.cancelled() => {
 					event!(Level::INFO, "Onion service accept loop cancelled.");
 				}
-				result = serve_circuits(rend_requests, app, tls_acceptor, loop_address, policy) => {
+				result = serve_circuits(rend_requests, app, tls_acceptor, loop_address, policy, tls) => {
 					if let Err(err) = result {
 						event!(Level::ERROR, "Onion service accept loop ended with error: {err}");
 					} else {
@@ -648,21 +726,21 @@ fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
 }
 
 // Then handle_stream_request
-async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress, circuit_id: CircuitId) -> Result<()> {
+async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress, circuit_id: CircuitId, tls: Tls) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
 	let _handling_request_trace_guard = handling_request_trace_span.enter();
-	match stream_request.request().clone() {
-		// Clone request to use `begin` later
-		IncomingStreamRequest::Begin(begin) if begin.port() == 443 => {
-			// Only handle port 443 for TLS
-			handle_tls_connection(stream_request, tls_acceptor, app, circuit_id).await
-		}
-		IncomingStreamRequest::Begin(begin) if begin.port() == 80 => {
-			// Handle Port 80 (Plain HTTP) - Redirect to HTTPS
-			handle_http_redirect(stream_request, address.host().to_string()).await
-		}
-		_ => {
-			// Reject the incoming request
+	// The per-port transport decision is factored into the pure, offline-tested
+	// `tls_policy::port_action`; here we only execute it. Under `Tls::Strict` the
+	// port-80 arm resolves to `Reject`, so there is no plaintext handler at all.
+	let port = match stream_request.request() {
+		IncomingStreamRequest::Begin(begin) => begin.port(),
+		_ => 0,
+	};
+	match tls_policy::port_action(port, tls) {
+		tls_policy::PortAction::ServeTls => handle_tls_connection(stream_request, tls_acceptor, app, circuit_id).await,
+		tls_policy::PortAction::RedirectToHttps => handle_http_redirect(stream_request, address.host().to_string()).await,
+		tls_policy::PortAction::Reject => {
+			// Reject the incoming request (non-HTTP port, or plaintext under strict TLS).
 			event!(Level::INFO, "Rejecting the incoming request {:?}...", stream_request.request());
 			stream_request.shutdown_circuit().map_err(|e| anyhow::anyhow!("Failed to shutdown circuit: {e}"))
 		}
@@ -744,6 +822,66 @@ mod tests {
 		let (name, value) = address.onion_location_header();
 		assert_eq!(name, "onion-location");
 		assert_eq!(value, "https://abcdef.onion/");
+	}
+
+	#[test]
+	fn qr_svg_is_a_wellformed_svg_document() {
+		let address = OnionAddress::normalized("abcdef");
+		let svg = address.qr_svg();
+		assert!(svg.starts_with("<?xml") || svg.starts_with("<svg"), "should be an SVG document, got: {}", &svg[..svg.len().min(40)]);
+		assert!(svg.contains("<svg"), "missing <svg> element");
+		assert!(svg.contains("</svg>"), "missing closing </svg>");
+		// A real QR renders dark modules as filled rects/paths — a blank/degenerate
+		// document would have none.
+		assert!(svg.contains("path") || svg.contains("rect"), "SVG has no QR modules");
+	}
+
+	#[test]
+	fn qr_encoding_is_deterministic_and_address_sensitive() {
+		let a = OnionAddress::normalized("abcdef");
+		let b = OnionAddress::normalized("ghijkl");
+		// Deterministic: same address → identical QR (encoding has no randomness).
+		assert_eq!(a.qr_svg(), a.qr_svg());
+		assert_eq!(a.qr_terminal(), a.qr_terminal());
+		// Address-sensitive: a different URL is encoded into a different QR.
+		assert_ne!(a.qr_svg(), b.qr_svg());
+		assert_ne!(a.qr_terminal(), b.qr_terminal());
+	}
+
+	#[test]
+	fn qr_terminal_is_multiline_block_art() {
+		let address = OnionAddress::normalized("abcdef");
+		let term = address.qr_terminal();
+		assert!(!term.is_empty(), "terminal QR must not be empty");
+		// Dense1x2 emits one line per two QR rows; a real code is many lines tall.
+		assert!(term.lines().count() > 5, "terminal QR should span multiple lines");
+	}
+
+	#[tokio::test]
+	async fn strict_tls_adds_hsts_header() {
+		use tower::ServiceExt as _;
+
+		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Strict);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		let hsts = response.headers().get("strict-transport-security").expect("strict mode must emit HSTS");
+		assert_eq!(hsts, "max-age=63072000; includeSubDomains");
+	}
+
+	#[tokio::test]
+	async fn upgrade_tls_omits_hsts_header() {
+		use tower::ServiceExt as _;
+
+		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Upgrade);
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		assert!(response.headers().get("strict-transport-security").is_none(), "upgrade mode must not emit HSTS");
+	}
+
+	#[test]
+	fn builder_defaults_to_upgrade_tls() {
+		let builder = OnionServiceBuilder::default();
+		assert_eq!(builder.tls, Tls::Upgrade);
+		let builder = builder.tls(Tls::Strict);
+		assert_eq!(builder.tls, Tls::Strict);
 	}
 
 	#[tokio::test]

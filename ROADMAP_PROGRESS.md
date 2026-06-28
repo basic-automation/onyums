@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-27 (run 2) — onyums server Phase 1 QR + Phase 3 TLS-first strict mode (4 increments)
 
-Branch `routine/onyums-2026-06-27-2` → PR (base `master`). **Crate alternation:**
+Branch `routine/onyums-2026-06-27-2` → PR
+[#19](https://github.com/basic-automation/onyums/pull/19) (base `master`). **Crate alternation:**
 the previous run (2026-06-27, PR
 [#18](https://github.com/basic-automation/onyums/pull/18)) advanced **onyums-skin**
 (Phase 5 EquiX), so per the never-twice-in-a-row rule this run targets the **onyums

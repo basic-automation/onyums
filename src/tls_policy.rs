@@ -12,11 +12,17 @@
 /// How the built-in HTTP handler provisions and enforces TLS.
 ///
 /// TLS is the standard here, never an opt-*off*: every variant serves HTTPS on
-/// port 443 with an auto-generated self-signed certificate. The variants differ
-/// only in how strictly plaintext is treated. This is the Phase 3 "opt *down*,
-/// never *up*" knob — the secure default is the most forgiving toward clients,
-/// and [`Tls::Strict`] is the explicit tightening.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// port 443. The default variants differ only in how strictly plaintext is
+/// treated — this is the Phase 3 "opt *down*, never *up*" knob, where the secure
+/// default is the most forgiving toward clients and [`Tls::Strict`] is the
+/// explicit tightening. [`Tls::Provided`] is an orthogonal axis: it swaps the
+/// auto-generated self-signed certificate for a caller-supplied (e.g. CA-signed)
+/// one without otherwise changing the posture.
+///
+/// This enum carries a (non-`Copy`) certificate in the [`Tls::Provided`] case;
+/// the rendezvous loop never sees it — it threads only the small [`Copy`]
+/// [`PlaintextPolicy`] returned by [`Tls::plaintext_policy`].
+#[derive(Clone, Debug, Default)]
 pub enum Tls {
 	/// Default — auto self-signed cert, and plaintext HTTP on port 80 is
 	/// transparently **upgraded** to HTTPS with a `301` redirect. The most
@@ -29,6 +35,13 @@ pub enum Tls {
 	/// responses carry an HSTS header so a conforming client never silently
 	/// downgrades. For operators who want TLS to be mandatory.
 	Strict,
+	/// Bring-your-own certificate — serve the caller-supplied certificate chain
+	/// and key instead of an auto-generated self-signed one, for CA-signed
+	/// `.onion` certificates (e.g. HARICA) that some clients prefer. Plaintext is
+	/// treated like [`Tls::Upgrade`] (port 80 redirects to HTTPS, no HSTS);
+	/// combining a provided cert with strict plaintext rejection is a future
+	/// extension, kept out of the initial variant to keep the BYO axis orthogonal.
+	Provided(crate::ProvidedCert),
 }
 
 impl Tls {
@@ -37,12 +50,12 @@ impl Tls {
 	/// This is the *only* part of [`Tls`] the rendezvous loop needs: how to
 	/// treat a plaintext (port-80) circuit and whether to emit HSTS. Factoring
 	/// it out lets the loop thread a small [`Copy`] value while [`Tls`] itself is
-	/// free to carry non-`Copy` configuration (e.g. a bring-your-own
-	/// certificate) that only the one-time acceptor build consumes.
+	/// free to carry non-`Copy` configuration (the [`Tls::Provided`] certificate)
+	/// that only the one-time acceptor build consumes.
 	#[must_use]
-	pub const fn plaintext_policy(self) -> PlaintextPolicy {
+	pub const fn plaintext_policy(&self) -> PlaintextPolicy {
 		match self {
-			Self::Upgrade => PlaintextPolicy::Upgrade,
+			Self::Upgrade | Self::Provided(_) => PlaintextPolicy::Upgrade,
 			Self::Strict => PlaintextPolicy::Reject,
 		}
 	}
@@ -122,7 +135,7 @@ mod tests {
 
 	#[test]
 	fn default_mode_is_upgrade() {
-		assert_eq!(Tls::default(), Tls::Upgrade);
+		assert!(matches!(Tls::default(), Tls::Upgrade));
 	}
 
 	#[test]
@@ -130,6 +143,12 @@ mod tests {
 		assert_eq!(Tls::Upgrade.plaintext_policy(), PlaintextPolicy::Upgrade);
 		assert_eq!(Tls::Strict.plaintext_policy(), PlaintextPolicy::Reject);
 		assert_eq!(PlaintextPolicy::default(), PlaintextPolicy::Upgrade);
+
+		// A bring-your-own certificate is orthogonal to plaintext strictness: it
+		// keeps the forgiving upgrade posture.
+		let ck = rcgen::generate_simple_self_signed(vec!["example.onion".to_string()]).expect("rcgen");
+		let provided = crate::ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
+		assert_eq!(Tls::Provided(provided).plaintext_policy(), PlaintextPolicy::Upgrade);
 	}
 
 	#[test]

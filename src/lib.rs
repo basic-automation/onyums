@@ -499,8 +499,10 @@ impl OnionServiceBuilder {
 	/// TLS non-negotiable: plaintext circuits are rejected outright (no port-80
 	/// handler) and HTTPS responses carry an HSTS header. This is an explicit opt
 	/// *down* in client tolerance, never an opt *up* into TLS — TLS is always on.
+	/// Pass [`Tls::Provided`] to serve a caller-supplied (e.g. CA-signed)
+	/// certificate instead of the auto-generated self-signed one.
 	#[must_use]
-	pub const fn tls(mut self, tls: Tls) -> Self {
+	pub fn tls(mut self, tls: Tls) -> Self {
 		self.tls = tls;
 		self
 	}
@@ -568,7 +570,7 @@ impl OnionServiceBuilder {
 
 		let client = setup_tor_client().await?;
 		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
-		let tls_acceptor = tls_acceptor(&address)?;
+		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
@@ -707,7 +709,22 @@ impl AxumConnected<Self> for ConnectionInfo {
 }
 
 // Move tls_acceptor function up, before serve
-fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
+fn tls_acceptor(address: &OnionAddress, tls: &Tls) -> Result<TlsAcceptor> {
+	// Phase 3 bring-your-own cert: `Tls::Provided` serves the caller-supplied,
+	// already-validated config (parsed once in `ProvidedCert::from_pem`); every
+	// other mode auto-generates a self-signed certificate for the onion address.
+	let server_config = match tls {
+		Tls::Provided(cert) => cert.server_config(),
+		Tls::Upgrade | Tls::Strict => Arc::new(self_signed_server_config(address)?),
+	};
+	let acceptor = TlsAcceptor::from(server_config);
+	Ok(acceptor)
+}
+
+/// Build a `rustls` server config with a freshly generated self-signed
+/// certificate for the onion address — the default when the caller did not
+/// bring their own.
+fn self_signed_server_config(address: &OnionAddress) -> Result<rustls::ServerConfig> {
 	let subject_alt_names = vec![address.host().to_string()];
 	let cert = generate_simple_self_signed(subject_alt_names).unwrap();
 
@@ -725,8 +742,7 @@ fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
 			bail!(format!("Error creating server config: {e:?}"))
 		}
 	};
-	let acceptor = TlsAcceptor::from(Arc::new(server_config));
-	Ok(acceptor)
+	Ok(server_config)
 }
 
 // Then handle_stream_request
@@ -884,9 +900,29 @@ mod tests {
 	#[test]
 	fn builder_defaults_to_upgrade_tls() {
 		let builder = OnionServiceBuilder::default();
-		assert_eq!(builder.tls, Tls::Upgrade);
+		assert!(matches!(builder.tls, Tls::Upgrade));
 		let builder = builder.tls(Tls::Strict);
-		assert_eq!(builder.tls, Tls::Strict);
+		assert!(matches!(builder.tls, Tls::Strict));
+	}
+
+	#[test]
+	fn builder_accepts_a_provided_certificate() {
+		let ck = rcgen::generate_simple_self_signed(vec!["example.onion".to_string()]).expect("rcgen");
+		let provided = ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
+		let builder = OnionServiceBuilder::default().tls(Tls::Provided(provided));
+		// A provided cert keeps the forgiving plaintext posture (BYO is orthogonal).
+		assert!(matches!(builder.tls, Tls::Provided(_)));
+		assert_eq!(builder.tls.plaintext_policy(), tls_policy::PlaintextPolicy::Upgrade);
+	}
+
+	#[test]
+	fn tls_acceptor_builds_from_a_provided_certificate() {
+		let address = OnionAddress::normalized("examplereturnsavalidacceptorpaddingxxxxxxxxxxxxxxxxxxxxx");
+		let ck = rcgen::generate_simple_self_signed(vec![address.host().to_string()]).expect("rcgen");
+		let provided = ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
+		// The acceptor builds offline for both the self-signed and provided paths.
+		tls_acceptor(&address, &Tls::Provided(provided)).expect("provided-cert acceptor");
+		tls_acceptor(&address, &Tls::Upgrade).expect("self-signed acceptor");
 	}
 
 	#[tokio::test]

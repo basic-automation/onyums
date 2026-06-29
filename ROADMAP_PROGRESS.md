@@ -7,6 +7,121 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-28 (run 2) — onyums server Phase 3 TLS-first: bring-your-own certificate (`Tls::Provided`) (5 increments)
+
+Branch `routine/onyums-2026-06-28-2` → PR
+[#21](https://github.com/basic-automation/onyums/pull/21) (base `master`). **Crate
+alternation:** the previous run (2026-06-28, PR
+[#20](https://github.com/basic-automation/onyums/pull/20)) advanced **onyums-skin**
+(Phase 5 frontier), so per the never-twice-in-a-row rule this run targets the **onyums
+server**. (Same-day rerun, hence the `-2` branch suffix.) It implements the documented
+next step from the 2026-06-27 (run 2) entry — `Tls::Provided(cert)` — as a complete,
+offline-verifiable arc: decouple, build the cert type, add the variant + acceptor wiring,
+document it, and add a file loader. Every increment is pure-Rust and unit-tested with no
+live Tor; the workspace stayed green and clippy-clean throughout.
+
+**Increment 1 — decouple plaintext enforcement into a `Copy` `PlaintextPolicy`.** *onyums
+Phase 3, TLS-first prep.* Files: `src/tls_policy.rs`, `src/lib.rs`. The rendezvous loop
+threaded the whole `Tls` mode through `serve_circuits → handle_circuit_streams →
+handle_stream_request` purely to make a port-80/HSTS decision — a coupling that would
+force the soon-to-be non-`Copy` `Tls::Provided` cert to be cloned per stream. Introduced
+`tls_policy::PlaintextPolicy` (`Copy`: `Upgrade`/`Reject`) — the only part of the mode the
+loop needs — plus `Tls::plaintext_policy()`. `serve()` derives the policy once; the loop
+and `apply_hsts` now carry the trivially-copyable value while `Tls` is free to hold
+non-`Copy` config. `port_action`/`hsts_header` rekeyed on `PlaintextPolicy`; HSTS now rides
+with `Reject` (a service that refuses plaintext also tells clients never to try it). Pure
+refactor, no behaviour change. **+1 unit test** (the mode→policy mapping).
+
+**Increment 2 — validated `ProvidedCert` type.** *onyums Phase 3, "Bring-your-own cert".*
+Files: `src/provided_cert.rs` (new), `src/lib.rs`. `ProvidedCert::from_pem(cert, key)`
+parses a PEM certificate chain + private key and *eagerly* assembles a `rustls`
+`ServerConfig`, so a malformed or unusable pair fails at configuration time rather than
+when the first circuit arrives. The validated config is shared behind an `Arc` (cheap
+`Clone`); `server_config()` hands out that `Arc` so the acceptor never re-parses. A manual
+`Debug` impl avoids printing key material so the type can sit inside the `Debug`-deriving
+`Tls` enum. Exported publicly (`onyums::ProvidedCert`). Reuses the existing pure-Rust
+`tokio-rustls`/`rcgen` deps — **no new dependency**. **6 unit tests** (valid pair, empty
+chain, garbage key, non-PEM cert, shared-config identity, no-key-leak `Debug`).
+
+**Increment 3 — `Tls::Provided(cert)` variant + acceptor wiring.** *onyums Phase 3, same
+item.* Files: `src/lib.rs`, `src/tls_policy.rs`. Added the `Tls::Provided(ProvidedCert)`
+variant; `tls_acceptor` now branches — `Provided` hands its pre-validated config straight
+to the acceptor, while `Upgrade`/`Strict` keep generating a self-signed cert (factored into
+`self_signed_server_config`). Wired through the builder's existing `.tls()`. The cert
+payload is non-`Copy`, so `Tls` dropped `Copy`/`PartialEq`/`Eq` (kept `Clone`/`Debug`/
+`Default`); increment 1's `PlaintextPolicy` split means the loop is unaffected. BYO is
+orthogonal to plaintext strictness — `Provided` keeps the forgiving `Upgrade` posture
+(port-80 redirect, no HSTS); a Provided+strict combination is documented as a future
+extension. **+2 unit tests** (builder accepts a provided cert / keeps Upgrade policy;
+`tls_acceptor` builds offline from both the provided and self-signed paths).
+
+**Increment 4 — document `Tls::Provided`.** *Cross-cutting DX — "document the opt-downs
+explicitly."* Files: `README.md`. Extended the TLS-first section with a worked
+`ProvidedCert::from_pem` + `.tls(Tls::Provided(cert))` example, the HARICA/CA-signed
+`.onion` use case, the eager-validation guarantee, and the BYO-is-orthogonal note; added a
+`Tls::Provided` line to the builder opt-down comment list. Docs-only — `src/` does not
+`include_str!` the README, so the example is not compiled; checked against the public API
+by hand. No new tests.
+
+**Increment 5 — `ProvidedCert::from_pem_files` (load from disk).** *onyums Phase 3,
+BYO-cert ergonomics.* Files: `src/provided_cert.rs`. Most operators keep their certificate
+as PEM files, so `from_pem_files(cert_path, key_path)` reads both and delegates to
+`from_pem` — same eager validation, IO errors carrying the offending path. Removes the
+`std::fs::read` boilerplate the README example showed. **2 unit tests** (loads & validates
+a pair written to the temp dir; reports a missing file with its path).
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each code increment; the one
+  pre-existing `proc-macro-error2` future-incompat note is a transitive dep, not ours).
+- `cargo test -p onyums --lib -- --skip test_serve`: **54 passed; 0 failed; 0 ignored**
+  (1 filtered out = `test_serve`). Up from 43 at run start (**+11**: 1 + 6 + 2 + 0 + 2).
+- `cargo clippy -p onyums --all-targets`: **0 warnings** (fixed two directly along the way
+  — a `Self`-repetition in the `impl Tls` match, and restoring `const fn` on the
+  now-by-ref `plaintext_policy`; never `#[allow]`).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design;
+  nothing this run touched the live-serve path beyond the offline-tested `tls_acceptor`
+  branch and the `PlaintextPolicy` thread (the live loop only executes those decisions).
+
+### Done vs. open
+- **onyums Phase 3 (TLS-first):** `Tls::Provided` bring-your-own cert is now **DONE**
+  (offline-verifiable): the validated `ProvidedCert` type (`from_pem` / `from_pem_files`),
+  the `Tls::Provided` variant, and the acceptor wiring — closing the last sub-bullet of the
+  "TLS-first, with optional strict enforcement" item. The `Tls::Upgrade`/`Tls::Strict`
+  modes + HSTS landed in prior runs.
+- OPEN (onyums Phase 3): the **`StreamHandler` trait + arbitrary port→handler mapping**
+  (`.route_port(...)`) — the protocol-versatility layer (gRPC/SSH/raw TCP over an onion);
+  **single onion service mode** (latency opt-down). Both are fresh, larger design pieces.
+  A future Provided+strict combination (BYO cert *and* plaintext rejection) is a small
+  follow-up if wanted.
+- OPEN (onyums Phase 1, live-Tor only): keystore placement of a mined/BYO *onion* key so
+  the launched service serves that address; `.ephemeral()` opt-down — touch the
+  serve/keystore path this routine cannot runtime-verify.
+- OPEN (onyums Phase 2, carried): drive `AccountingCircuitPolicy` from
+  `handle_stream_request`; **Under Attack Mode** builder toggle; feed Skin's
+  adaptive-difficulty signal — all on the live circuit path.
+- NOT STARTED: onyums Phase 4 (observability/multi-service).
+- NOT a server concern this run: onyums-skin (the other crate; advanced last run, PR #20).
+  Its owed next slice is the filter **string-syntax parser**.
+
+**STOP REASON:** Landed 5 verifiable increments (above the 2–4 bar) forming one complete,
+coherent arc — the entire `Tls::Provided` bring-your-own-certificate feature, end to end
+(decouple → type → variant+wiring → docs → file loader). This is a natural stopping point:
+the feature is whole and the remaining onyums items are each a *fresh, larger* design piece
+better started on its own (the `StreamHandler` trait surface; single-onion-service mode) or
+sit on the live-Tor path this routine cannot runtime-verify (Phase-1 keystore placement,
+Phase-2 `CircuitPolicy` drive / Under Attack Mode). Workspace is green, clippy-clean, and
+every increment is committed with nothing half-landed.
+
+**NEXT STEP:** *(onyums, a later run)* Design the **`StreamHandler` trait surface** —
+`.route_port(443, HttpHandler::new(app))` / `.route_port(9735, RawTcpHandler::new(...))` —
+starting with the pure, offline-testable port→handler routing table (which handler serves a
+port, default fallback, the HTTP handler as the built-in default) before the live-stream
+plumbing. *(onyums-skin, next run by alternation)* The filter **string-syntax parser** —
+tokenizer + recursive-descent/Pratt parser producing `FilterExpr` from an operator-authored
+rule string, per the skin progress tail.
+
+---
+
 ## 2026-06-28 — onyums-skin Phase 5 frontier: edge-rules + caching, multi-instance coordination, WAF filter front-end (5 increments)
 
 Branch `routine/onyums-2026-06-28` → PR

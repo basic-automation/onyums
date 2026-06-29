@@ -45,8 +45,10 @@ pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
+mod provided_cert;
 mod tls_policy;
 mod vanity;
+pub use provided_cert::ProvidedCert;
 pub use tls_policy::Tls;
 pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};
 
@@ -246,7 +248,7 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 /// drives accept / per-stream reject / whole-circuit teardown. Each circuit's streams
 /// are handled on a dedicated task so circuits run concurrently, and the circuit's
 /// accounting is dropped via [`CircuitPolicy::forget`] once its stream drains.
-async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: Arc<dyn CircuitPolicy>, tls: Tls) -> Result<()> {
+async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: Arc<dyn CircuitPolicy>, plaintext: tls_policy::PlaintextPolicy) -> Result<()> {
 	event!(Level::INFO, "Waiting for incoming rendezvous circuits...");
 	let allocator = Arc::new(CircuitIdAllocator::new());
 	while let Some(rend_request) = rend_requests.next().await {
@@ -279,7 +281,7 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 		let address = address.clone();
 		let policy = policy.clone();
 		tokio::spawn(async move {
-			handle_circuit_streams(streams, id, app, tls_acceptor, address, policy.as_ref(), tls).await;
+			handle_circuit_streams(streams, id, app, tls_acceptor, address, policy.as_ref(), plaintext).await;
 			// The circuit has drained; drop its accounting so the policy's map does not
 			// grow without bound (there is no per-stream close hook).
 			policy.forget(&id);
@@ -291,7 +293,7 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 
 /// Handles every stream on one accepted rendezvous circuit, consulting the policy per
 /// stream and spawning a task to serve each one the policy admits.
-async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: &dyn CircuitPolicy, tls: Tls) {
+async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: &dyn CircuitPolicy, plaintext: tls_policy::PlaintextPolicy) {
 	while let Some(stream_request) = streams.next().await {
 		let stream_span = span!(Level::INFO, "onyums - incoming_stream");
 		let _stream_guard = stream_span.enter();
@@ -307,7 +309,7 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 				let tls_acceptor = tls_acceptor.clone();
 				let address = address.clone();
 				tokio::spawn(async move {
-					if let Err(err) = handle_stream_request(stream_request, tls_acceptor, app, &address, id, tls).await {
+					if let Err(err) = handle_stream_request(stream_request, tls_acceptor, app, &address, id, plaintext).await {
 						event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
 					}
 				});
@@ -434,14 +436,15 @@ fn apply_skin(app: Router, skin: SkinChoice) -> Router {
 	}
 }
 
-/// Add the HSTS response header to every served response when the [`Tls`] mode
-/// enforces it ([`Tls::Strict`]), so a conforming client never silently
-/// downgrades from HTTPS. A no-op under [`Tls::Upgrade`].
+/// Add the HSTS response header to every served response when the plaintext
+/// policy enforces it ([`tls_policy::PlaintextPolicy::Reject`]), so a conforming
+/// client never silently downgrades from HTTPS. A no-op when plaintext is merely
+/// upgraded.
 ///
 /// Like [`apply_skin`], this is a plain `Router` transform so it is testable with
 /// `tower::ServiceExt::oneshot` and no live Tor network.
-fn apply_hsts(app: Router, tls: Tls) -> Router {
-	match tls_policy::hsts_header(tls) {
+fn apply_hsts(app: Router, plaintext: tls_policy::PlaintextPolicy) -> Router {
+	match tls_policy::hsts_header(plaintext) {
 		Some((name, value)) => app.layer(axum::middleware::map_response(move |mut response: axum::response::Response| async move {
 			response.headers_mut().insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value));
 			response
@@ -496,8 +499,10 @@ impl OnionServiceBuilder {
 	/// TLS non-negotiable: plaintext circuits are rejected outright (no port-80
 	/// handler) and HTTPS responses carry an HSTS header. This is an explicit opt
 	/// *down* in client tolerance, never an opt *up* into TLS — TLS is always on.
+	/// Pass [`Tls::Provided`] to serve a caller-supplied (e.g. CA-signed)
+	/// certificate instead of the auto-generated self-signed one.
 	#[must_use]
-	pub const fn tls(mut self, tls: Tls) -> Self {
+	pub fn tls(mut self, tls: Tls) -> Self {
 		self.tls = tls;
 		self
 	}
@@ -551,11 +556,13 @@ impl OnionServiceBuilder {
 		// serve path is unchanged.
 		let app = apply_skin(app, self.skin);
 
-		// Phase 3 TLS-first: in strict mode every HTTPS response carries an HSTS
-		// header so a conforming client never silently downgrades. A no-op under
-		// the default `Tls::Upgrade`. (The strict-mode port-80 rejection is applied
-		// in the rendezvous loop's port dispatch.)
-		let app = apply_hsts(app, self.tls);
+		// Phase 3 TLS-first: derive the pure, `Copy` plaintext-enforcement decision
+		// once. In strict mode every HTTPS response carries an HSTS header so a
+		// conforming client never silently downgrades (a no-op under the default
+		// upgrade policy); the matching port-80 rejection is applied in the
+		// rendezvous loop's port dispatch.
+		let plaintext = self.tls.plaintext_policy();
+		let app = apply_hsts(app, plaintext);
 
 		// The per-circuit Tor-layer gate. Secure-by-default but non-disruptive: an
 		// accept-all accounting policy unless the caller supplied a tuned one.
@@ -563,19 +570,18 @@ impl OnionServiceBuilder {
 
 		let client = setup_tor_client().await?;
 		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
-		let tls_acceptor = tls_acceptor(&address)?;
+		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
 		let loop_address = address.clone();
-		let tls = self.tls;
 		let task = tokio::spawn(async move {
 			let rend_requests = Box::pin(request_stream);
 			tokio::select! {
 				() = loop_cancel.cancelled() => {
 					event!(Level::INFO, "Onion service accept loop cancelled.");
 				}
-				result = serve_circuits(rend_requests, app, tls_acceptor, loop_address, policy, tls) => {
+				result = serve_circuits(rend_requests, app, tls_acceptor, loop_address, policy, plaintext) => {
 					if let Err(err) = result {
 						event!(Level::ERROR, "Onion service accept loop ended with error: {err}");
 					} else {
@@ -703,7 +709,22 @@ impl AxumConnected<Self> for ConnectionInfo {
 }
 
 // Move tls_acceptor function up, before serve
-fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
+fn tls_acceptor(address: &OnionAddress, tls: &Tls) -> Result<TlsAcceptor> {
+	// Phase 3 bring-your-own cert: `Tls::Provided` serves the caller-supplied,
+	// already-validated config (parsed once in `ProvidedCert::from_pem`); every
+	// other mode auto-generates a self-signed certificate for the onion address.
+	let server_config = match tls {
+		Tls::Provided(cert) => cert.server_config(),
+		Tls::Upgrade | Tls::Strict => Arc::new(self_signed_server_config(address)?),
+	};
+	let acceptor = TlsAcceptor::from(server_config);
+	Ok(acceptor)
+}
+
+/// Build a `rustls` server config with a freshly generated self-signed
+/// certificate for the onion address — the default when the caller did not
+/// bring their own.
+fn self_signed_server_config(address: &OnionAddress) -> Result<rustls::ServerConfig> {
 	let subject_alt_names = vec![address.host().to_string()];
 	let cert = generate_simple_self_signed(subject_alt_names).unwrap();
 
@@ -721,22 +742,22 @@ fn tls_acceptor(address: &OnionAddress) -> Result<TlsAcceptor> {
 			bail!(format!("Error creating server config: {e:?}"))
 		}
 	};
-	let acceptor = TlsAcceptor::from(Arc::new(server_config));
-	Ok(acceptor)
+	Ok(server_config)
 }
 
 // Then handle_stream_request
-async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress, circuit_id: CircuitId, tls: Tls) -> Result<()> {
+async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress, circuit_id: CircuitId, plaintext: tls_policy::PlaintextPolicy) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
 	let _handling_request_trace_guard = handling_request_trace_span.enter();
 	// The per-port transport decision is factored into the pure, offline-tested
-	// `tls_policy::port_action`; here we only execute it. Under `Tls::Strict` the
-	// port-80 arm resolves to `Reject`, so there is no plaintext handler at all.
+	// `tls_policy::port_action`; here we only execute it. Under a `Reject`
+	// plaintext policy the port-80 arm resolves to `Reject`, so there is no
+	// plaintext handler at all.
 	let port = match stream_request.request() {
 		IncomingStreamRequest::Begin(begin) => begin.port(),
 		_ => 0,
 	};
-	match tls_policy::port_action(port, tls) {
+	match tls_policy::port_action(port, plaintext) {
 		tls_policy::PortAction::ServeTls => handle_tls_connection(stream_request, tls_acceptor, app, circuit_id).await,
 		tls_policy::PortAction::RedirectToHttps => handle_http_redirect(stream_request, address.host().to_string()).await,
 		tls_policy::PortAction::Reject => {
@@ -861,7 +882,7 @@ mod tests {
 	async fn strict_tls_adds_hsts_header() {
 		use tower::ServiceExt as _;
 
-		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Strict);
+		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Strict.plaintext_policy());
 		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
 		let hsts = response.headers().get("strict-transport-security").expect("strict mode must emit HSTS");
 		assert_eq!(hsts, "max-age=63072000; includeSubDomains");
@@ -871,7 +892,7 @@ mod tests {
 	async fn upgrade_tls_omits_hsts_header() {
 		use tower::ServiceExt as _;
 
-		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Upgrade);
+		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Upgrade.plaintext_policy());
 		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
 		assert!(response.headers().get("strict-transport-security").is_none(), "upgrade mode must not emit HSTS");
 	}
@@ -879,9 +900,29 @@ mod tests {
 	#[test]
 	fn builder_defaults_to_upgrade_tls() {
 		let builder = OnionServiceBuilder::default();
-		assert_eq!(builder.tls, Tls::Upgrade);
+		assert!(matches!(builder.tls, Tls::Upgrade));
 		let builder = builder.tls(Tls::Strict);
-		assert_eq!(builder.tls, Tls::Strict);
+		assert!(matches!(builder.tls, Tls::Strict));
+	}
+
+	#[test]
+	fn builder_accepts_a_provided_certificate() {
+		let ck = rcgen::generate_simple_self_signed(vec!["example.onion".to_string()]).expect("rcgen");
+		let provided = ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
+		let builder = OnionServiceBuilder::default().tls(Tls::Provided(provided));
+		// A provided cert keeps the forgiving plaintext posture (BYO is orthogonal).
+		assert!(matches!(builder.tls, Tls::Provided(_)));
+		assert_eq!(builder.tls.plaintext_policy(), tls_policy::PlaintextPolicy::Upgrade);
+	}
+
+	#[test]
+	fn tls_acceptor_builds_from_a_provided_certificate() {
+		let address = OnionAddress::normalized("examplereturnsavalidacceptorpaddingxxxxxxxxxxxxxxxxxxxxx");
+		let ck = rcgen::generate_simple_self_signed(vec![address.host().to_string()]).expect("rcgen");
+		let provided = ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
+		// The acceptor builds offline for both the self-signed and provided paths.
+		tls_acceptor(&address, &Tls::Provided(provided)).expect("provided-cert acceptor");
+		tls_acceptor(&address, &Tls::Upgrade).expect("self-signed acceptor");
 	}
 
 	#[tokio::test]

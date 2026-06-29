@@ -9,8 +9,9 @@ STOP REASON, and the next step.
 
 ## 2026-06-28 (run 2) — onyums server Phase 3 TLS-first: bring-your-own certificate (`Tls::Provided`) (5 increments)
 
-Branch `routine/onyums-2026-06-28-2` → PR (base `master`). **Crate alternation:** the
-previous run (2026-06-28, PR
+Branch `routine/onyums-2026-06-28-2` → PR
+[#21](https://github.com/basic-automation/onyums/pull/21) (base `master`). **Crate
+alternation:** the previous run (2026-06-28, PR
 [#20](https://github.com/basic-automation/onyums/pull/20)) advanced **onyums-skin**
 (Phase 5 frontier), so per the never-twice-in-a-row rule this run targets the **onyums
 server**. (Same-day rerun, hence the `-2` branch suffix.) It implements the documented

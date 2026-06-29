@@ -824,6 +824,17 @@ impl std::fmt::Display for FilterExpr {
 	}
 }
 
+impl std::str::FromStr for FilterExpr {
+	type Err = ParseError;
+
+	/// Parse a rule string via [`FilterExpr::parse`], so `"...".parse::<FilterExpr>()` and
+	/// config-deserialization paths that key on [`FromStr`](std::str::FromStr) work idiomatically.
+	/// Paired with the [`Display`](std::fmt::Display) impl, `FilterExpr` round-trips text ⇄ AST.
+	fn from_str(s: &str) -> Result<Self, Self::Err> {
+		FilterExpr::parse(s)
+	}
+}
+
 #[cfg(test)]
 mod display_tests {
 	use axum::http::Request;
@@ -875,6 +886,17 @@ mod display_tests {
 		assert_eq!(s, r#"path matches "^/x/\\d+$""#, "the literal backslash is doubled in canonical form");
 		let p = parts(Request::builder().uri("/x/42"));
 		assert!(FilterExpr::parse(&s).unwrap().evaluate(&p));
+	}
+
+	#[test]
+	fn from_str_parses_like_the_associated_fn() {
+		// The idiomatic `str::parse` entry point delegates to `FilterExpr::parse`.
+		let expr: FilterExpr = r#"method eq "GET""#.parse().unwrap();
+		assert!(expr.evaluate(&parts(Request::builder().method("GET").uri("/"))));
+		// And it round-trips with Display: text → AST → text is a fixed point.
+		assert_eq!(expr.to_string().parse::<FilterExpr>().unwrap().to_string(), expr.to_string());
+		// Errors propagate as the same `ParseError`.
+		assert!("frob eq \"x\"".parse::<FilterExpr>().is_err());
 	}
 
 	#[test]

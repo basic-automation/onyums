@@ -45,8 +45,10 @@ pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
+mod provided_cert;
 mod tls_policy;
 mod vanity;
+pub use provided_cert::ProvidedCert;
 pub use tls_policy::Tls;
 pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};
 

@@ -81,6 +81,7 @@ async fn main() {
 		// .skin(Skin::secure_default())        // tune via Skin::builder() (difficulty, store, WAF, ...)
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits & Under-Attack mode
 		// .tls(Tls::Strict)                     // make TLS non-negotiable (reject plaintext, emit HSTS)
+		// .tls(Tls::Provided(my_cert))          // serve your own CA-signed cert instead of self-signed
 		// .no_skin()                            // opt out of the gate entirely
 		.serve()
 		.await
@@ -102,6 +103,24 @@ Onyums treats encrypted, certificate-authenticated transport as the standard, ne
 
 - **`Tls::Upgrade` (default)** — an auto-generated self-signed cert, and plaintext HTTP on port 80 is transparently redirected (`301`) to HTTPS. A client that arrives over plain HTTP is pointed at the secure URL rather than refused.
 - **`Tls::Strict`** — TLS is non-negotiable. Plaintext circuits are **rejected outright** (there is no port-80 redirect handler at all), and every HTTPS response carries an `Strict-Transport-Security` header (`max-age=63072000; includeSubDomains`) so a conforming client never silently downgrades.
+- **`Tls::Provided(cert)`** — serve your **own** certificate chain and key instead of the auto-generated self-signed one, for CA-signed `.onion` certificates (e.g. [HARICA](https://www.harica.gr/)) that some clients and browsers prefer. Build the cert once with `ProvidedCert::from_pem(cert_pem, key_pem)` — it parses and validates the pair up front, so a bad cert/key is a clean error at startup, not a runtime surprise. Bringing your own cert is *orthogonal* to plaintext strictness: it keeps the forgiving `Upgrade` posture (port-80 → HTTPS redirect, no HSTS).
+
+```rust
+use onyums::{OnionService, ProvidedCert, Tls, routing::get, Router};
+
+let cert = ProvidedCert::from_pem(
+	&std::fs::read("fullchain.pem").unwrap(),
+	&std::fs::read("privkey.pem").unwrap(),
+).expect("certificate and key are a valid, usable pair");
+
+let handle = OnionService::builder()
+	.router(Router::new().route("/", get(|| async { "Hello, World!" })))
+	.nickname("my_onion")
+	.tls(Tls::Provided(cert)) // serve a CA-signed cert instead of self-signed
+	.serve()
+	.await
+	.unwrap();
+```
 
 ```rust
 use onyums::{OnionService, Tls, routing::get, Router};

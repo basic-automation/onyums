@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-29 — onyums-skin Phase 3/5 frontier: filter rule-string front-end (lex → parse → serialize → wire) (5 increments)
 
-Branch `routine/onyums-2026-06-29` → PR (base `master`). **Crate alternation:** the previous
+Branch `routine/onyums-2026-06-29` → PR
+[#22](https://github.com/basic-automation/onyums/pull/22) (base `master`). **Crate alternation:** the previous
 run (2026-06-28 run 2, PR [#21](https://github.com/basic-automation/onyums/pull/21)) advanced
 the **onyums server** (Phase 3 BYO cert), so per the never-twice-in-a-row rule this run targets
 **onyums-skin**. It builds the documented next step from the 2026-06-28 onyums-skin entry (PR

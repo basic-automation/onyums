@@ -237,9 +237,20 @@ Request inspection — 100% IP-free, the cleanest Cloudflare carry-over.
   > dimensions — × `StrOp` ∈ {eq, not_eq, contains, starts/ends_with, regex `Matches`, `Exists`},
   > combined with `And`/`Or`/`Not`/`Always`/`Never`) evaluated directly against `Parts`. No parser
   > dependency, no `failure`, no advisory exception — it replaces only wirefilter's *expression*
-  > layer. Absent fields are false except `Exists` (WAF-safe). 9 unit tests. The **string-syntax
-  > parser is the next slice**; this AST is what such a parser targets and what operator-tunable
-  > WAF/edge rule conditions evaluate.
+  > layer. Absent fields are false except `Exists` (WAF-safe). 9 unit tests. This AST is what the
+  > string-syntax parser targets and what operator-tunable WAF/edge rule conditions evaluate.
+  >
+  > **String-syntax front-end landed (2026-06-29).** The operator-authored rule string is now
+  > parsed into `FilterExpr` with no parser dependency: a position-tracking lexer, a
+  > recursive-descent parser (`FilterExpr::parse` / `FromStr` / free `filter::parse`), and a
+  > canonical `Display` that is the parser's inverse (fixed-point tested). Grammar: fields
+  > `method`/`path`/`query`/`header[NAME]` × operators `eq`/`ne` (`!=`)/`contains`/`starts_with`/
+  > `ends_with`/`matches` (`~`, regex)/`exists`, combined with `and` (`&&`)/`or` (`||`)/`not`
+  > (`!`)/parens/`true`/`false`; precedence `not` → `and` → `or`. Errors carry a byte offset
+  > (`ParseError`). `EdgeMatch::expr(rule)` is the first consumer — edge-rule conditions are now
+  > config-authorable as strings. **Resolution path (c) for the `wirefilter` blocker is complete**
+  > (AST + evaluator + string front-end); the WAF custom-rule path can adopt `FilterExpr::parse`
+  > as a follow-up. Pure `regex` (already a dep), fully offline.
 - A curated starter ruleset (SQLi / XSS / path traversal / OS command injection / SSRF /
   server-side code injection / NoSQL / LDAP / XXE / protocol anomalies); not OWASP-CRS-complete
   at first, but extensible with custom rules, per-rule/category disabling, and operator-tunable

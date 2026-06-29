@@ -245,6 +245,253 @@ pub fn any(exprs: Vec<FilterExpr>) -> FilterExpr {
 	FilterExpr::Or(exprs)
 }
 
+// ---------------------------------------------------------------------------
+// String-syntax front-end: lexer
+// ---------------------------------------------------------------------------
+//
+// The typed AST above is what an operator-authored rule string parses into, so
+// WAF/edge-rule conditions can be config-driven rather than code-built. The grammar:
+//
+//   expr      := or_expr
+//   or_expr   := and_expr ( ("or" | "||") and_expr )*
+//   and_expr  := not_expr ( ("and" | "&&") not_expr )*
+//   not_expr  := ("not" | "!") not_expr | primary
+//   primary   := "(" expr ")" | "true" | "false" | predicate
+//   predicate := field ( "exists" | binop string )
+//   field     := "method" | "path" | "query" | "header" "[" (string | ident) "]"
+//   binop     := "eq" | "ne" | "!=" | "contains" | "starts_with" | "ends_with" | "matches" | "~"
+//
+// This section is the lexer; the recursive-descent parser is a later slice.
+
+/// An error from the filter string parser — a lexing or parsing failure with the byte
+/// offset into the input where it was detected.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParseError {
+	/// Byte offset into the input string where the problem was detected.
+	pub pos: usize,
+	/// Human-readable description of the problem.
+	pub message: String,
+}
+
+impl ParseError {
+	fn new(pos: usize, message: impl Into<String>) -> Self {
+		ParseError { pos, message: message.into() }
+	}
+}
+
+impl std::fmt::Display for ParseError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "filter parse error at byte {}: {}", self.pos, self.message)
+	}
+}
+
+impl std::error::Error for ParseError {}
+
+/// A lexical token of the filter rule string syntax.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Token {
+	/// A bare word: a field name, an operator keyword, a constant, or an unquoted header name.
+	Ident(String),
+	/// A double-quoted string literal, with escape sequences already decoded.
+	Str(String),
+	/// `(`
+	LParen,
+	/// `)`
+	RParen,
+	/// `[`
+	LBracket,
+	/// `]`
+	RBracket,
+	/// `~` — the regex-match operator.
+	Tilde,
+	/// `!` — prefix logical NOT.
+	Bang,
+	/// `!=` — the not-equal operator.
+	BangEq,
+	/// `&&` — logical AND.
+	AmpAmp,
+	/// `||` — logical OR.
+	PipePipe,
+}
+
+/// A token paired with the byte offset where it began, for error reporting.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Spanned {
+	tok: Token,
+	pos: usize,
+}
+
+/// True for the first byte of a bare identifier (ASCII letter or `_`).
+fn is_ident_start(c: u8) -> bool {
+	c.is_ascii_alphabetic() || c == b'_'
+}
+
+/// True for a continuation byte of a bare identifier — letters, digits, `_`, `-`, `.`
+/// (so header names like `user-agent` and operators like `starts_with` lex as one token).
+fn is_ident_continue(c: u8) -> bool {
+	c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.')
+}
+
+/// Decode a double-quoted string literal beginning at `open` (the opening quote). Returns
+/// the decoded contents and the byte offset just past the closing quote. Supports the
+/// escapes `\"`, `\\`, `\n`, `\t`, `\r`.
+fn lex_string(input: &str, open: usize) -> Result<(String, usize), ParseError> {
+	let bytes = input.as_bytes();
+	let mut out = String::new();
+	let mut i = open + 1; // skip the opening quote
+	while i < bytes.len() {
+		match bytes[i] {
+			b'"' => return Ok((out, i + 1)),
+			b'\\' => {
+				let esc = bytes.get(i + 1).ok_or_else(|| ParseError::new(i, "trailing backslash in string literal"))?;
+				let ch = match esc {
+					b'"' => '"',
+					b'\\' => '\\',
+					b'n' => '\n',
+					b't' => '\t',
+					b'r' => '\r',
+					other => return Err(ParseError::new(i, format!("invalid escape `\\{}`", *other as char))),
+				};
+				out.push(ch);
+				i += 2;
+			}
+			_ => {
+				// Copy one whole UTF-8 char so multibyte content survives intact.
+				let ch = input[i..].chars().next().expect("byte index is on a char boundary");
+				out.push(ch);
+				i += ch.len_utf8();
+			}
+		}
+	}
+	Err(ParseError::new(open, "unterminated string literal"))
+}
+
+/// Tokenize a filter rule string. Whitespace separates tokens and is otherwise ignored.
+fn lex(input: &str) -> Result<Vec<Spanned>, ParseError> {
+	let bytes = input.as_bytes();
+	let mut tokens = Vec::new();
+	let mut i = 0;
+	while i < bytes.len() {
+		let c = bytes[i];
+		match c {
+			b' ' | b'\t' | b'\r' | b'\n' => i += 1,
+			b'(' => {
+				tokens.push(Spanned { tok: Token::LParen, pos: i });
+				i += 1;
+			}
+			b')' => {
+				tokens.push(Spanned { tok: Token::RParen, pos: i });
+				i += 1;
+			}
+			b'[' => {
+				tokens.push(Spanned { tok: Token::LBracket, pos: i });
+				i += 1;
+			}
+			b']' => {
+				tokens.push(Spanned { tok: Token::RBracket, pos: i });
+				i += 1;
+			}
+			b'~' => {
+				tokens.push(Spanned { tok: Token::Tilde, pos: i });
+				i += 1;
+			}
+			b'!' => {
+				if bytes.get(i + 1) == Some(&b'=') {
+					tokens.push(Spanned { tok: Token::BangEq, pos: i });
+					i += 2;
+				} else {
+					tokens.push(Spanned { tok: Token::Bang, pos: i });
+					i += 1;
+				}
+			}
+			b'&' => {
+				if bytes.get(i + 1) == Some(&b'&') {
+					tokens.push(Spanned { tok: Token::AmpAmp, pos: i });
+					i += 2;
+				} else {
+					return Err(ParseError::new(i, "lone `&` (use `&&` for AND)"));
+				}
+			}
+			b'|' => {
+				if bytes.get(i + 1) == Some(&b'|') {
+					tokens.push(Spanned { tok: Token::PipePipe, pos: i });
+					i += 2;
+				} else {
+					return Err(ParseError::new(i, "lone `|` (use `||` for OR)"));
+				}
+			}
+			b'"' => {
+				let (s, next) = lex_string(input, i)?;
+				tokens.push(Spanned { tok: Token::Str(s), pos: i });
+				i = next;
+			}
+			_ if is_ident_start(c) => {
+				let start = i;
+				i += 1;
+				while i < bytes.len() && is_ident_continue(bytes[i]) {
+					i += 1;
+				}
+				tokens.push(Spanned { tok: Token::Ident(input[start..i].to_owned()), pos: start });
+			}
+			_ => {
+				let ch = input[i..].chars().next().expect("byte index is on a char boundary");
+				return Err(ParseError::new(i, format!("unexpected character `{ch}`")));
+			}
+		}
+	}
+	Ok(tokens)
+}
+
+#[cfg(test)]
+mod lex_tests {
+	use super::*;
+
+	fn toks(input: &str) -> Vec<Token> {
+		lex(input).unwrap().into_iter().map(|s| s.tok).collect()
+	}
+
+	#[test]
+	fn idents_and_keywords() {
+		assert_eq!(toks("method eq starts_with"), vec![Token::Ident("method".into()), Token::Ident("eq".into()), Token::Ident("starts_with".into())]);
+		// `-` and `.` continue an ident, so header names lex as one token.
+		assert_eq!(toks("user-agent x.y"), vec![Token::Ident("user-agent".into()), Token::Ident("x.y".into())]);
+	}
+
+	#[test]
+	fn symbols_and_two_char_operators() {
+		assert_eq!(toks("( ) [ ] ~ !"), vec![Token::LParen, Token::RParen, Token::LBracket, Token::RBracket, Token::Tilde, Token::Bang]);
+		assert_eq!(toks("a != b"), vec![Token::Ident("a".into()), Token::BangEq, Token::Ident("b".into())]);
+		assert_eq!(toks("a && b || c"), vec![Token::Ident("a".into()), Token::AmpAmp, Token::Ident("b".into()), Token::PipePipe, Token::Ident("c".into())]);
+		// `!` not followed by `=` is a bare Bang.
+		assert_eq!(toks("!a"), vec![Token::Bang, Token::Ident("a".into())]);
+	}
+
+	#[test]
+	fn string_literals_and_escapes() {
+		assert_eq!(toks(r#""hello""#), vec![Token::Str("hello".into())]);
+		assert_eq!(toks(r#""a\"b\\c\n""#), vec![Token::Str("a\"b\\c\n".into())]);
+		// A quoted string can hold characters that are otherwise operators.
+		assert_eq!(toks(r#""/admin && (x)""#), vec![Token::Str("/admin && (x)".into())]);
+	}
+
+	#[test]
+	fn positions_are_tracked() {
+		let spanned = lex("method  eq").unwrap();
+		assert_eq!(spanned[0].pos, 0);
+		assert_eq!(spanned[1].pos, 8, "leading whitespace is skipped but counted in the offset");
+	}
+
+	#[test]
+	fn lex_errors() {
+		assert_eq!(lex(r#""unterminated"#).unwrap_err().pos, 0);
+		assert_eq!(lex(r#""bad\escape""#).unwrap_err().message, "invalid escape `\\e`");
+		assert_eq!(lex("a & b").unwrap_err().message, "lone `&` (use `&&` for AND)");
+		assert_eq!(lex("a | b").unwrap_err().message, "lone `|` (use `||` for OR)");
+		assert_eq!(lex("a @ b").unwrap_err().message, "unexpected character `@`");
+		assert_eq!(lex("a @ b").unwrap_err().pos, 2);
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use axum::http::Request;

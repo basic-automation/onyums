@@ -704,6 +704,200 @@ pub fn parse(input: &str) -> Result<FilterExpr, ParseError> {
 	FilterExpr::parse(input)
 }
 
+// ---------------------------------------------------------------------------
+// String-syntax front-end: canonical serialization (the parser's inverse)
+// ---------------------------------------------------------------------------
+
+/// Write `value` as a double-quoted string literal the lexer round-trips: `"` and `\` are
+/// escaped (so a backslash always decodes back to one), and the whitespace controls become
+/// `\n`/`\t`/`\r`. Everything else is emitted verbatim.
+fn fmt_quoted(f: &mut std::fmt::Formatter<'_>, value: &str) -> std::fmt::Result {
+	f.write_str("\"")?;
+	for ch in value.chars() {
+		match ch {
+			'"' => f.write_str("\\\"")?,
+			'\\' => f.write_str("\\\\")?,
+			'\n' => f.write_str("\\n")?,
+			'\t' => f.write_str("\\t")?,
+			'\r' => f.write_str("\\r")?,
+			_ => write!(f, "{ch}")?,
+		}
+	}
+	f.write_str("\"")
+}
+
+/// Write a field in the rule syntax. Header names are always quoted so any HTTP-token
+/// character (`!`, `#`, …) round-trips, not just the bare-identifier subset.
+fn fmt_field(f: &mut std::fmt::Formatter<'_>, field: &Field) -> std::fmt::Result {
+	match field {
+		Field::Method => f.write_str("method"),
+		Field::Path => f.write_str("path"),
+		Field::Query => f.write_str("query"),
+		Field::Header(name) => {
+			f.write_str("header[")?;
+			fmt_quoted(f, name.as_str())?;
+			f.write_str("]")
+		}
+	}
+}
+
+/// Write a `field op value` predicate. The canonical form uses the keyword operators
+/// (`ne`/`matches`), never the `!=`/`~` symbol aliases.
+fn fmt_predicate(f: &mut std::fmt::Formatter<'_>, field: &Field, op: &StrOp) -> std::fmt::Result {
+	fmt_field(f, field)?;
+	let (keyword, value) = match op {
+		StrOp::Exists => return write!(f, " exists"),
+		StrOp::Eq(s) => ("eq", s.as_str()),
+		StrOp::NotEq(s) => ("ne", s.as_str()),
+		StrOp::Contains(s) => ("contains", s.as_str()),
+		StrOp::StartsWith(s) => ("starts_with", s.as_str()),
+		StrOp::EndsWith(s) => ("ends_with", s.as_str()),
+		StrOp::Matches(re) => ("matches", re.as_str()),
+	};
+	write!(f, " {keyword} ")?;
+	fmt_quoted(f, value)
+}
+
+impl FilterExpr {
+	/// Operator binding tightness, for deciding when a child needs parentheses:
+	/// `or` (loosest) < `and` < `not` < atom (predicate/constant, tightest).
+	fn precedence(&self) -> u8 {
+		match self {
+			FilterExpr::Or(_) => 1,
+			FilterExpr::And(_) => 2,
+			FilterExpr::Not(_) => 3,
+			FilterExpr::Predicate { .. } | FilterExpr::Always | FilterExpr::Never => 4,
+		}
+	}
+
+	/// Render this node, wrapping in parens when it binds looser than its parent context.
+	fn write_inner(&self, f: &mut std::fmt::Formatter<'_>, parent: u8) -> std::fmt::Result {
+		let wrap = self.precedence() < parent;
+		if wrap {
+			f.write_str("(")?;
+		}
+		match self {
+			FilterExpr::Always => f.write_str("true")?,
+			FilterExpr::Never => f.write_str("false")?,
+			FilterExpr::Predicate { field, op } => fmt_predicate(f, field, op)?,
+			FilterExpr::Not(inner) => {
+				f.write_str("not ")?;
+				inner.write_inner(f, 3)?;
+			}
+			FilterExpr::And(subs) => {
+				if subs.is_empty() {
+					f.write_str("true")?; // vacuous AND
+				} else {
+					for (i, s) in subs.iter().enumerate() {
+						if i > 0 {
+							f.write_str(" and ")?;
+						}
+						s.write_inner(f, 2)?;
+					}
+				}
+			}
+			FilterExpr::Or(subs) => {
+				if subs.is_empty() {
+					f.write_str("false")?; // vacuous OR
+				} else {
+					for (i, s) in subs.iter().enumerate() {
+						if i > 0 {
+							f.write_str(" or ")?;
+						}
+						s.write_inner(f, 1)?;
+					}
+				}
+			}
+		}
+		if wrap {
+			f.write_str(")")?;
+		}
+		Ok(())
+	}
+}
+
+impl std::fmt::Display for FilterExpr {
+	/// The canonical rule string — the inverse of [`FilterExpr::parse`]. `parse(expr.to_string())`
+	/// re-parses to an equivalent expression, and re-serializing is a fixed point.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		self.write_inner(f, 0)
+	}
+}
+
+#[cfg(test)]
+mod display_tests {
+	use axum::http::Request;
+
+	use super::*;
+
+	fn parts(builder: axum::http::request::Builder) -> Parts {
+		builder.body(()).unwrap().into_parts().0
+	}
+
+	#[test]
+	fn predicates_and_operators_render() {
+		assert_eq!(Field::method().eq("POST").to_string(), r#"method eq "POST""#);
+		assert_eq!(Field::path().not_eq("/x").to_string(), r#"path ne "/x""#);
+		assert_eq!(Field::path().starts_with("/admin").to_string(), r#"path starts_with "/admin""#);
+		assert_eq!(Field::query().exists().to_string(), "query exists");
+		assert_eq!(Field::header(HeaderName::from_static("user-agent")).contains("curl").to_string(), r#"header["user-agent"] contains "curl""#);
+		assert_eq!(FilterExpr::Always.to_string(), "true");
+		assert_eq!(FilterExpr::Never.to_string(), "false");
+	}
+
+	#[test]
+	fn precedence_parenthesizes_only_where_needed() {
+		// AND of two atoms: no parens.
+		let flat = Field::method().eq("POST").and(Field::path().starts_with("/admin"));
+		assert_eq!(flat.to_string(), r#"method eq "POST" and path starts_with "/admin""#);
+		// AND whose child is an OR: the OR is wrapped (it binds looser).
+		let nested = Field::method().eq("GET").and(Field::path().eq("/a").or(Field::path().eq("/b")));
+		assert_eq!(nested.to_string(), r#"method eq "GET" and (path eq "/a" or path eq "/b")"#);
+		// NOT over a compound wraps; NOT over an atom does not.
+		assert_eq!((!Field::method().eq("GET")).to_string(), r#"not method eq "GET""#);
+		assert_eq!((!flat.clone()).to_string(), r#"not (method eq "POST" and path starts_with "/admin")"#);
+	}
+
+	#[test]
+	fn quoting_round_trips_special_characters() {
+		// Backslash and quote in a value are escaped so they decode back to themselves.
+		let e = Field::header(HeaderName::from_static("x-v")).eq("a\"b\\c");
+		let s = e.to_string();
+		assert_eq!(s, r#"header["x-v"] eq "a\"b\\c""#);
+		let p = parts(Request::builder().uri("/").header("x-v", "a\"b\\c"));
+		assert!(FilterExpr::parse(&s).unwrap().evaluate(&p), "the re-parsed rule matches the original value");
+	}
+
+	#[test]
+	fn regex_value_round_trips_with_doubled_backslashes() {
+		let e = Field::path().matches(r"^/x/\d+$").unwrap();
+		let s = e.to_string();
+		assert_eq!(s, r#"path matches "^/x/\\d+$""#, "the literal backslash is doubled in canonical form");
+		let p = parts(Request::builder().uri("/x/42"));
+		assert!(FilterExpr::parse(&s).unwrap().evaluate(&p));
+	}
+
+	#[test]
+	fn display_is_a_fixed_point_of_parse() {
+		// Whatever Display emits, parse accepts, and re-serializing is identical — proving the
+		// parser is the inverse of the serializer across the operator and connective surface.
+		let canon = |input: &str| FilterExpr::parse(input).unwrap().to_string();
+		for input in [
+			r#"method eq "POST""#,
+			r#"path ~ "^/admin/\w+$""#,
+			r#"method != "GET" && path starts_with "/api""#,
+			r#"query exists || header[x-token] eq "v""#,
+			r#"not (method eq "GET" and (path eq "/a" or path eq "/b"))"#,
+			"true",
+			"false",
+		] {
+			let once = canon(input);
+			let twice = canon(&once);
+			assert_eq!(once, twice, "canonical form of `{input}` must re-parse to itself");
+		}
+	}
+}
+
 #[cfg(test)]
 mod parse_tests {
 	use axum::http::Request;

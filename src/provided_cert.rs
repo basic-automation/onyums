@@ -57,6 +57,24 @@ impl ProvidedCert {
 		Ok(Self { config: Arc::new(config) })
 	}
 
+	/// Read a PEM certificate chain and private key from the filesystem and
+	/// validate them, the common case for an operator who keeps their CA-signed
+	/// certificate as files on disk.
+	///
+	/// A thin convenience over [`from_pem`](Self::from_pem): each file is read
+	/// and the bytes handed straight to it, so the same eager validation applies.
+	///
+	/// # Errors
+	/// Returns an error if either file cannot be read, or if the PEM content is
+	/// rejected by [`from_pem`](Self::from_pem).
+	pub fn from_pem_files(cert_path: impl AsRef<std::path::Path>, key_path: impl AsRef<std::path::Path>) -> Result<Self> {
+		let cert_path = cert_path.as_ref();
+		let key_path = key_path.as_ref();
+		let cert_pem = std::fs::read(cert_path).map_err(|e| anyhow::anyhow!("failed to read certificate file {}: {e}", cert_path.display()))?;
+		let key_pem = std::fs::read(key_path).map_err(|e| anyhow::anyhow!("failed to read private-key file {}: {e}", key_path.display()))?;
+		Self::from_pem(&cert_pem, &key_pem)
+	}
+
 	/// The shared, validated `rustls` server configuration. Cloning the returned
 	/// [`Arc`] is how the TLS acceptor is built without re-parsing the PEM.
 	#[must_use]
@@ -120,6 +138,33 @@ mod tests {
 		let a = provided.server_config();
 		let b = provided.server_config();
 		assert!(Arc::ptr_eq(&a, &b), "server_config should share one validated config, not rebuild it");
+	}
+
+	#[test]
+	fn from_pem_files_loads_and_validates_from_disk() {
+		let (cert, key) = sample_pem();
+		// Unique paths under the system temp dir, namespaced by PID so parallel
+		// test binaries do not collide.
+		let dir = std::env::temp_dir();
+		let cert_path = dir.join(format!("onyums-provided-cert-{}.pem", std::process::id()));
+		let key_path = dir.join(format!("onyums-provided-key-{}.pem", std::process::id()));
+		std::fs::write(&cert_path, cert.as_bytes()).expect("write cert");
+		std::fs::write(&key_path, key.as_bytes()).expect("write key");
+
+		let result = ProvidedCert::from_pem_files(&cert_path, &key_path);
+
+		// Clean up regardless of the assertion outcome.
+		let _ = std::fs::remove_file(&cert_path);
+		let _ = std::fs::remove_file(&key_path);
+		result.expect("a valid PEM pair on disk should load");
+	}
+
+	#[test]
+	fn from_pem_files_reports_a_missing_file() {
+		let dir = std::env::temp_dir();
+		let missing = dir.join(format!("onyums-provided-does-not-exist-{}.pem", std::process::id()));
+		let err = ProvidedCert::from_pem_files(&missing, &missing).expect_err("a missing file must be an error");
+		assert!(err.to_string().contains("failed to read certificate file"), "unexpected error: {err}");
 	}
 
 	#[test]

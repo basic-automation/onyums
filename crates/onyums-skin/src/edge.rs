@@ -92,6 +92,18 @@ impl EdgeMatch {
 			EdgeMatch::Expr(expr) => expr.evaluate(parts),
 		}
 	}
+
+	/// Build an [`Expr`](Self::Expr) matcher from an operator-authored rule string, so edge
+	/// rules can be defined in configuration rather than code. The string is the filter
+	/// language — e.g. `method eq "POST" and path starts_with "/admin"`; see
+	/// [`FilterExpr::parse`](crate::filter::FilterExpr::parse) for the full grammar.
+	///
+	/// # Errors
+	/// Returns the [`ParseError`](crate::filter::ParseError) from the filter parser on any
+	/// lexing or parsing failure (unknown field/operator, invalid regex, unbalanced group, …).
+	pub fn expr(rule: &str) -> Result<Self, crate::filter::ParseError> {
+		Ok(EdgeMatch::Expr(crate::filter::FilterExpr::parse(rule)?))
+	}
 }
 
 /// The action half of an [`EdgeRule`]. A redirect or block short-circuits the request; a
@@ -409,6 +421,17 @@ mod tests {
 		let regex_rule = EdgeRules::new().push(EdgeMatch::Expr(Field::path().matches(r"^/item/\d+$").unwrap()), EdgeAction::Block(StatusCode::NOT_FOUND));
 		assert!(regex_rule.evaluate(&parts(Request::builder().uri("/item/42"))).is_short_circuit());
 		assert!(!regex_rule.evaluate(&parts(Request::builder().uri("/item/abc"))).is_short_circuit());
+	}
+
+	#[test]
+	fn expr_matcher_from_rule_string() {
+		// The same condition authored as a config string instead of built in code.
+		let m = EdgeMatch::expr(r#"method eq "POST" and path starts_with "/admin""#).unwrap();
+		assert!(m.matches(&parts(Request::builder().method("POST").uri("/admin/x"))));
+		assert!(!m.matches(&parts(Request::builder().method("GET").uri("/admin/x"))));
+		assert!(!m.matches(&parts(Request::builder().method("POST").uri("/public"))));
+		// A malformed rule surfaces the filter parser's error rather than building a matcher.
+		assert!(EdgeMatch::expr(r#"frob eq "x""#).is_err());
 	}
 
 	#[test]

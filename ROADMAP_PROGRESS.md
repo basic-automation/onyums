@@ -7,6 +7,100 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-29 — onyums-skin Phase 3/5 frontier: filter rule-string front-end (lex → parse → serialize → wire) (5 increments)
+
+Branch `routine/onyums-2026-06-29` → PR (base `master`). **Crate alternation:** the previous
+run (2026-06-28 run 2, PR [#21](https://github.com/basic-automation/onyums/pull/21)) advanced
+the **onyums server** (Phase 3 BYO cert), so per the never-twice-in-a-row rule this run targets
+**onyums-skin**. It builds the documented next step from the 2026-06-28 onyums-skin entry (PR
+[#20](https://github.com/basic-automation/onyums/pull/20)): the **filter string-syntax parser**
+that turns an operator-authored rule string into the typed `FilterExpr` AST, so WAF/edge-rule
+conditions become config-driven. Delivered as a complete arc — lexer → parser → canonical
+serializer → first consumer → idiomatic trait — every increment pure Rust, no new dependency,
+fully offline and unit-tested. Workspace stayed green and clippy-clean throughout.
+
+**Increment 1 — rule-string lexer.** *Phase 3 WAF / Phase 5, `wirefilter` resolution path (c).*
+Files: `src/filter.rs`. A position-tracking tokenizer over the rule grammar: identifiers (field
+names / operator keywords / bare header names), double-quoted string literals with escape
+decoding, the bracket/paren punctuation, and the two-char operators `!=`/`&&`/`||` plus `~`/`!`.
+`ParseError` carries the byte offset where a problem was detected (lone `&`/`|`, unterminated
+string, invalid escape, unexpected character). **+5 unit tests.**
+
+**Increment 2 — recursive-descent parser → `FilterExpr`.** *Same item.* Files: `src/filter.rs`,
+`src/lib.rs`. `FilterExpr::parse` (and the free `filter::parse`) consume the tokens into the AST.
+Grammar: fields `method`/`path`/`query`/`header[NAME]` (name quoted or bare); operators `eq`,
+`ne`/`!=`, `contains`, `starts_with`, `ends_with`, `matches`/`~` (regex), unary `exists`;
+combined with `and`/`&&`, `or`/`||`, `not`/`!`, parens, and `true`/`false` constants; precedence
+`not` → `and` → `or`. Errors are specific and positioned (unknown field/operator, missing value,
+invalid regex or header name, unbalanced group, trailing tokens). Also refined the lexer's string
+escaping — surfaced by regex values: the recognized escapes decode, but any *other* `\x` now
+passes through verbatim so regex metacharacters (`\w`, `\d`, `\.`) read naturally in a `matches`
+value instead of needing doubled backslashes (a trailing backslash is still an error).
+`ParseError` re-exported at the crate root. **+9 parser unit tests + 1 doctest.**
+
+**Increment 3 — canonical `Display` (parser's inverse).** *Same item.* Files: `src/filter.rs`.
+`FilterExpr` renders back to a rule string via `Display`/`to_string`, so a rule is inspectable,
+loggable, and persistable. Canonical form: keyword operators only (never the `!=`/`~` aliases),
+header names always quoted (any HTTP-token char round-trips), and precedence-minimal parens (a
+child is wrapped only when it binds looser than its parent). Value quoting is the lexer's inverse
+(`"`/`\` escaped so a backslash always decodes back to one), so a regex value re-parses intact.
+A fixed-point test locks `parse∘to_string` as identity across the operator/connective surface.
+**+5 unit tests.**
+
+**Increment 4 — `EdgeMatch::expr` (first consumer).** *Phase 5 edge-rules × the filter
+front-end.* Files: `src/edge.rs`. `EdgeMatch::expr(rule)` parses a rule string into an
+`EdgeMatch::Expr`, so edge rules can be authored in configuration rather than built in code (e.g.
+`method eq "POST" and path starts_with "/admin"`); a malformed rule returns the parser's
+`ParseError`. Closes the loop the parser slices opened: lex → parse → a config string becomes a
+live, evaluable rule condition. **+1 unit test.**
+
+**Increment 5 — `FromStr` for `FilterExpr` (idiomatic capstone).** *Same item.* Files:
+`src/filter.rs`. `impl FromStr` delegating to `FilterExpr::parse`, the standard partner to the
+`Display` impl: `"...".parse::<FilterExpr>()` works and any config-deserialization path keyed on
+`FromStr` gets the filter language for free. Paired with `Display`, `FilterExpr` round-trips
+text ⇄ AST through the idiomatic traits. **+1 unit test.**
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each increment; the one pre-existing
+  `proc-macro-error2` future-incompat note is a transitive dep, not ours — same as prior runs).
+- `cargo test -p onyums-skin`: **291 passed; 0 failed; 0 ignored** (lib) + **2 doctests passed**
+  (final). Up from 270 lib + 1 doctest at run start (**+21 lib: 5+9+5+1+1; +1 doctest**).
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** (fixed two directly along the way —
+  a test `== false` rewritten as a negation, and the escaping `match` restructured to push chars;
+  never `#[allow]`).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design; nothing
+  this run touched the onyums server crate or the live-serve path.
+
+### Done vs. open (onyums-skin Phase 3/5)
+- DONE this run: the filter **string-syntax front-end** — lexer, recursive-descent parser
+  (`FilterExpr::parse` / `FromStr` / `filter::parse`), canonical `Display` (parser's inverse,
+  fixed-point), and `EdgeMatch::expr` config-authoring. **`wirefilter` blocker resolution path
+  (c) is now complete** (AST + evaluator from PR #20, plus this string front-end).
+- OPEN: the WAF custom-rule path adopting `FilterExpr::parse` for operator-tunable rule
+  *conditions* (the WAF is today a `RegexSet` signature engine — gating rules on a `FilterExpr`
+  condition is a design-heavy slice, not a quick wire); **restricted-discovery orchestration**
+  (bridges Arti client-auth into Skin policy — needs Arti types, host-integration, a poor
+  offline-verifiable fit for a skin run); wiring `EdgeRules`/`ResponseCache` into `SkinLayer`
+  (host-integration, hits the live-serve path).
+- NOT a skin concern this run: onyums server Phases 1/3/4 (the other crate; advanced last run, PR
+  #21).
+
+**STOP REASON:** Landed 5 verifiable increments (above the 2–4 bar) forming one coherent,
+self-contained arc that completes the filter string-syntax front-end and closes the `wirefilter`
+Phase-3 blocker (resolution path c). The remaining skin items are each either a design-heavy
+slice better isolated on its own (the WAF condition-gating adoption) or host-integration that is
+not offline-verifiable on a skin run (restricted-discovery needs Arti; `SkinLayer` wiring hits
+the live-serve path) — so stopping here rather than starting one of those rushed. Workspace is
+green; every increment is committed and nothing is half-landed.
+
+**NEXT STEP:** *(onyums, next run by alternation)* Continue the server roadmap (Phase 1 identity
+helpers / Phase 3 handler surface) per its own progress tail. *(skin, when alternation next
+allows)* Adopt `FilterExpr::parse` in the WAF custom-rule path so a custom rule can carry a
+`FilterExpr` *condition* (fire only when the expression matches) in addition to its regex
+signature — operator-tunable rule gating, the natural next use of the now-complete front-end.
+
+---
+
 ## 2026-06-28 (run 2) — onyums server Phase 3 TLS-first: bring-your-own certificate (`Tls::Provided`) (5 increments)
 
 Branch `routine/onyums-2026-06-28-2` → PR

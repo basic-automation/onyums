@@ -31,32 +31,69 @@ pub enum Tls {
 	Strict,
 }
 
+impl Tls {
+	/// The pure, `Copy` plaintext-enforcement decision this mode implies.
+	///
+	/// This is the *only* part of [`Tls`] the rendezvous loop needs: how to
+	/// treat a plaintext (port-80) circuit and whether to emit HSTS. Factoring
+	/// it out lets the loop thread a small [`Copy`] value while [`Tls`] itself is
+	/// free to carry non-`Copy` configuration (e.g. a bring-your-own
+	/// certificate) that only the one-time acceptor build consumes.
+	#[must_use]
+	pub const fn plaintext_policy(self) -> PlaintextPolicy {
+		match self {
+			Self::Upgrade => PlaintextPolicy::Upgrade,
+			Self::Strict => PlaintextPolicy::Reject,
+		}
+	}
+}
+
+/// How the rendezvous loop treats a plaintext (port-80) circuit — the pure,
+/// `Copy` enforcement decision threaded through the serve path.
+///
+/// Separated from [`Tls`] so the loop carries a trivially-copyable value while
+/// the builder-facing [`Tls`] mode is free to hold non-`Copy` data (a provided
+/// certificate). HSTS emission rides along with [`PlaintextPolicy::Reject`]: a
+/// service that refuses plaintext also tells conforming clients never to try it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlaintextPolicy {
+	/// Plaintext HTTP on port 80 is answered with a `301` redirect to HTTPS, and
+	/// no HSTS header is emitted. The forgiving default.
+	#[default]
+	Upgrade,
+	/// Plaintext circuits are rejected outright (no port-80 handler), and HTTPS
+	/// responses carry HSTS.
+	Reject,
+}
+
 /// What the rendezvous loop should do with a BEGIN cell for a given port under a
-/// given [`Tls`] mode. The pure, offline-testable counterpart to the live port
-/// dispatch in `handle_stream_request`.
+/// given [`PlaintextPolicy`]. The pure, offline-testable counterpart to the live
+/// port dispatch in `handle_stream_request`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortAction {
 	/// Accept the stream and serve it over TLS + HTTP (the axum app). Port 443.
 	ServeTls,
 	/// Accept the stream and answer with a `301` redirect to the HTTPS URL.
-	/// Port 80 under [`Tls::Upgrade`] only.
+	/// Port 80 under [`PlaintextPolicy::Upgrade`] only.
 	RedirectToHttps,
 	/// Reject the stream and tear down the circuit. Any non-HTTP port, plus
-	/// port 80 under [`Tls::Strict`] (plaintext is non-negotiable there).
+	/// port 80 under [`PlaintextPolicy::Reject`] (plaintext is non-negotiable
+	/// there).
 	Reject,
 }
 
-/// Decide what to do with a stream for `port` under the chosen `tls` mode.
+/// Decide what to do with a stream for `port` under the chosen plaintext policy.
 ///
 /// Port 443 is always served over TLS. Port 80 is upgraded to HTTPS under
-/// [`Tls::Upgrade`] but **rejected** under [`Tls::Strict`] (no plaintext handler
-/// at all). Every other port is rejected — the built-in handler is HTTP-only;
-/// arbitrary-port `StreamHandler`s are a later Phase 3 slice.
+/// [`PlaintextPolicy::Upgrade`] but **rejected** under [`PlaintextPolicy::Reject`]
+/// (no plaintext handler at all). Every other port is rejected — the built-in
+/// handler is HTTP-only; arbitrary-port `StreamHandler`s are a later Phase 3
+/// slice.
 #[must_use]
-pub const fn port_action(port: u16, tls: Tls) -> PortAction {
-	match (port, tls) {
+pub const fn port_action(port: u16, plaintext: PlaintextPolicy) -> PortAction {
+	match (port, plaintext) {
 		(443, _) => PortAction::ServeTls,
-		(80, Tls::Upgrade) => PortAction::RedirectToHttps,
+		(80, PlaintextPolicy::Upgrade) => PortAction::RedirectToHttps,
 		_ => PortAction::Reject,
 	}
 }
@@ -64,18 +101,18 @@ pub const fn port_action(port: u16, tls: Tls) -> PortAction {
 /// The HSTS response-header name.
 pub const HSTS_HEADER_NAME: &str = "strict-transport-security";
 
-/// The HSTS response-header value onyums emits in [`Tls::Strict`] mode: two
+/// The HSTS response-header value onyums emits when plaintext is rejected: two
 /// years, covering subdomains. No `preload` directive — preload requires the
 /// public HSTS-preload registration that does not apply to a `.onion` host.
 pub const HSTS_HEADER_VALUE: &str = "max-age=63072000; includeSubDomains";
 
 /// The HSTS `(name, value)` header pair to add to HTTPS responses, or `None`
-/// when the mode does not enforce HSTS.
+/// when the policy does not enforce HSTS.
 #[must_use]
-pub const fn hsts_header(tls: Tls) -> Option<(&'static str, &'static str)> {
-	match tls {
-		Tls::Strict => Some((HSTS_HEADER_NAME, HSTS_HEADER_VALUE)),
-		Tls::Upgrade => None,
+pub const fn hsts_header(plaintext: PlaintextPolicy) -> Option<(&'static str, &'static str)> {
+	match plaintext {
+		PlaintextPolicy::Reject => Some((HSTS_HEADER_NAME, HSTS_HEADER_VALUE)),
+		PlaintextPolicy::Upgrade => None,
 	}
 }
 
@@ -89,34 +126,41 @@ mod tests {
 	}
 
 	#[test]
+	fn plaintext_policy_maps_mode_to_enforcement() {
+		assert_eq!(Tls::Upgrade.plaintext_policy(), PlaintextPolicy::Upgrade);
+		assert_eq!(Tls::Strict.plaintext_policy(), PlaintextPolicy::Reject);
+		assert_eq!(PlaintextPolicy::default(), PlaintextPolicy::Upgrade);
+	}
+
+	#[test]
 	fn port_443_is_always_served_over_tls() {
-		assert_eq!(port_action(443, Tls::Upgrade), PortAction::ServeTls);
-		assert_eq!(port_action(443, Tls::Strict), PortAction::ServeTls);
+		assert_eq!(port_action(443, PlaintextPolicy::Upgrade), PortAction::ServeTls);
+		assert_eq!(port_action(443, PlaintextPolicy::Reject), PortAction::ServeTls);
 	}
 
 	#[test]
 	fn port_80_upgrades_by_default_but_is_rejected_when_strict() {
-		assert_eq!(port_action(80, Tls::Upgrade), PortAction::RedirectToHttps);
-		assert_eq!(port_action(80, Tls::Strict), PortAction::Reject);
+		assert_eq!(port_action(80, PlaintextPolicy::Upgrade), PortAction::RedirectToHttps);
+		assert_eq!(port_action(80, PlaintextPolicy::Reject), PortAction::Reject);
 	}
 
 	#[test]
 	fn non_http_ports_are_always_rejected() {
 		for port in [0_u16, 22, 25, 8080, 9735, 65535] {
-			assert_eq!(port_action(port, Tls::Upgrade), PortAction::Reject, "port {port} should be rejected (upgrade)");
-			assert_eq!(port_action(port, Tls::Strict), PortAction::Reject, "port {port} should be rejected (strict)");
+			assert_eq!(port_action(port, PlaintextPolicy::Upgrade), PortAction::Reject, "port {port} should be rejected (upgrade)");
+			assert_eq!(port_action(port, PlaintextPolicy::Reject), PortAction::Reject, "port {port} should be rejected (reject)");
 		}
 	}
 
 	#[test]
-	fn hsts_only_in_strict_mode() {
-		assert_eq!(hsts_header(Tls::Upgrade), None);
-		assert_eq!(hsts_header(Tls::Strict), Some((HSTS_HEADER_NAME, HSTS_HEADER_VALUE)));
+	fn hsts_only_when_plaintext_rejected() {
+		assert_eq!(hsts_header(PlaintextPolicy::Upgrade), None);
+		assert_eq!(hsts_header(PlaintextPolicy::Reject), Some((HSTS_HEADER_NAME, HSTS_HEADER_VALUE)));
 	}
 
 	#[test]
 	fn hsts_value_is_a_wellformed_directive() {
-		let (name, value) = hsts_header(Tls::Strict).expect("strict mode emits HSTS");
+		let (name, value) = hsts_header(PlaintextPolicy::Reject).expect("reject policy emits HSTS");
 		assert_eq!(name, "strict-transport-security");
 		assert!(value.starts_with("max-age="), "HSTS must lead with max-age: {value}");
 		assert!(value.contains("includeSubDomains"), "HSTS should cover subdomains: {value}");

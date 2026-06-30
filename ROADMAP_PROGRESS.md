@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-06-30 — onyums server Phase 3: StreamHandler trait + .route_port arbitrary-protocol tunneling (4 increments)
 
-Branch `routine/onyums-2026-06-30` → PR (see end). **Crate alternation:** the previous run
+Branch `routine/onyums-2026-06-30` → PR [#23](https://github.com/basic-automation/onyums/pull/23)
+(base `master`). **Crate alternation:** the previous run
 (2026-06-29, PR [#22](https://github.com/basic-automation/onyums/pull/22)) advanced
 **onyums-skin** (Phase 3/5 filter front-end), so per the never-twice-in-a-row rule this run targets
 the **onyums server**. It builds the documented next step from the 2026-06-28 (run 2) entry — the

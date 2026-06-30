@@ -46,10 +46,12 @@ use onyums_skin::CircuitId;
 
 mod circuit_gate;
 mod port_router;
+mod raw_tcp;
 mod provided_cert;
 mod tls_policy;
 mod vanity;
 pub use port_router::{AsyncStream, OnionStream, PortRouter, ServeFuture, StreamHandler};
+pub use raw_tcp::RawTcpHandler;
 pub use provided_cert::ProvidedCert;
 pub use tls_policy::Tls;
 pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};

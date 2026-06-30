@@ -8,6 +8,7 @@ Onyums is an axum wrapper for serving tor onion services — secure and complete
 *******************
 ####  **NEW! - Onyums now ships a secure-by-default abuse-defense layer (Skin): a proof-of-work gate, no-JS fallback, token rate limiting, and a pure-Rust WAF — see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).**
 ####  **NEW! - The builder returns an `OnionServiceHandle` with a real readiness signal (`ready()`), the `.onion` address, and graceful `shutdown()` — no more polling a global.**
+####  **NEW! - Onyums can now tunnel ANY protocol over an onion service — `.route_port(port, handler)` for raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler. See [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).**
 ####  **NEW! - Onyums now supports websockets over Tor!**
 ####  **NEW! - Onyums now generates self-signed certs automatically on the fly!**
 #### **NEW! - Onyums now automatically upgrades http urls to https with no extra work on your end.**
@@ -82,6 +83,7 @@ async fn main() {
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits & Under-Attack mode
 		// .tls(Tls::Strict)                     // make TLS non-negotiable (reject plaintext, emit HSTS)
 		// .tls(Tls::Provided(my_cert))          // serve your own CA-signed cert instead of self-signed
+		// .route_port(9735, raw_handler)        // serve another protocol (raw TCP, gRPC, SSH, ...) on a non-HTTP port
 		// .no_skin()                            // opt out of the gate entirely
 		.serve()
 		.await
@@ -144,6 +146,29 @@ async fn main() {
 ```
 
 `.tls(Tls::Strict)` is an explicit opt **down** in client tolerance, never an opt *up* into TLS: TLS is on in every mode.
+
+****
+
+## Protocol versatility — any protocol over an onion service
+
+The built-in handler is the TLS-enforced HTTP/WS app, serving port 443 (HTTPS) and port 80 (the HTTPS upgrade/redirect). But an onion service is just a byte tunnel, so onyums lets you serve **any** protocol on **any other** port with `.route_port(port, handler)` — gRPC, SSH, a game server, Lightning, anything that speaks raw TCP:
+
+```rust
+use onyums::{OnionService, RawTcpHandler, routing::get, Router};
+
+let handle = OnionService::builder()
+	.router(Router::new().route("/", get(|| async { "Hello, World!" }))) // HTTP on 443/80
+	.nickname("my_onion")
+	.route_port(9735, RawTcpHandler::new("127.0.0.1:9735")) // Lightning over the onion service
+	.route_port(2222, RawTcpHandler::new("127.0.0.1:22"))   // SSH over the onion service
+	.serve()
+	.await
+	.unwrap();
+```
+
+`RawTcpHandler` forwards each accepted stream to a local TCP backend and splices the two together until either side closes. The backend protocol negotiates its own end-to-end security over the already-encrypted onion channel — onyums does **not** wrap a raw handler in its TLS, which is reserved for the HTTP handler.
+
+Bring your own protocol by implementing the `StreamHandler` trait (one method: `serve(&self, stream: OnionStream) -> ServeFuture`). The TLS-first posture is preserved no matter what you register: ports **80 and 443 stay reserved for the built-in HTTP handler**, so a raw handler may only occupy another (otherwise-rejected) port — registering a reserved port, port 0, or the same port twice is a clean error from `serve()`, not a runtime surprise. This is an opt **up** in protocol reach, never a relaxation of the secure HTTP defaults.
 
 ****
 

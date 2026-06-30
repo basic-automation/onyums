@@ -45,9 +45,13 @@ pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
+mod port_router;
+mod raw_tcp;
 mod provided_cert;
 mod tls_policy;
 mod vanity;
+pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeFuture, StreamHandler};
+pub use raw_tcp::RawTcpHandler;
 pub use provided_cert::ProvidedCert;
 pub use tls_policy::Tls;
 pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};
@@ -236,6 +240,24 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 	Ok(address)
 }
 
+/// The shared, per-service context threaded through the rendezvous loop down to
+/// every served stream: the application router, the TLS acceptor, the service
+/// address, the plaintext-enforcement policy, and the port → handler routing
+/// table.
+///
+/// Bundled into one cheaply-`Clone` value (the `Router`/`TlsAcceptor`/`Arc` clones
+/// are all shallow) so the loop's helpers take a handful of arguments instead of a
+/// long, error-prone positional list. The per-circuit [`CircuitPolicy`] is kept
+/// separate because it is borrowed (`&dyn`) at the circuit level, not cloned.
+#[derive(Clone)]
+struct ServeContext {
+	app: Router,
+	tls_acceptor: TlsAcceptor,
+	address: OnionAddress,
+	plaintext: tls_policy::PlaintextPolicy,
+	port_router: Arc<PortRouter>,
+}
+
 /// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
 /// per-circuit boundary that `tor_hsservice::handle_rend_requests` (the flattener used
 /// before) discards.
@@ -248,7 +270,7 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 /// drives accept / per-stream reject / whole-circuit teardown. Each circuit's streams
 /// are handled on a dedicated task so circuits run concurrently, and the circuit's
 /// accounting is dropped via [`CircuitPolicy::forget`] once its stream drains.
-async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: Arc<dyn CircuitPolicy>, plaintext: tls_policy::PlaintextPolicy) -> Result<()> {
+async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, ctx: ServeContext, policy: Arc<dyn CircuitPolicy>) -> Result<()> {
 	event!(Level::INFO, "Waiting for incoming rendezvous circuits...");
 	let allocator = Arc::new(CircuitIdAllocator::new());
 	while let Some(rend_request) = rend_requests.next().await {
@@ -276,12 +298,10 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 			}
 		};
 
-		let app = app.clone();
-		let tls_acceptor = tls_acceptor.clone();
-		let address = address.clone();
+		let ctx = ctx.clone();
 		let policy = policy.clone();
 		tokio::spawn(async move {
-			handle_circuit_streams(streams, id, app, tls_acceptor, address, policy.as_ref(), plaintext).await;
+			handle_circuit_streams(streams, id, ctx, policy.as_ref()).await;
 			// The circuit has drained; drop its accounting so the policy's map does not
 			// grow without bound (there is no per-stream close hook).
 			policy.forget(&id);
@@ -293,7 +313,7 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 
 /// Handles every stream on one accepted rendezvous circuit, consulting the policy per
 /// stream and spawning a task to serve each one the policy admits.
-async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, app: Router, tls_acceptor: TlsAcceptor, address: OnionAddress, policy: &dyn CircuitPolicy, plaintext: tls_policy::PlaintextPolicy) {
+async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, ctx: ServeContext, policy: &dyn CircuitPolicy) {
 	while let Some(stream_request) = streams.next().await {
 		let stream_span = span!(Level::INFO, "onyums - incoming_stream");
 		let _stream_guard = stream_span.enter();
@@ -305,11 +325,9 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 
 		match circuit_gate::stream_disposition(policy.on_new_stream(&id, &target)) {
 			StreamDisposition::Serve => {
-				let app = app.clone();
-				let tls_acceptor = tls_acceptor.clone();
-				let address = address.clone();
+				let ctx = ctx.clone();
 				tokio::spawn(async move {
-					if let Err(err) = handle_stream_request(stream_request, tls_acceptor, app, &address, id, plaintext).await {
+					if let Err(err) = handle_stream_request(stream_request, ctx, id).await {
 						event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
 					}
 				});
@@ -453,6 +471,19 @@ fn apply_hsts(app: Router, plaintext: tls_policy::PlaintextPolicy) -> Router {
 	}
 }
 
+/// Assemble a [`PortRouter`] from the builder's `route_port` registrations,
+/// surfacing the first invalid registration (reserved/zero port, or a duplicate).
+///
+/// Extracted from `serve` so the registration validation is unit-testable with no
+/// live Tor network.
+fn build_port_router(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<PortRouter> {
+	let mut router = PortRouter::new();
+	for (port, handler) in handlers {
+		router.register(port, handler)?;
+	}
+	Ok(router)
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -464,6 +495,7 @@ pub struct OnionServiceBuilder {
 	skin: SkinChoice,
 	tls: Tls,
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
+	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 }
 
 impl OnionServiceBuilder {
@@ -521,6 +553,25 @@ impl OnionServiceBuilder {
 		self
 	}
 
+	/// Register a raw [`StreamHandler`] to serve an arbitrary, non-HTTP port over
+	/// the onion service (onyums ROADMAP Phase 3 — protocol versatility).
+	///
+	/// The built-in TLS-enforced HTTP handler always serves port 443 (HTTPS) and
+	/// port 80 (HTTPS upgrade/redirect); a raw handler may occupy any *other* port
+	/// — one that would otherwise be rejected — letting onyums tunnel gRPC, SSH, a
+	/// game server, or Lightning alongside HTTP. For example,
+	/// `.route_port(9735, RawTcpHandler::new("127.0.0.1:9735"))`. Registering a
+	/// reserved port (80/443), port 0, or the same port twice surfaces an error
+	/// from [`Self::serve`].
+	///
+	/// This is an opt-*up* in protocol reach, not a relaxation of safety: the HTTP
+	/// handler and its TLS-first posture are unchanged.
+	#[must_use]
+	pub fn route_port(mut self, port: u16, handler: impl StreamHandler + 'static) -> Self {
+		self.raw_handlers.push((port, Arc::new(handler)));
+		self
+	}
+
 	/// Opt *down*: serve the router with no Skin abuse-defense gate.
 	///
 	/// An explicit, named relaxation of the secure default — the gate is on
@@ -550,6 +601,13 @@ impl OnionServiceBuilder {
 		let app = self.router.ok_or_else(|| anyhow::anyhow!("router not set on OnionServiceBuilder"))?;
 		let nickname = self.nickname.ok_or_else(|| anyhow::anyhow!("nickname not set on OnionServiceBuilder"))?;
 
+		// Phase 3 protocol versatility: build the port → handler routing table from
+		// the caller's `route_port` registrations. Validated here (before any Tor
+		// bootstrap) so a bad registration — a reserved/zero port, or a duplicate —
+		// fails offline rather than at the first circuit. An empty router reproduces
+		// today's HTTP-only behaviour.
+		let port_router = Arc::new(build_port_router(self.raw_handlers)?);
+
 		// Insert the onyums-skin gate ahead of the application on the HTTP path
 		// (Phase 2 Skin integration). Secure-by-default unless the caller opted down
 		// with `no_skin`. `Router::layer` keeps the `Router` type, so the rest of the
@@ -572,16 +630,19 @@ impl OnionServiceBuilder {
 		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
+		// Bundle everything the loop threads down to each served stream into one
+		// cheaply-cloned context (see [`ServeContext`]).
+		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router };
+
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
-		let loop_address = address.clone();
 		let task = tokio::spawn(async move {
 			let rend_requests = Box::pin(request_stream);
 			tokio::select! {
 				() = loop_cancel.cancelled() => {
 					event!(Level::INFO, "Onion service accept loop cancelled.");
 				}
-				result = serve_circuits(rend_requests, app, tls_acceptor, loop_address, policy, plaintext) => {
+				result = serve_circuits(rend_requests, ctx, policy) => {
 					if let Err(err) = result {
 						event!(Level::ERROR, "Onion service accept loop ended with error: {err}");
 					} else {
@@ -746,26 +807,45 @@ fn self_signed_server_config(address: &OnionAddress) -> Result<rustls::ServerCon
 }
 
 // Then handle_stream_request
-async fn handle_stream_request(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, address: &OnionAddress, circuit_id: CircuitId, plaintext: tls_policy::PlaintextPolicy) -> Result<()> {
+async fn handle_stream_request(stream_request: StreamRequest, ctx: ServeContext, circuit_id: CircuitId) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
 	let _handling_request_trace_guard = handling_request_trace_span.enter();
-	// The per-port transport decision is factored into the pure, offline-tested
-	// `tls_policy::port_action`; here we only execute it. Under a `Reject`
-	// plaintext policy the port-80 arm resolves to `Reject`, so there is no
-	// plaintext handler at all.
+	// The per-port dispatch is factored into the pure, offline-tested
+	// `PortRouter::dispatch`; here we only execute it. The built-in TLS-first
+	// decision wins for ports 80/443 (so under a `Reject` plaintext policy the
+	// port-80 arm resolves to `Reject`, no plaintext handler at all); any other
+	// port resolves to a caller-registered raw handler or, with none, a reject.
 	let port = match stream_request.request() {
 		IncomingStreamRequest::Begin(begin) => begin.port(),
 		_ => 0,
 	};
-	match tls_policy::port_action(port, plaintext) {
-		tls_policy::PortAction::ServeTls => handle_tls_connection(stream_request, tls_acceptor, app, circuit_id).await,
-		tls_policy::PortAction::RedirectToHttps => handle_http_redirect(stream_request, address.host().to_string()).await,
-		tls_policy::PortAction::Reject => {
-			// Reject the incoming request (non-HTTP port, or plaintext under strict TLS).
+	match ctx.port_router.dispatch(port, ctx.plaintext) {
+		PortDispatch::ServeHttp => handle_tls_connection(stream_request, ctx.tls_acceptor, ctx.app, circuit_id).await,
+		PortDispatch::RedirectToHttps => handle_http_redirect(stream_request, ctx.address.host().to_string()).await,
+		PortDispatch::Raw(handler) => {
+			let handler = Arc::clone(handler);
+			handle_raw_stream(stream_request, handler, port).await
+		}
+		PortDispatch::Reject => {
+			// Reject the incoming request (non-HTTP port with no registered handler,
+			// or plaintext under strict TLS).
 			event!(Level::INFO, "Rejecting the incoming request {:?}...", stream_request.request());
 			stream_request.shutdown_circuit().map_err(|e| anyhow::anyhow!("Failed to shutdown circuit: {e}"))
 		}
 	}
+}
+
+/// Accept a stream on a caller-registered port and hand it to its raw
+/// [`StreamHandler`] (onyums ROADMAP Phase 3 — protocol versatility).
+///
+/// Unlike [`handle_tls_connection`], a raw stream is *not* wrapped in onyums' TLS:
+/// the handler's protocol negotiates its own end-to-end security over the
+/// onion-encrypted channel. The accepted onion stream is boxed into an
+/// [`OnionStream`] and handed to the handler, which owns it for the connection.
+async fn handle_raw_stream(stream_request: StreamRequest, handler: Arc<dyn StreamHandler>, port: u16) -> Result<()> {
+	event!(Level::INFO, "Accepting a raw stream on port {port} for a registered handler...");
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
+	handler.serve(Box::pin(onion_service_stream)).await
 }
 
 #[cfg(test)]
@@ -965,6 +1045,48 @@ mod tests {
 		let result = OnionService::builder().router(app).serve().await;
 		let err = result.err().expect("missing nickname should error");
 		assert!(err.to_string().contains("nickname not set"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn build_port_router_rejects_a_reserved_port() {
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(443, Arc::new(RawTcpHandler::new("127.0.0.1:9000")))];
+		// `PortRouter` is not `Debug` (it holds a `dyn StreamHandler`), so take the
+		// error via `.err()` rather than `expect_err`.
+		let err = build_port_router(handlers).err().expect("443 is reserved for the built-in HTTP handler");
+		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn build_port_router_registers_valid_non_http_ports() {
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![
+			(9735, Arc::new(RawTcpHandler::new("127.0.0.1:9735"))),
+			(2222, Arc::new(RawTcpHandler::new("127.0.0.1:22"))),
+		];
+		let router = build_port_router(handlers).expect("9735 and 2222 are registerable");
+		assert_eq!(router.len(), 2);
+		assert!(router.contains_port(9735));
+		assert!(router.contains_port(2222));
+		// Dispatch routes the registered ports to a raw handler; an unregistered one
+		// is still rejected.
+		assert!(matches!(router.dispatch(9735, tls_policy::PlaintextPolicy::Upgrade), PortDispatch::Raw(_)));
+		assert!(matches!(router.dispatch(8080, tls_policy::PlaintextPolicy::Upgrade), PortDispatch::Reject));
+	}
+
+	#[test]
+	fn route_port_records_registrations_on_the_builder() {
+		let builder = OnionServiceBuilder::default().route_port(9735, RawTcpHandler::new("127.0.0.1:9735"));
+		assert_eq!(builder.raw_handlers.len(), 1);
+		assert_eq!(builder.raw_handlers[0].0, 9735);
+	}
+
+	#[tokio::test]
+	async fn builder_route_port_reserved_errors_before_bootstrap() {
+		// Router and nickname are both set, so validation reaches the port router —
+		// which rejects the reserved port before any Tor bootstrap (offline).
+		let app = Router::new().route("/", get(|| async { "hi" }));
+		let result = OnionService::builder().router(app).nickname("raw_reserved").route_port(443, RawTcpHandler::new("127.0.0.1:9000")).serve().await;
+		let err = result.err().expect("a reserved-port registration should error");
+		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
 	}
 
 	#[tokio::test]

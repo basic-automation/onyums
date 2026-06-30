@@ -7,6 +7,118 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-06-30 — onyums server Phase 3: StreamHandler trait + .route_port arbitrary-protocol tunneling (4 increments)
+
+Branch `routine/onyums-2026-06-30` → PR (see end). **Crate alternation:** the previous run
+(2026-06-29, PR [#22](https://github.com/basic-automation/onyums/pull/22)) advanced
+**onyums-skin** (Phase 3/5 filter front-end), so per the never-twice-in-a-row rule this run targets
+the **onyums server**. It builds the documented next step from the 2026-06-28 (run 2) entry — the
+Phase 3 **`StreamHandler` trait + arbitrary port → handler mapping** (`.route_port`) — as a
+complete, mostly-offline-verifiable arc: pure routing table → a concrete handler verified offline →
+live wiring + builder API → docs. Every increment is pure Rust, no new dependency; the workspace
+stayed green and clippy-clean throughout.
+
+**Increment 1 — `StreamHandler` trait + pure `PortRouter` routing table.** *onyums Phase 3,
+"Arbitrary port → handler mapping" — the offline-testable routing slice.* Files: `src/port_router.rs`
+(new), `src/lib.rs`. The routing decision as pure data, before any live-stream plumbing. The
+`StreamHandler` trait serves one accepted onion stream for a caller-registered port; it is
+object-safe — takes an owned boxed `OnionStream` (an `AsyncStream` marker unifies
+`AsyncRead`+`AsyncWrite` so a single `dyn` can name both) and returns an owned `'static + Send`
+`ServeFuture` so the loop can drive it on a spawned task. `PortRouter` maps a port to its handler:
+ports 80/443 stay reserved for the built-in HTTP handler (the TLS-first `tls_policy::port_action`
+decision wins — one source of truth), raw handlers may only occupy otherwise-rejected ports.
+`register` validates (no port 0, no reserved port, no double-registration); `dispatch(port,
+plaintext)` returns `PortDispatch::{ServeHttp, RedirectToHttps, Raw, Reject}`. An empty router
+reproduces today's HTTP-only behaviour exactly. Public types re-exported at the crate root. **+6
+unit tests.**
+
+**Increment 2 — `RawTcpHandler` (offline-verified raw-TCP forwarder).** *onyums Phase 3, the first
+concrete `StreamHandler`.* Files: `src/raw_tcp.rs` (new), `src/lib.rs`. Forwards each accepted onion
+stream to a configured local TCP backend and splices the two with `copy_bidirectional` until either
+side closes; the backend protocol negotiates its own end-to-end security over the onion-encrypted
+channel (a raw handler is *not* wrapped in onyums' TLS). Unlike most of the live-serve path this
+handler is verified **offline**: `serve` takes an owned boxed stream, so the end-to-end proxy test
+drives it with an in-memory `tokio::io::duplex` pair against a loopback echo listener — bytes
+round-trip with no live Tor. **+3 unit tests** (backend accessor; a real offline proxy round-trip;
+unreachable-backend error).
+
+**Increment 3 — `.route_port` builder API + live serve-loop wiring.** *onyums Phase 3, same item,
+end to end.* Files: `src/lib.rs`. `OnionServiceBuilder::route_port(port, handler)` registers a raw
+handler; registrations are validated in `serve()` *before* any Tor bootstrap via a new
+`build_port_router` helper, so a reserved/zero/duplicate port fails offline. The rendezvous loop now
+dispatches through `PortRouter::dispatch` instead of the bare `port_action` — 80/443 keep the
+built-in decision; any other registered port is accepted and handed to its handler via a new
+`handle_raw_stream` (accept → box the onion stream → `StreamHandler::serve`); the boxed onion stream
+satisfies `AsyncStream` (Send + Unpin), confirmed by the build. Refactor: the values threaded
+through `serve_circuits → handle_circuit_streams → handle_stream_request` (router, TLS acceptor,
+address, plaintext policy, port router) are bundled into one cheaply-`Clone` `ServeContext`,
+dropping each helper back under clippy's argument-count limit with no `#[allow]`. **+4 unit tests**
+(router rejects a reserved port; registers valid non-HTTP ports + dispatch resolves them; builder
+records registrations; `serve()` surfaces a reserved-port error before bootstrap).
+
+**Increment 4 — document protocol versatility.** *Cross-cutting DX — "document capabilities
+explicitly."* Files: `README.md`. New "Protocol versatility" section covering `.route_port`,
+`RawTcpHandler`, and the `StreamHandler` trait, framed against the preserved TLS-first invariant
+(80/443 reserved; a raw handler is not TLS-wrapped); added a `.route_port(...)` line to the builder
+opt-list in the Skin example and a top-of-README NEW! banner. Docs-only — `src/` does not
+`include_str!` the README, so the code blocks are not compiled; the example was checked against the
+public API by hand. No new tests.
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (re-run green after each code increment; the one pre-existing
+  `proc-macro-error2` future-incompat note is a transitive dep, not ours — same as prior runs).
+- `cargo test -p onyums --lib -- --skip test_serve`: **67 passed; 0 failed; 0 ignored** (1 filtered
+  out = `test_serve`). Up from 54 at run start (**+13**: 6 + 3 + 4 + 0).
+- `cargo test -p onyums-skin` (sanity, untouched this run): **291 passed; 0 failed** + **2 doctests
+  passed** — no regression.
+- `cargo clippy -p onyums --all-targets`: **0 warnings** (fixed two directly along the way — a
+  `too_long_first_doc_paragraph` on the `StreamHandler` doc, and a `too_many_arguments` resolved by
+  bundling the loop's threaded values into `ServeContext`; never `#[allow]`).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design. The live
+  raw-serve path (`handle_raw_stream` accepting a real onion stream) is therefore **not
+  runtime-verified**; its routing decision, builder validation, and the `RawTcpHandler` proxy logic
+  are all offline-tested.
+
+### Done vs. open
+- **onyums Phase 3 (TLS-first & protocol versatility):** the **`StreamHandler` trait + arbitrary
+  port → handler mapping** (`.route_port`) is now **DONE** (offline-verifiable parts): the pure
+  `PortRouter`, the offline-tested `RawTcpHandler`, and the builder + live-loop wiring. Combined with
+  the `Tls::Upgrade`/`Strict`/`Provided` modes from prior runs, the TLS-first transport item and the
+  arbitrary-port item are both implemented; **single onion service mode** is the remaining Phase 3
+  bullet.
+- OPEN (onyums Phase 3): **single onion service mode** (latency opt-down — touches
+  `OnionServiceConfig`, a live-config slice not offline-verifiable); a future **`Tls::Provided` +
+  strict** combination (BYO cert *and* plaintext rejection — deliberately kept orthogonal in the
+  initial variant, a small but breaking enum-shape change better made considered than rushed).
+- OPEN (onyums Phase 1, live-Tor only): keystore placement of a mined/BYO onion key so the launched
+  service serves that address; `.ephemeral()` opt-down.
+- OPEN (onyums Phase 2, carried): drive `AccountingCircuitPolicy` from `handle_stream_request`;
+  Under Attack Mode builder toggle; feed Skin's adaptive-difficulty signal — all on the live circuit
+  path.
+- NOT STARTED: onyums Phase 4 (observability/multi-service).
+- NOT a server concern this run: onyums-skin (the other crate; advanced last run, PR #22). Its owed
+  next slice is adopting `FilterExpr::parse` in the WAF custom-rule path (operator-tunable rule
+  conditions).
+
+**STOP REASON:** Landed 4 verifiable increments (top of the 2–4 bar) forming one complete, coherent
+arc — the entire `StreamHandler` / `.route_port` protocol-versatility feature, end to end (pure
+routing table → offline-verified handler → live wiring + builder → docs). This is a natural arc
+boundary: the remaining onyums items are each either a **deliberate design decision** rather than a
+rushed late increment (single-onion mode reworks `OnionServiceConfig`; the `Provided`+strict combo
+is a breaking `Tls` enum-shape change kept orthogonal on purpose) or sit on the **live-Tor
+serve/keystore/circuit path this routine cannot runtime-verify** (Phase 1 keystore placement, Phase
+2 `CircuitPolicy` drive). Per crate alternation this was an onyums run; the next run is owed
+**onyums-skin**. Everything is green, clippy-clean, and nothing is half-landed.
+
+**NEXT STEP:** *(onyums-skin, next run by alternation)* Adopt `FilterExpr::parse` in the WAF
+custom-rule path so a custom rule can carry a `FilterExpr` *condition* (fire only when the
+expression matches) alongside its regex signature — operator-tunable rule gating, the natural next
+use of the now-complete filter front-end. *(onyums, a later run)* Single onion service mode
+(`.single_onion()` opt-down over `OnionServiceConfig`), and/or the `Tls::Provided`+strict
+combination — both deliberate design slices to plan rather than rush.
+
+---
+
 ## 2026-06-29 — onyums-skin Phase 3/5 frontier: filter rule-string front-end (lex → parse → serialize → wire) (5 increments)
 
 Branch `routine/onyums-2026-06-29` → PR

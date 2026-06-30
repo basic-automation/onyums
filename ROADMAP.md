@@ -151,10 +151,16 @@ arbitrary protocols.
     (e.g. HARICA), which some clients and browsers prefer over self-signed.
   Raw-TCP / non-HTTP handlers (below) negotiate their own transport security; the TLS-first stance
   is specifically about the built-in HTTP/WS handler.
-- **Arbitrary port → handler mapping.** `.route_port(443, HttpHandler::new(app))`,
-  `.route_port(9735, RawTcpHandler::new(...))`. A `StreamHandler` trait lets onyums tunnel *any*
-  protocol over an onion service (gRPC, SSH, a game server, Lightning), not just HTTP/WS. The
-  TLS-enforced HTTP handler remains the default built-in; raw handlers are the versatility layer.
+- **Arbitrary port → handler mapping.** *(Implemented 2026-06-30.)* `.route_port(9735,
+  RawTcpHandler::new("127.0.0.1:9735"))`. A `StreamHandler` trait (`serve(&self, OnionStream) ->
+  ServeFuture`) lets onyums tunnel *any* protocol over an onion service (gRPC, SSH, a game server,
+  Lightning), not just HTTP/WS. The TLS-enforced HTTP handler remains the default built-in and stays
+  on ports 80/443; a raw handler may only occupy another (otherwise-rejected) port, so the
+  TLS-first invariant holds (registering a reserved/zero/duplicate port is a clean `serve()` error).
+  Shipped: the pure `PortRouter` routing table, `RawTcpHandler` (offline-tested raw-TCP forwarder),
+  and the `.route_port` builder wiring through the rendezvous loop. The live raw-serve path is not
+  runtime-verified (no live Tor in the routine), but the routing decision, builder validation, and
+  the `RawTcpHandler` proxy are unit-tested offline.
 - **Single onion service mode** — trade server-side anonymity for lower latency where the server
   is not trying to hide (common for high-traffic public onion sites). An explicit opt-down from the
   anonymous default.

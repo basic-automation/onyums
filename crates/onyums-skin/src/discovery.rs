@@ -292,6 +292,71 @@ impl RestrictedDiscovery {
 		let key = parse_auth_file(contents)?;
 		Ok(self.authorize(nickname, key))
 	}
+
+	/// Compute the change set that turns `self` (the currently-applied allowlist) into
+	/// `desired` — the minimal set of client additions, key changes, and removals.
+	///
+	/// The host uses this for **live reconfiguration**: rather than rewriting the whole
+	/// `authorized_clients/` directory when one client is added or revoked, it applies
+	/// only the [`AllowlistDiff`]'s changed and removed files. The three lists are
+	/// nickname-ordered (deterministic).
+	#[must_use]
+	pub fn diff(&self, desired: &Self) -> AllowlistDiff {
+		let mut added = Vec::new();
+		let mut changed = Vec::new();
+		let mut removed = Vec::new();
+		for (name, key) in &desired.clients {
+			match self.clients.get(name) {
+				None => added.push((name.clone(), *key)),
+				Some(current) if current != key => changed.push((name.clone(), *key)),
+				Some(_) => {}
+			}
+		}
+		for name in self.clients.keys() {
+			if !desired.clients.contains_key(name) {
+				removed.push(name.clone());
+			}
+		}
+		AllowlistDiff { added, changed, removed }
+	}
+}
+
+/// The minimal change set between two [`RestrictedDiscovery`] allowlists, produced by
+/// [`RestrictedDiscovery::diff`] for incremental (live) reconfiguration.
+///
+/// `added` and `changed` carry the new `(nickname, key)`; `removed` carries the
+/// nicknames no longer authorized. A host writes an `<nickname>.auth` file for each
+/// entry in [`files_to_write`](Self::files_to_write) and deletes each name in
+/// [`files_to_remove`](Self::files_to_remove).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AllowlistDiff {
+	/// Newly-authorized clients (nickname absent from the current allowlist).
+	pub added: Vec<(String, ClientAuthKey)>,
+	/// Clients whose key changed (same nickname, new key).
+	pub changed: Vec<(String, ClientAuthKey)>,
+	/// Nicknames that are no longer authorized.
+	pub removed: Vec<String>,
+}
+
+impl AllowlistDiff {
+	/// Whether the two allowlists are identical (nothing to add, change, or remove).
+	#[must_use]
+	pub fn is_unchanged(&self) -> bool {
+		self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+	}
+
+	/// The `.auth` files to (over)write to apply this diff: `<nickname>.auth` mapped to
+	/// its `descriptor:x25519:<BASE32>\n` body, for every added and changed client.
+	#[must_use]
+	pub fn files_to_write(&self) -> BTreeMap<String, String> {
+		self.added.iter().chain(&self.changed).map(|(name, key)| (format!("{name}.auth"), format!("{key}\n"))).collect()
+	}
+
+	/// The `.auth` filenames to delete to apply this diff, one per removed client.
+	#[must_use]
+	pub fn files_to_remove(&self) -> Vec<String> {
+		self.removed.iter().map(|name| format!("{name}.auth")).collect()
+	}
 }
 
 /// Parse the contents of a Tor `authorized_clients/*.auth` file into a
@@ -556,5 +621,78 @@ mod tests {
 		let err = RestrictedDiscovery::from_auth_files(files).unwrap_err();
 		assert_eq!(err.file, "bad.auth");
 		assert_eq!(err.error, AuthFileError::Key(ClientAuthKeyError::WrongLength(1)));
+	}
+
+	#[test]
+	fn diff_of_identical_allowlists_is_unchanged() {
+		let mut acl = RestrictedDiscovery::new();
+		acl.authorize("alice", sample_key());
+		let diff = acl.diff(&acl.clone());
+		assert!(diff.is_unchanged());
+		assert!(diff.files_to_write().is_empty());
+		assert!(diff.files_to_remove().is_empty());
+	}
+
+	#[test]
+	fn diff_classifies_added_changed_and_removed() {
+		let alice = sample_key();
+		let bob = ClientAuthKey::from_bytes([2u8; 32]);
+		let bob_rotated = ClientAuthKey::from_bytes([22u8; 32]);
+		let carol = ClientAuthKey::from_bytes([3u8; 32]);
+
+		let mut current = RestrictedDiscovery::new();
+		current.authorize("alice", alice); // stays
+		current.authorize("bob", bob); // key rotates
+		current.authorize("dave", ClientAuthKey::from_bytes([4u8; 32])); // removed
+
+		let mut desired = RestrictedDiscovery::new();
+		desired.authorize("alice", alice);
+		desired.authorize("bob", bob_rotated);
+		desired.authorize("carol", carol); // added
+
+		let diff = current.diff(&desired);
+		assert!(!diff.is_unchanged());
+		assert_eq!(diff.added, vec![("carol".to_string(), carol)]);
+		assert_eq!(diff.changed, vec![("bob".to_string(), bob_rotated)]);
+		assert_eq!(diff.removed, vec!["dave".to_string()]);
+	}
+
+	#[test]
+	fn diff_files_to_write_and_remove_have_auth_suffix() {
+		let mut current = RestrictedDiscovery::new();
+		current.authorize("dave", ClientAuthKey::from_bytes([4u8; 32]));
+		let mut desired = RestrictedDiscovery::new();
+		desired.authorize("carol", sample_key());
+
+		let diff = current.diff(&desired);
+		let write = diff.files_to_write();
+		assert_eq!(write.keys().collect::<Vec<_>>(), vec!["carol.auth"]);
+		assert_eq!(write.get("carol.auth"), Some(&format!("descriptor:x25519:{}\n", sample_key().to_base32())));
+		assert_eq!(diff.files_to_remove(), vec!["dave.auth".to_string()]);
+	}
+
+	#[test]
+	fn diff_then_apply_reaches_desired_state() {
+		// Applying files_to_write + files_to_remove to the current directory should
+		// reproduce the desired allowlist exactly.
+		let mut current = RestrictedDiscovery::new();
+		current.authorize("alice", sample_key());
+		current.authorize("dave", ClientAuthKey::from_bytes([4u8; 32]));
+
+		let mut desired = RestrictedDiscovery::new();
+		desired.authorize("alice", sample_key());
+		desired.authorize("carol", ClientAuthKey::from_bytes([3u8; 32]));
+
+		let diff = current.diff(&desired);
+
+		// Model the on-disk directory as a filename->contents map and apply the diff.
+		let mut dir = current.to_auth_files();
+		for name in diff.files_to_remove() {
+			dir.remove(&name);
+		}
+		dir.extend(diff.files_to_write());
+
+		let applied = RestrictedDiscovery::from_auth_files(dir).unwrap();
+		assert_eq!(applied.iter().collect::<Vec<_>>(), desired.iter().collect::<Vec<_>>());
 	}
 }

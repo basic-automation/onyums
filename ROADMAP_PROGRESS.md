@@ -9,7 +9,8 @@ STOP REASON, and the next step.
 
 ## 2026-07-01 — onyums-skin Phase 5: restricted-discovery orchestration (5 increments)
 
-Branch `routine/onyums-2026-07-01` → PR (base `master`). **Crate alternation:** the previous run
+Branch `routine/onyums-2026-07-01` → PR [#24](https://github.com/basic-automation/onyums/pull/24)
+(base `master`). **Crate alternation:** the previous run
 (2026-06-30, PR [#23](https://github.com/basic-automation/onyums/pull/23)) advanced the **onyums
 server** (Phase 3 `StreamHandler`/`.route_port`), so per the never-twice-in-a-row rule this run
 targets **onyums-skin**. It builds out the Phase 5 frontier item **restricted-discovery

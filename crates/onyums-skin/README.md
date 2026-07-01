@@ -3,7 +3,7 @@
 A **"Cloudflare for Tor"** abuse-defense layer for onion services: a challenge /
 proof-of-work gate, stateless clearance tokens as a synthetic per-client identity,
 token/circuit-keyed rate limiting, no-JS fallbacks, a per-circuit policy hook, and
-(later) a pure-Rust WAF.
+a pure-Rust WAF.
 
 `onyums-skin` is a standalone, framework-agnostic crate — usable by any [`axum`] app —
 that the [`onyums`](https://github.com/basic-automation/onyums) onion-service server
@@ -56,8 +56,28 @@ diff.files_to_write();   // <nickname>.auth files to (over)write
 diff.files_to_remove();  // .auth files to delete
 ```
 
-See [`ROADMAP.md`](ROADMAP.md) for the threat model, the locked component decisions, the
-full API, and the phased plan.
+See [`ROADMAP.md`](ROADMAP.md) for the phased task list (what is done and what is next).
+
+## The threat model, in one paragraph
+
+A Tor onion service sees **none** of the signals Cloudflare-style defenses key on: no
+client IP / ASN / geo (connections arrive over a rendezvous circuit), no client TLS
+fingerprint (the app never receives a ClientHello), and often no JavaScript or WASM
+(Tor Browser "Safer"/"Safest" disable both). The per-rendezvous-circuit is the only
+stable network handle, and circuits are cheap to rotate. So everything in this crate
+keys on the two handles that *do* exist — the circuit and an app-issued signed
+clearance token — and the abuse economics are **cost, not prevention**: each fresh
+identity costs a fresh proof-of-work solve.
+
+## Component decisions
+
+| Component | Decision | Basis | License |
+|---|---|---|---|
+| PoW | pluggable `Pow` trait, **SHA-256 hashcash default** | hand-rolled; pure-Rust Equi-X behind the opt-in `equix` feature | MIT (equix: LGPL, gated) |
+| Rate limiter | reuse | `governor` (keyed on the clearance token) | MIT/Apache |
+| Clearance token | reuse | `hmac` + `sha2` | MIT |
+| No-JS fallbacks | server-rendered CAPTCHA + patience tarpit | `captcha` / hand-rolled | MIT |
+| WAF | build | `regex` + `aho-corasick` + the in-house `FilterExpr` rule language | MIT |
 
 ## Principles
 

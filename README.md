@@ -5,14 +5,17 @@
 
 Onyums is an axum wrapper for serving tor onion services — secure and complete by default. It bootstraps the Tor client, generates TLS certs, upgrades HTTP to HTTPS, and sits the app behind a built-in abuse-defense gate. It provides the `ConnectionInfo` extractor to differentiate connections made over tor since the concept of `SocketAddrs` does not exist on private connections.
 
-*******************
-####  **NEW! - Onyums now ships a secure-by-default abuse-defense layer (Skin): a proof-of-work gate, no-JS fallback, token rate limiting, and a pure-Rust WAF — see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).**
-####  **NEW! - The builder returns an `OnionServiceHandle` with a real readiness signal (`ready()`), the `.onion` address, and graceful `shutdown()` — no more polling a global.**
-####  **NEW! - Onyums can now tunnel ANY protocol over an onion service — `.route_port(port, handler)` for raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler. See [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).**
-####  **NEW! - Onyums now supports websockets over Tor!**
-####  **NEW! - Onyums now generates self-signed certs automatically on the fly!**
-#### **NEW! - Onyums now automatically upgrades http urls to https with no extra work on your end.**
-*******************
+The posture is *secure and complete by default*: the hard, Tor-specific machinery ships enabled, and you opt **down** when you have a reason to — never assemble safety from feature flags.
+
+## Features
+
+- **One-liner serve** — `serve(app, "nickname")` is the full secure stack; the builder (`OnionService::builder()`) tunes or relaxes it.
+- **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
+- **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()`, the typed `.onion` address, and `shutdown()`.
+- **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
+- **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
+- **Stable identity** — a persistent keystore by default, plus vanity-address mining and address helpers (QR, `Onion-Location`); see [Address helpers](#address-helpers).
+- **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity; see [Websocket example](#websocket-example).
 
 
 ## Hello world example

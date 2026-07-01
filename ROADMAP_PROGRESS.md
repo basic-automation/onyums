@@ -7,6 +7,107 @@ STOP REASON, and the next step.
 
 ---
 
+## 2026-07-01 — onyums-skin Phase 5: restricted-discovery orchestration (5 increments)
+
+Branch `routine/onyums-2026-07-01` → PR [#24](https://github.com/basic-automation/onyums/pull/24)
+(base `master`). **Crate alternation:** the previous run
+(2026-06-30, PR [#23](https://github.com/basic-automation/onyums/pull/23)) advanced the **onyums
+server** (Phase 3 `StreamHandler`/`.route_port`), so per the never-twice-in-a-row rule this run
+targets **onyums-skin**. It builds out the Phase 5 frontier item **restricted-discovery
+orchestration** — the last not-started Phase 5 bullet — as a complete, pure-Rust, fully
+offline-testable arc: key type + canonical text form → on-disk `.auth` render/parse → bulk directory
+loader → live-reconfiguration diff → docs. New `discovery` module; every increment compiles fast (no
+`arti-client`), and the workspace stayed green and clippy-clean throughout.
+
+Restricted discovery (Tor v3 client authorization) encrypts the service descriptor to an allowlist
+of client `x25519` keys, so an un-listed client cannot even *discover* the service — enforced in
+descriptor crypto, before any rendezvous circuit or byte of application traffic. It is the one gate
+entirely *upstream* of Skin's HTTP challenge/PoW/WAF layers. Skin does not perform the crypto (Arti
+does, driven by onyums); this run builds the **orchestration** half — the "policy as data" the host
+feeds Arti or materializes as `authorized_clients/` files.
+
+**Increment 1 — `ClientAuthKey` + `RestrictedDiscovery` core.** *onyums-skin Phase 5,
+restricted-discovery orchestration.* Files: `src/discovery.rs` (new), `src/lib.rs`. `ClientAuthKey`
+is a 32-byte `x25519` client-auth public key that round-trips losslessly through Tor's canonical
+`descriptor:x25519:<BASE32>` text form (the exact `authorized_clients/*.auth` line) via
+`Display`/`FromStr`, plus bare `to_base32`/`from_base32`. Includes a hand-rolled RFC 4648 base32
+codec (uppercase, unpadded) — base32 is not crypto, so **no new dependency**; verified against the
+RFC 4648 §10 test vectors, decode accepts either case and rejects out-of-alphabet chars and
+non-canonical trailing bits. `ClientAuthKeyError` (MissingPrefix/InvalidChar/NonCanonical/WrongLength)
+with manual `Display`+`Error`. `RestrictedDiscovery` is an ordered (`BTreeMap`) nickname→key
+allowlist: `authorize`/`revoke`/`key_for`/`is_authorized`/`len`/`is_empty`/`iter`. **+11 unit tests.**
+
+**Increment 2 — render/parse Tor `.auth` files.** *Same item, the on-disk bridge to Arti.* Files:
+`src/discovery.rs`, `src/lib.rs`. `to_auth_files()` → deterministic (nickname-ordered) map from
+`<nickname>.auth` to its `descriptor:x25519:<BASE32>\n` body; `auth_line(nickname)` → the single key
+line; `authorize_auth_file(nickname, contents)` and free `parse_auth_file(contents)` parse Tor's file
+format (skip blanks/`#` comments, first key line wins). `AuthFileError { Empty, Key(...) }` (Display +
+Error, source chains to the key error). **+5 unit tests.**
+
+**Increment 3 — `from_auth_files` bulk directory loader.** *Same item, the collection-level inverse
+of `to_auth_files`.* Files: `src/discovery.rs`, `src/lib.rs`. Rebuilds an allowlist from a set of
+`(filename, contents)` pairs, mirroring Tor's directory rule (only `*.auth` files loaded, nickname =
+file stem; other files ignored). A malformed `.auth` file aborts the load with `AuthDirError { file,
+error }` naming the offender (Display + Error, source chains). **+3 unit tests.**
+
+**Increment 4 — `AllowlistDiff` for live reconfiguration.** *Same item, the incremental-apply half.*
+Files: `src/discovery.rs`, `src/lib.rs`. `RestrictedDiscovery::diff(&desired)` computes the minimal
+change set (`added`/`changed`/`removed`, all nickname-ordered) so the host adds or revokes a client
+by touching only the affected `.auth` files instead of rewriting the whole directory.
+`is_unchanged()`, `files_to_write()` (added+changed → `<nickname>.auth` → body), `files_to_remove()`
+(removed → filenames). A round-trip test proves applying both to the current directory reproduces the
+desired allowlist exactly. **+4 unit tests.**
+
+**Increment 5 — README refresh + restricted-discovery docs.** *Cross-cutting DX.* Files:
+`crates/onyums-skin/README.md`. The Status section was stale ("Phase 2/3 trait/skeleton stage");
+brought current (Phases 1–4 implemented, Phase 5 in progress, with a one-line inventory of shipped
+work) and added a "Restricted discovery — the strongest, upstream gate" subsection showing the new
+API. Docs-only; the README is not `include_str!`'d, so the snippet is illustrative and was checked
+against the public API by hand. No new tests.
+
+### Verification (real counts)
+- `cargo build --workspace`: **GREEN** (the one pre-existing `proc-macro-error2` future-incompat note
+  is a transitive dep, not ours — same as prior runs).
+- `cargo test -p onyums-skin`: **314 passed; 0 failed; 0 ignored** + **2 doctests passed**. Up from
+  291 at run start (**+23**: 11 + 5 + 3 + 4 new `discovery` tests).
+- `cargo clippy -p onyums-skin --all-targets`: **0 warnings** (no `#[allow]` added).
+- onyums lib `test_serve` (real Tor network): **not run** — slow/network-bound by design. This run
+  added no onyums-server code, so nothing on the live-serve path changed.
+
+### Done vs. open (onyums-skin Phase 5)
+- **DONE:** restricted-discovery orchestration — the Skin (orchestration) half is complete:
+  `ClientAuthKey` canonical round-trip, `.auth` file render/parse, bulk directory load, and the
+  live-reconfiguration `AllowlistDiff`. Marked implemented in `crates/onyums-skin/ROADMAP.md`.
+- OPEN (restricted discovery, deliberately out of this run's scope): client `x25519` **key
+  generation** (would need an x25519 crypto dependency — arguably Arti's job); **wiring into onyums**
+  (feed `to_auth_files`/`AllowlistDiff` into Arti's restricted-discovery config — a cross-crate,
+  host-integration slice, not a single-crate skin increment).
+- OPEN (other Phase 5 follow-ups, all integration slices): the WAF custom-rule path adopting
+  `FilterExpr::parse`; wiring `edge::EdgeRules` / `cache::ResponseCache` into `SkinLayer`.
+- Phase 5 frontier items already implemented in prior runs: JA4H fingerprinting, request-shape bot
+  heuristics + bot-difficulty, the opt-in EquiX PoW backend, multi-instance clearance coordination,
+  edge-rules & caching.
+
+**STOP REASON:** Landed 5 verifiable increments (above the 2–4 bar), completing the entire Skin-side
+arc of the last not-started Phase 5 item (restricted-discovery orchestration) as a cohesive unit that
+is 100% pure-Rust and offline-tested green. The remaining restricted-discovery work is genuinely not
+a single-crate skin increment — key generation needs a new crypto dependency (a human decision, and
+plausibly Arti's responsibility), and the live wiring is cross-crate host integration that belongs on
+an onyums-server run. Other Phase 5 skin items are already implemented; the next skin increments are
+`SkinLayer`-integration follow-ups better started fresh. Workspace is green and clippy-clean; nothing
+is half-landed.
+
+**NEXT STEP:** Next run is an **onyums server** run (alternation). A natural fit: the cross-crate
+consumer of tonight's work — wire `onyums-skin`'s `RestrictedDiscovery` into onyums' Arti
+restricted-discovery config (`to_auth_files` → the service's `authorized_clients/` dir, or Arti's
+`key_dirs`), so an operator-managed allowlist gates the descriptor. Alternatively continue onyums
+Phase 3 (single onion service mode) or begin Phase 1 identity helpers (vanity-address mining is the
+most self-contained, pure-Rust, offline-verifiable slice). On the skin side (a later run), the
+`SkinLayer`-integration follow-ups (`FilterExpr` custom WAF rules; `EdgeRules`/`ResponseCache`
+wiring) remain.
+
+---
+
 ## 2026-06-30 — onyums server Phase 3: StreamHandler trait + .route_port arbitrary-protocol tunneling (4 increments)
 
 Branch `routine/onyums-2026-06-30` → PR [#23](https://github.com/basic-automation/onyums/pull/23)

@@ -290,6 +290,19 @@ The research-grade, Tor-specific bets — none have prior art in this environmen
 - **Restricted-discovery orchestration** — helpers that bridge onyums' Arti client-authorization
   (restricted discovery, stable in Arti 1.7) into Skin's policy as the strongest, upstream gate: an
   allowlist enforced in descriptor crypto before any traffic arrives.
+  > **Implemented (2026-07-01).** The `discovery` module models the authorized-client set as pure,
+  > offline-testable data that onyums hands to Arti or materializes as Tor's `authorized_clients/`
+  > files. `ClientAuthKey` is a 32-byte `x25519` client-auth public key that round-trips losslessly
+  > through Tor's canonical `descriptor:x25519:<BASE32>` text form (Display/FromStr) over a
+  > hand-rolled RFC 4648 base32 codec — no new dependency (base32 is not crypto), verified against
+  > the RFC vectors. `RestrictedDiscovery` is a nickname→key allowlist (`authorize`/`revoke`/
+  > `is_authorized`/`iter`) that renders to and loads from `authorized_clients/<name>.auth` files
+  > (`to_auth_files`/`from_auth_files`/`parse_auth_file`, mirroring Tor's "only `*.auth`" directory
+  > rule), and computes an `AllowlistDiff` (`files_to_write`/`files_to_remove`) so a host adds or
+  > revokes a client by touching only the changed files rather than rewriting the directory — live
+  > reconfiguration. 23 unit tests. Skin does *not* perform the descriptor crypto (Arti's job) or
+  > generate keys (would need an x25519 crypto dep); wiring this into onyums' Arti config is a host-
+  > integration follow-up.
 - **Pluggable PoW backend** — `EquiX`, Tor's own puzzle via the pure-Rust `equix` crate, behind an
   opt-in (LGPL) cargo feature. RandomX "useful-work" mining stays excluded: it would require C++
   FFI, and was independently rejected on Tor-WASM and reputation grounds.

@@ -194,6 +194,32 @@ impl RestrictedDiscovery {
 		Self { clients: BTreeMap::new() }
 	}
 
+	/// Build an allowlist from a set of `(filename, contents)` pairs — the inverse of
+	/// [`to_auth_files`](Self::to_auth_files), for loading a materialized
+	/// `authorized_clients/` directory back into memory.
+	///
+	/// Mirroring Tor's directory behaviour, only files whose name ends in `.auth` are
+	/// loaded; the nickname is the file stem (the name minus `.auth`). Any other file
+	/// is ignored. A `.auth` file that fails to parse aborts the load with the
+	/// offending file named in the error.
+	pub fn from_auth_files<I, N, C>(files: I) -> Result<Self, AuthDirError>
+	where
+		I: IntoIterator<Item = (N, C)>,
+		N: AsRef<str>,
+		C: AsRef<str>,
+	{
+		let mut acl = Self::new();
+		for (name, contents) in files {
+			let name = name.as_ref();
+			let Some(nickname) = name.strip_suffix(".auth") else {
+				continue;
+			};
+			let key = parse_auth_file(contents.as_ref()).map_err(|error| AuthDirError { file: name.to_string(), error })?;
+			acl.authorize(nickname, key);
+		}
+		Ok(acl)
+	}
+
 	/// Authorize `key` under `nickname`, returning the previous key if that nickname
 	/// was already present (an update). The nickname is the `.auth` file stem.
 	pub fn authorize(&mut self, nickname: impl Into<String>, key: ClientAuthKey) -> Option<ClientAuthKey> {
@@ -306,6 +332,28 @@ impl std::error::Error for AuthFileError {
 			Self::Empty => None,
 			Self::Key(e) => Some(e),
 		}
+	}
+}
+
+/// A failure loading an `authorized_clients/` directory: which `.auth` file failed and
+/// why.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthDirError {
+	/// The name of the `.auth` file that failed to parse.
+	pub file: String,
+	/// The underlying parse error.
+	pub error: AuthFileError,
+}
+
+impl std::fmt::Display for AuthDirError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}: {}", self.file, self.error)
+	}
+}
+
+impl std::error::Error for AuthDirError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		Some(&self.error)
 	}
 }
 
@@ -479,5 +527,34 @@ mod tests {
 			Err(AuthFileError::Key(ClientAuthKeyError::WrongLength(1))) => {}
 			other => panic!("expected wrapped WrongLength, got {other:?}"),
 		}
+	}
+
+	#[test]
+	fn from_auth_files_is_the_inverse_of_to_auth_files() {
+		let mut src = RestrictedDiscovery::new();
+		src.authorize("alice", sample_key());
+		src.authorize("bob", ClientAuthKey::from_bytes([7u8; 32]));
+
+		let loaded = RestrictedDiscovery::from_auth_files(src.to_auth_files()).unwrap();
+		let a: Vec<_> = src.iter().collect();
+		let b: Vec<_> = loaded.iter().collect();
+		assert_eq!(a, b);
+	}
+
+	#[test]
+	fn from_auth_files_ignores_non_auth_files() {
+		let key = sample_key();
+		let files = vec![("alice.auth".to_string(), format!("{key}\n")), ("README.txt".to_string(), "not a key file".to_string()), (".gitkeep".to_string(), String::new())];
+		let acl = RestrictedDiscovery::from_auth_files(files).unwrap();
+		assert_eq!(acl.len(), 1);
+		assert_eq!(acl.key_for("alice"), Some(&key));
+	}
+
+	#[test]
+	fn from_auth_files_names_the_failing_file() {
+		let files = vec![("good.auth".to_string(), format!("{}\n", sample_key())), ("bad.auth".to_string(), "descriptor:x25519:MY".to_string())];
+		let err = RestrictedDiscovery::from_auth_files(files).unwrap_err();
+		assert_eq!(err.file, "bad.auth");
+		assert_eq!(err.error, AuthFileError::Key(ClientAuthKeyError::WrongLength(1)));
 	}
 }

@@ -72,7 +72,7 @@ pub use circuit::{
 };
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
 pub use difficulty::{AdaptiveDifficulty, BotDifficulty, ShapeDifficulty};
-pub use discovery::{ClientAuthKey, ClientAuthKeyError, RestrictedDiscovery};
+pub use discovery::{parse_auth_file, AuthFileError, ClientAuthKey, ClientAuthKeyError, RestrictedDiscovery};
 pub use edge::{apply_response_headers, render_location, EdgeAction, EdgeDecision, EdgeMatch, EdgeRule, EdgeRules, HeaderMutation};
 pub use filter::{all, any, Field, FilterExpr, ParseError, StrOp};
 pub use fingerprint::Ja4hFingerprint;

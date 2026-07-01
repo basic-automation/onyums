@@ -12,9 +12,9 @@ app can use, Tor or not; the Tor half is a single `CircuitPolicy` trait the host
 
 ## Status
 
-**Phase 1 (gate core) is implemented.** A plain axum app can require a PoW-or-tarpit
-gate that mints a stateless clearance token and rate-limits by it, with a working path
-for no-JS (Tor "Safer"/"Safest") clients:
+**Phases 1–4 are implemented; Phase 5 (frontier) is in progress.** A plain axum app
+can require a PoW-or-tarpit gate that mints a stateless clearance token and rate-limits
+by it, with a working path for no-JS (Tor "Safer"/"Safest") clients:
 
 ```rust
 use axum::{Router, routing::get};
@@ -24,9 +24,40 @@ let app: Router = Router::new().route("/", get(|| async { "hello" }));
 let gated: Router = app.layer(Skin::secure_default().into_layer());
 ```
 
-The Tor dimension (`CircuitPolicy`, Phase 2) and the WAF (Phase 3) are trait/skeleton
-stage. See [`ROADMAP.md`](ROADMAP.md) for the threat model, the locked component
-decisions, the full API, and the phased plan.
+Built out: the gate core (PoW/tarpit challenge chain, `hmac`-signed clearance,
+`governor` rate limiting), the Tor dimension (`CircuitPolicy` + `AccountingCircuitPolicy`
+with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
+expression language + curated ruleset + anomaly scoring), observability (typed
+`SecurityEvent`s, metrics, request-shape baselining), and Phase-5 frontier work: JA4H
+fingerprinting, request-shape bot heuristics, an opt-in EquiX PoW backend, edge
+rules/caching, multi-instance clearance-key coordination, and **restricted-discovery
+orchestration** (below).
+
+### Restricted discovery — the strongest, upstream gate
+
+Tor v3 client authorization encrypts the service descriptor to an allowlist of client
+`x25519` keys, so an un-listed client cannot even *discover* the service — enforced in
+descriptor crypto, before any rendezvous circuit. Skin models the allowlist as pure data
+onyums hands to Arti (or materializes as Tor's `authorized_clients/*.auth` files):
+
+```rust
+use onyums_skin::{ClientAuthKey, RestrictedDiscovery};
+
+let mut acl = RestrictedDiscovery::new();
+// A key copied from an `authorized_clients/*.auth` line parses directly.
+let key: ClientAuthKey = "descriptor:x25519:AAAA…".parse()?;
+acl.authorize("alice", key);
+
+// Render the on-disk directory Arti reads …
+for (filename, body) in acl.to_auth_files() { /* write authorized_clients/<filename> */ }
+// … and apply a later change set incrementally, not by rewriting everything.
+let diff = acl.diff(&next);
+diff.files_to_write();   // <nickname>.auth files to (over)write
+diff.files_to_remove();  // .auth files to delete
+```
+
+See [`ROADMAP.md`](ROADMAP.md) for the threat model, the locked component decisions, the
+full API, and the phased plan.
 
 ## Principles
 

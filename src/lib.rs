@@ -484,6 +484,24 @@ fn build_port_router(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<Por
 	Ok(router)
 }
 
+/// Resolve the per-rendezvous-circuit [`CircuitPolicy`] from the builder's choices.
+///
+/// The Under Attack Mode toggle ([`OnionServiceBuilder::under_attack`]) configures the
+/// *default* [`AccountingCircuitPolicy`] to challenge every new circuit. A caller-supplied
+/// [`circuit_policy`](OnionServiceBuilder::circuit_policy) owns its own Under-Attack
+/// decision, so combining the two is a configuration error surfaced here — offline, before
+/// any Tor bootstrap — rather than silently ignoring one of them. With no custom policy the
+/// default accounting policy is returned, in Under Attack Mode iff the toggle is set.
+///
+/// Extracted from `serve` so the resolution is unit-testable with no live Tor network.
+fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: bool) -> Result<Arc<dyn CircuitPolicy>> {
+	match (custom, under_attack) {
+		(Some(_), true) => bail!("under_attack() configures the default circuit policy and conflicts with a custom circuit_policy(); set under_attack on your own policy instead"),
+		(Some(policy), false) => Ok(policy),
+		(None, on) => Ok(Arc::new(AccountingCircuitPolicy::new().under_attack(on))),
+	}
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -495,6 +513,7 @@ pub struct OnionServiceBuilder {
 	skin: SkinChoice,
 	tls: Tls,
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
+	under_attack: bool,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 }
 
@@ -550,6 +569,26 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub fn circuit_policy(mut self, policy: Arc<dyn CircuitPolicy>) -> Self {
 		self.circuit_policy = Some(policy);
+		self
+	}
+
+	/// Under Attack Mode: force *every new rendezvous circuit* through the Skin
+	/// challenge gate before it is served (onyums ROADMAP Phase 2).
+	///
+	/// This is an explicit opt-*up* into a stricter posture for when the service is
+	/// actively under a flood: it configures the default [`AccountingCircuitPolicy`]
+	/// so that [`on_new_circuit`](onyums_skin::CircuitPolicy::on_new_circuit) returns
+	/// [`Challenge`](onyums_skin::CircuitAction::Challenge) for every circuit, not
+	/// only the ones the policy would otherwise flag. Leave it off (the default) for
+	/// normal operation.
+	///
+	/// Conflicts with a custom [`circuit_policy`](Self::circuit_policy): that policy
+	/// owns its own Under-Attack decision, so setting both is an error surfaced from
+	/// [`Self::serve`] (offline, before any Tor bootstrap). Set Under Attack Mode on
+	/// your own policy instead — `AccountingCircuitPolicy::new().under_attack(true)`.
+	#[must_use]
+	pub const fn under_attack(mut self, on: bool) -> Self {
+		self.under_attack = on;
 		self
 	}
 
@@ -623,8 +662,10 @@ impl OnionServiceBuilder {
 		let app = apply_hsts(app, plaintext);
 
 		// The per-circuit Tor-layer gate. Secure-by-default but non-disruptive: an
-		// accept-all accounting policy unless the caller supplied a tuned one.
-		let policy: Arc<dyn CircuitPolicy> = self.circuit_policy.unwrap_or_else(|| Arc::new(AccountingCircuitPolicy::new()));
+		// accept-all accounting policy unless the caller supplied a tuned one, or the
+		// Under Attack Mode toggle asked the default policy to challenge every circuit.
+		// A custom policy combined with the toggle is a conflict caught offline here.
+		let policy = resolve_circuit_policy(self.circuit_policy, self.under_attack)?;
 
 		let client = setup_tor_client().await?;
 		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
@@ -1087,6 +1128,66 @@ mod tests {
 		let result = OnionService::builder().router(app).nickname("raw_reserved").route_port(443, RawTcpHandler::new("127.0.0.1:9000")).serve().await;
 		let err = result.err().expect("a reserved-port registration should error");
 		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn builder_records_under_attack_toggle() {
+		let builder = OnionServiceBuilder::default();
+		assert!(!builder.under_attack, "Under Attack Mode is off by default");
+		let builder = builder.under_attack(true);
+		assert!(builder.under_attack, "toggle records on the builder");
+	}
+
+	#[test]
+	fn under_attack_toggle_challenges_every_circuit() {
+		use onyums_skin::CircuitAction;
+		// With no custom policy and the toggle on, the resolved default policy
+		// challenges every new circuit.
+		let policy = resolve_circuit_policy(None, true).expect("default policy under attack");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Challenge);
+	}
+
+	#[test]
+	fn default_circuit_policy_accepts_every_circuit() {
+		use onyums_skin::CircuitAction;
+		// The default (toggle off) policy is accept-all on a fresh circuit — unchanged
+		// behaviour, purely the accounting substrate.
+		let policy = resolve_circuit_policy(None, false).expect("default accept-all policy");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Accept);
+	}
+
+	#[test]
+	fn under_attack_conflicts_with_a_custom_circuit_policy() {
+		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new());
+		let err = resolve_circuit_policy(Some(custom), true).err().expect("under_attack + custom policy must conflict");
+		assert!(err.to_string().contains("under_attack"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn custom_circuit_policy_passes_through_without_the_toggle() {
+		use onyums_skin::CircuitAction;
+		// A custom policy is handed back untouched when the toggle is off; its own caps
+		// (here a stream cap that only trips later) are preserved.
+		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new().max_streams(5));
+		let policy = resolve_circuit_policy(Some(custom), false).expect("custom policy passes through");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Accept);
+	}
+
+	#[tokio::test]
+	async fn builder_under_attack_conflicts_before_bootstrap() {
+		// Router, nickname, a custom policy, and the toggle are all set, so validation
+		// reaches the policy resolution — which rejects the conflict before any Tor
+		// bootstrap (offline).
+		let app = Router::new().route("/", get(|| async { "hi" }));
+		let result = OnionService::builder()
+			.router(app)
+			.nickname("ua_conflict")
+			.circuit_policy(Arc::new(AccountingCircuitPolicy::new()))
+			.under_attack(true)
+			.serve()
+			.await;
+		let err = result.err().expect("a conflicting under_attack + custom policy should error");
+		assert!(err.to_string().contains("under_attack"), "unexpected error: {err}");
 	}
 
 	#[tokio::test]

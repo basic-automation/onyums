@@ -28,7 +28,7 @@
 - [x] Skin integration: `SkinLayer` inserted into the served `Router` (secure default **on**)
 - [x] Skin integration: `onyums_skin::CircuitPolicy` driven from the rendezvous loop (`CircuitAction::{Accept, Challenge, Reject, Shutdown}`)
 - [x] Skin integration: `.skin(...)` / `.no_skin()` / `.circuit_policy(...)` builder surface
-- [ ] Skin integration: Under Attack Mode toggle on the builder — force every new circuit through the gate
+- [x] Skin integration: Under Attack Mode toggle on the builder — force every new circuit through the gate
 - [ ] Skin integration: feed Skin's adaptive-difficulty signal from onyums-observed circuit/request rate (intro-layer PoW effort is not surfaced by Arti)
 - [ ] Surface Skin's security events (challenge / WAF / rate-limit / teardown) into the Phase 4 observability stream
 

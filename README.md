@@ -10,12 +10,14 @@ The posture is *secure and complete by default*: the hard, Tor-specific machiner
 ## Features
 
 - **One-liner serve** — `serve(app, "nickname")` is the full secure stack; the builder (`OnionService::builder()`) tunes or relaxes it.
-- **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
+- **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF, plus an Under Attack Mode toggle and observable security events; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
+- **Restricted discovery (v3 client authorization)** — `.authorized_clients(...)` publishes a descriptor only the listed clients can decrypt, so an unlisted client cannot even discover the service; see [Restricted discovery](#restricted-discovery--v3-client-authorization).
 - **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()`, the typed `.onion` address, and `shutdown()`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
 - **Stable identity** — a persistent keystore by default, plus vanity-address mining and address helpers (QR, `Onion-Location`); see [Address helpers](#address-helpers).
-- **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity; see [Websocket example](#websocket-example).
+- **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity (typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers for per-circuit isolation); see [Websocket example](#websocket-example).
+- **Version-skew-proof arti** — the arti stack is re-exported (`onyums::arti_client`, `onyums::tor_hsservice`, `onyums::tor_hscrypto`, …) so downstreams use the exact versions onyums does, just like `axum`.
 
 
 ## Hello world example
@@ -83,7 +85,10 @@ async fn main() {
 		.nickname("my_onion")
 		// The secure-default gate is ALREADY ON. Use these only to tune or relax it:
 		// .skin(Skin::secure_default())        // tune via Skin::builder() (difficulty, store, WAF, ...)
-		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits & Under-Attack mode
+		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits (custom CircuitPolicy)
+		// .under_attack(true)                   // force EVERY new circuit through the gate (flood mode)
+		// .circuit_events(my_sink)              // observe circuit rejects/teardowns/challenges
+		// .authorized_clients(allowlist)        // restricted discovery — only listed clients can reach it
 		// .tls(Tls::Strict)                     // make TLS non-negotiable (reject plaintext, emit HSTS)
 		// .tls(Tls::Provided(my_cert))          // serve your own CA-signed cert instead of self-signed
 		// .route_port(9735, raw_handler)        // serve another protocol (raw TCP, gRPC, SSH, ...) on a non-HTTP port
@@ -99,6 +104,41 @@ async fn main() {
 ```
 
 The full Skin API (clearance tokens, the challenge chain, the WAF, per-circuit `CircuitPolicy`, adaptive difficulty, and security metrics/events) is re-exported under `onyums::onyums_skin`. The design and roadmap live in [`crates/onyums-skin/ROADMAP.md`](crates/onyums-skin/ROADMAP.md).
+
+****
+
+## Restricted discovery — v3 client authorization
+
+For a service with a known, small set of users, `.authorized_clients(...)` enables Tor's **restricted discovery** (v3 client authorization): the service descriptor — its introduction points and keys — is encrypted to the listed clients' x25519 keys, so an *unlisted* client cannot even discover the service. This is DoS resistance enforced in descriptor crypto, upstream of the Skin HTTP gate rather than in place of it.
+
+The allowlist is an `onyums_skin::RestrictedDiscovery`, built from `.auth` files or by authorizing keys directly:
+
+```rust
+use onyums::{OnionService, RestrictedDiscovery, ClientAuthKey, routing::get, Router};
+
+#[tokio::main]
+async fn main() {
+	let app = Router::new().route("/", get(|| async { "authorized clients only" }));
+
+	// nickname → x25519 client key. Load from a Tor `authorized_clients/` dir with
+	// `RestrictedDiscovery::from_auth_files(...)`, or authorize keys directly:
+	let mut allowlist = RestrictedDiscovery::new();
+	allowlist.authorize("alice", ClientAuthKey::from_bytes([/* alice's 32-byte x25519 key */ 0; 32]));
+
+	let handle = OnionService::builder()
+		.router(app)
+		.nickname("private_service")
+		.authorized_clients(allowlist) // an empty allowlist is rejected (would hide it from everyone)
+		.serve()
+		.await
+		.unwrap();
+
+	println!("Onion Address: {}", handle.onion_address());
+	handle.shutdown().await;
+}
+```
+
+This is an explicit opt-*down* in reachability (from "anyone with the address" to "only these clients"). Restricted discovery is a DoS-resistance mechanism, **not** a substitute for authentication: removing a client does not immediately revoke an already-connected one.
 
 ****
 

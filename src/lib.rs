@@ -47,6 +47,14 @@ pub use axum::*;
 pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, Skin};
 use onyums_skin::CircuitId;
 
+/// Re-export the arti stack onyums is built on, so downstream crates can depend on the
+/// *exact* versions onyums uses without a version skew — the same reason `axum` is
+/// re-exported above. If you need arti's `TorClient`, the onion-service config, or the
+/// onion key types (e.g. to build a custom [`CircuitPolicy`] or an authorized-clients
+/// allowlist from raw keys), reach them through `onyums::arti_client` / `onyums::tor_*`
+/// rather than adding your own `arti-client` / `tor-*` dependency.
+pub use {arti_client, tor_cell, tor_cert, tor_hscrypto, tor_hsservice, tor_llcrypto, tor_proto, tor_rtcompat};
+
 mod circuit_gate;
 mod port_router;
 mod raw_tcp;
@@ -1341,6 +1349,17 @@ mod tests {
 		let result = OnionService::builder().router(app).nickname("empty_ac").authorized_clients(RestrictedDiscovery::new()).serve().await;
 		let err = result.err().expect("an empty authorized_clients allowlist should error");
 		assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn arti_stack_is_reexported() {
+		// Compile-time proof that the arti stack is reachable through onyums, so a
+		// downstream needn't add its own version-skew-prone arti dependency. If any
+		// re-export path breaks, this stops compiling.
+		type _Client = crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime>;
+		type _Key = crate::tor_hscrypto::pk::HsClientDescEncKey;
+		type _Cfg = crate::tor_hsservice::config::OnionServiceConfigBuilder;
+		type _Cell = crate::tor_cell::relaycell::msg::End;
 	}
 
 	#[tokio::test]

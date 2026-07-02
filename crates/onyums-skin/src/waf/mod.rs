@@ -629,6 +629,10 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
 		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
+		// Boolean-based blind SQLi beyond `or N=N` (which `sqli_or_tautology` already covers):
+		// `and` with any comparator, or `or` with `<`/`>`. Deliberately excludes `or N=N` so it
+		// does not double-count against `sqli_or_tautology` in anomaly scoring.
+		Rule { id: "sqli_boolean_condition", category: WafCategory::Sqli, pattern: r#"(?i)(\band\b\s+['"]?\d+\s*[=<>]|\bor\b\s+['"]?\d+\s*[<>])\s*['"]?\d+"# },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
@@ -636,6 +640,7 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xss_iframe_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*iframe\b" },
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
 		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
+		Rule { id: "xss_svg_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*svg\b" },
 		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
@@ -645,11 +650,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
+		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
+		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
 		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
 		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
+		Rule { id: "ssrf_decimal_ip", category: WafCategory::Ssrf, pattern: r"(?i)\bhttps?://\d{8,10}(?:[:/]|\b)" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
@@ -823,6 +831,40 @@ mod tests {
 		// A handful of benign requests that brush near the new rules must still pass.
 		let waf = Waf::starter();
 		for uri in ["/blog/data-structures-101", "/shop/cats-and-dogs", "/docs/php-vs-python", "/files/binary-data"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn crs_growth_rules_match_their_signatures() {
+		// The signatures added in the OWASP-CRS coverage-growth pass each fire on a
+		// representative payload.
+		let waf = Waf::starter();
+		// XSS via the SVG vector (SVG markup can carry script / event handlers). Uses a bare
+		// tag so the SVG rule, not the event-handler rule, is the match.
+		assert_eq!(waf.inspect_str("<svg width=1 height=1>", "target").unwrap().rule_id, "xss_svg_tag");
+		// `$(...)` command substitution, which the separator-prefixed shell rule misses.
+		assert_eq!(waf.inspect_str("q=$(whoami)", "target").unwrap().rule_id, "cmdi_command_substitution");
+		// Windows command injection after a shell separator (the existing rule is Unix-centric).
+		assert_eq!(waf.inspect_str("x=1&dir c:\\", "target").unwrap().rule_id, "cmdi_windows_command");
+		// SSRF via a decimal-encoded IPv4 (127.0.0.1 as the integer 2130706433).
+		assert_eq!(waf.inspect_str("url=http://2130706433/latest", "target").unwrap().category, WafCategory::Ssrf);
+		// Boolean-based blind SQLi with `and` / a comparison operator (not just `or N=N`).
+		assert_eq!(waf.inspect_str("id=5 AND 1=1", "target").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("id=5 OR 7<9", "target").unwrap().rule_id, "sqli_boolean_condition");
+	}
+
+	#[test]
+	fn crs_growth_rules_keep_false_positives_low() {
+		// Benign requests that brush near the new signatures must still pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/gallery/svgoptimizer",         // "svg" as a substring, not a tag
+			"/pricing?plans=3",              // a bare number, no boolean operator
+			"/directory/listing",           // "dir" as a path word, no separator
+			"/go/http-status-codes",        // "http" without a decimal-IP host
+			"/search?q=cats+and+dogs",      // "and" without a numeric comparison
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

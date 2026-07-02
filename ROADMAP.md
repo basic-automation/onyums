@@ -22,15 +22,17 @@
 ## Phase 2 — Abuse resistance, live by default — `0.6`
 
 - [ ] Proof-of-Work DoS defense at the intro layer (arti `tor-hspow`) — on by default, effort tunable, opt-down not opt-in
-- [ ] v3 client authorization / restricted discovery — `.authorized_clients([...])` builder API wiring `onyums_skin::RestrictedDiscovery` (`to_auth_files` / `AllowlistDiff`) into the Arti restricted-discovery config
+  - Requires `tor-hsservice`'s **experimental** `hs-pow-full` feature (not in `full`) + `OnionServiceConfigBuilder::enable_pow(true)`; the local 0.43 config exposes `enable_pow`/`pow_rend_queue_depth` but gates the machinery behind that feature — decide before enabling whether to depend on an experimental arti feature.
+  - Tor's onion-service PoW v1 is **Equi-X + Blake2b**, effort scales linearly, and the service queues introductions by effort (<https://spec.torproject.org/hspow-spec/v1-equix.html>) — the *same* Equi-X puzzle family onyums-skin already ships behind its opt-in `equix` feature, so the intro-layer effort and the Skin gate can speak one difficulty vocabulary.
+- [x] v3 client authorization / restricted discovery — `.authorized_clients([...])` builder API wiring `onyums_skin::RestrictedDiscovery` (`to_auth_files` / `AllowlistDiff`) into the Arti restricted-discovery config
 - [ ] Client x25519 auth-key generation (needs a crypto-dep decision — possibly Arti's job)
 - [x] Circuit policy hook — the one-off port gate in `handle_stream_request` generalized into a first-class policy callback
 - [x] Skin integration: `SkinLayer` inserted into the served `Router` (secure default **on**)
 - [x] Skin integration: `onyums_skin::CircuitPolicy` driven from the rendezvous loop (`CircuitAction::{Accept, Challenge, Reject, Shutdown}`)
 - [x] Skin integration: `.skin(...)` / `.no_skin()` / `.circuit_policy(...)` builder surface
-- [ ] Skin integration: Under Attack Mode toggle on the builder — force every new circuit through the gate
+- [x] Skin integration: Under Attack Mode toggle on the builder — force every new circuit through the gate
 - [ ] Skin integration: feed Skin's adaptive-difficulty signal from onyums-observed circuit/request rate (intro-layer PoW effort is not surfaced by Arti)
-- [ ] Surface Skin's security events (challenge / WAF / rate-limit / teardown) into the Phase 4 observability stream
+- [x] Surface Skin's security events (challenge / WAF / rate-limit / teardown) into the Phase 4 observability stream — circuit-layer events via `.circuit_events(sink)`; HTTP-gate events via `Skin::builder().events(sink)` + `.skin(...)`
 
 ## Phase 3 — TLS-first transport & protocol versatility — `0.7`
 
@@ -46,7 +48,7 @@
 - [ ] Bootstrap & descriptor-upload progress as a stream/callback (so `ready()` provably means published + reachable)
 - [ ] Per-service metrics on the handle — active circuits, connection counts, intro-point health, PoW effort, descriptor republish times
 - [ ] Multiple services on one shared `TorClient` — bootstrap once, launch N onion services
-- [ ] Circuit-isolation controls via an enriched `ConnectionInfo` (beyond `circuit_id` + always-`None` `socket_addr`)
+- [x] Circuit-isolation controls via an enriched `ConnectionInfo` — typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers (and a non-panicking connect-info fallback)
 
 ## Phase 5 — Framework layer: batteries-included MVC over axum — `0.9+`
 
@@ -78,6 +80,7 @@ Non-goals: no inbound mail server; no heavy asset pipeline; no JS-*required* rea
 
 ## Cross-cutting
 
-- [ ] Re-export the arti stack we depend on (as we do `axum`) so downstreams can't version-skew
+- [x] Re-export the arti stack we depend on (as we do `axum`) so downstreams can't version-skew
+- [ ] Evaluate upgrading the arti stack — onyums pins `arti-client`/`tor-*` **0.43**, but the Arti release line is now **2.2.0** (2026-03-31, <https://blog.torproject.org/arti_2_2_0_released/>). Restricted discovery was stabilized in Arti **1.7.0** (2025-11, <https://blog.torproject.org/arti_1_7_0_released/>) and stays behind the `restricted-discovery` cargo feature until issue #1795 closes; a stack bump likely lands onion-service/PoW fixes relevant to Phase 2. Gate the bump on the workspace still building green on stable.
 - [x] Document the secure defaults and opt-downs loudly (README covers the Skin / TLS / `route_port` opt-downs)
-- [ ] In-process/loopback test mode so integration tests don't need the live Tor network (`test_serve` currently hits the real network)
+- [ ] In-process/loopback test mode so integration tests don't need the live Tor network (`test_serve` currently hits the real network) — *slice landed:* the composed application-facing stack (`build_serve_router`: gate + HSTS + app) is now `oneshot`-testable offline; *next slice:* a mock `RendRequest`/`StreamRequest` stream to drive `serve_circuits` without Tor

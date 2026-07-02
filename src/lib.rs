@@ -31,7 +31,10 @@ use hyper_util::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
-use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, RendRequest, RunningOnionService, StreamRequest};
+use tor_hsservice::{
+	config::{restricted_discovery::HsClientNickname, OnionServiceConfig, OnionServiceConfigBuilder}, HsNickname, RendRequest, RunningOnionService, StreamRequest
+};
+use tor_hscrypto::pk::HsClientDescEncKey;
 use tor_proto::client::stream::IncomingStreamRequest;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use safelog::DisplayRedacted;
@@ -41,8 +44,16 @@ extern crate rcgen;
 use std::sync::Arc;
 
 pub use axum::*;
-pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
+pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, SecurityEvent, SecurityEventSink, Skin};
 use onyums_skin::CircuitId;
+
+/// Re-export the arti stack onyums is built on, so downstream crates can depend on the
+/// *exact* versions onyums uses without a version skew — the same reason `axum` is
+/// re-exported above. If you need arti's `TorClient`, the onion-service config, or the
+/// onion key types (e.g. to build a custom [`CircuitPolicy`] or an authorized-clients
+/// allowlist from raw keys), reach them through `onyums::arti_client` / `onyums::tor_*`
+/// rather than adding your own `arti-client` / `tor-*` dependency.
+pub use {arti_client, tor_cell, tor_cert, tor_hscrypto, tor_hsservice, tor_llcrypto, tor_proto, tor_rtcompat};
 
 mod circuit_gate;
 mod port_router;
@@ -215,15 +226,68 @@ async fn setup_tor_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	client.config(config).create_bootstrapped().await.map_err(|_| anyhow::anyhow!("Failed to create bootstrapped Tor client."))
 }
 
-/// Launches an onion service with the given nickname.
+/// Apply a caller's authorized-clients allowlist to an [`OnionServiceConfigBuilder`]
+/// as Arti v3 restricted discovery (onyums ROADMAP Phase 2).
+///
+/// Restricted discovery encrypts the service descriptor (its introduction points and
+/// keys) to the listed clients' x25519 keys, so an unlisted client cannot even
+/// *discover* the service — a DoS-resistance measure enforced in descriptor crypto,
+/// upstream of every Skin HTTP layer. The allowlist is [`onyums_skin::RestrictedDiscovery`]
+/// (the orchestration half built in the skin crate); each entry's canonical
+/// `descriptor:x25519:<BASE32>` rendering is parsed straight into Arti's
+/// [`HsClientDescEncKey`], and each nickname into an [`HsClientNickname`] slug.
+///
+/// An empty allowlist is rejected: enabling restricted discovery with no authorized
+/// clients would hide the service from *everyone* (and Arti's own config validation
+/// rejects it too). Surfaced here so it fails offline, before any Tor bootstrap.
+///
+/// # Errors
+/// Returns an error if the allowlist is empty, a nickname is not a valid Tor client
+/// slug, or a key fails to parse into Arti's descriptor-encryption key type.
+fn apply_restricted_discovery(cfg: &mut OnionServiceConfigBuilder, allowlist: &RestrictedDiscovery) -> Result<()> {
+	if allowlist.is_empty() {
+		bail!("authorized_clients allowlist is empty: enabling restricted discovery with no clients would hide the service from everyone. Add at least one client key, or drop authorized_clients() to stay publicly discoverable");
+	}
+	let rd = cfg.restricted_discovery();
+	rd.enabled(true);
+	for (nickname, key) in allowlist.iter() {
+		let parsed_nickname = nickname.parse::<HsClientNickname>().map_err(|e| anyhow::anyhow!("invalid restricted-discovery client nickname {nickname:?}: {e}"))?;
+		// `ClientAuthKey`'s `Display` is the canonical `descriptor:x25519:<BASE32>` line,
+		// which is exactly what Arti's `HsClientDescEncKey` parses (case-insensitively).
+		let parsed_key = key.to_string().parse::<HsClientDescEncKey>().map_err(|e| anyhow::anyhow!("invalid restricted-discovery key for client {nickname:?}: {e}"))?;
+		rd.static_keys().access().push((parsed_nickname, parsed_key));
+	}
+	Ok(())
+}
+
+/// Build the [`OnionServiceConfig`] for `nickname`, applying restricted discovery if
+/// the caller supplied an authorized-clients allowlist.
+///
+/// Everything here is offline: the nickname parse, the restricted-discovery assembly,
+/// and Arti's own config validation all run before any Tor bootstrap, so a bad
+/// nickname or allowlist fails fast rather than after the network round-trip. Extracted
+/// from the launch path so it is unit-testable with no live Tor network.
+///
+/// # Errors
+/// Returns an error if the nickname fails to parse, the restricted-discovery allowlist
+/// is invalid (see [`apply_restricted_discovery`]), or the config fails to build.
+fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedDiscovery>) -> Result<OnionServiceConfig> {
+	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
+	let mut cfg = OnionServiceConfigBuilder::default();
+	cfg.nickname(nickname);
+	if let Some(allowlist) = allowlist {
+		apply_restricted_discovery(&mut cfg, allowlist)?;
+	}
+	cfg.build().map_err(|e| anyhow::anyhow!("Failed to build onion service config: {e}"))
+}
+
+/// Launches an onion service from an already-built [`OnionServiceConfig`].
 ///
 /// The returned request stream is self-contained (`use<>`) — it does not borrow
 /// the client — so callers can move the client elsewhere (e.g. into a handle)
 /// while keeping the stream.
-fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
+fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
 	event!(Level::INFO, "Launching onion service...");
-	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
-	let svc_cfg = OnionServiceConfigBuilder::default().nickname(nickname).build().map_err(|_| anyhow::anyhow!("Failed to build onion service config."))?;
 	client.launch_onion_service(svc_cfg)
 		.map_err(|_| anyhow::anyhow!("Failed to launch onion service."))?
 		.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
@@ -352,9 +416,10 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 	}
 }
 
-/// Initializes the onion service and returns the service and request stream.
-fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
-	let (service, request_stream) = launch_onion_service(client, nickname)?;
+/// Initializes the onion service from a built config and returns the service and
+/// request stream.
+fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
+	let (service, request_stream) = launch_onion_service(client, svc_cfg)?;
 	let address = get_onion_address(&service)?;
 	Ok((service, address, request_stream))
 }
@@ -471,6 +536,20 @@ fn apply_hsts(app: Router, plaintext: tls_policy::PlaintextPolicy) -> Router {
 	}
 }
 
+/// Assemble the application-facing HTTP stack exactly as [`OnionServiceBuilder::serve`]
+/// layers it: the Skin abuse-defense gate (Phase 2) wrapping the caller's app, then the
+/// HSTS response header under a plaintext-reject TLS policy (Phase 3). This is the full
+/// request path a client hits *inside* the onion-encrypted TLS stream, minus the TLS
+/// transport itself.
+///
+/// Extracted from `serve` so the *composed* stack — not just its two halves in isolation
+/// ([`apply_skin`] / [`apply_hsts`]) — is testable end-to-end with
+/// `tower::ServiceExt::oneshot` and no live Tor network. First slice of an
+/// in-process/loopback test mode (cross-cutting roadmap item).
+fn build_serve_router(app: Router, skin: SkinChoice, plaintext: tls_policy::PlaintextPolicy) -> Router {
+	apply_hsts(apply_skin(app, skin), plaintext)
+}
+
 /// Assemble a [`PortRouter`] from the builder's `route_port` registrations,
 /// surfacing the first invalid registration (reserved/zero port, or a duplicate).
 ///
@@ -484,6 +563,32 @@ fn build_port_router(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<Por
 	Ok(router)
 }
 
+/// Resolve the per-rendezvous-circuit [`CircuitPolicy`] from the builder's choices.
+///
+/// The default-policy toggles — Under Attack Mode ([`OnionServiceBuilder::under_attack`])
+/// and the circuit-event sink ([`OnionServiceBuilder::circuit_events`]) — configure the
+/// *default* [`AccountingCircuitPolicy`]. A caller-supplied
+/// [`circuit_policy`](OnionServiceBuilder::circuit_policy) owns those decisions itself, so
+/// combining it with either toggle is a configuration error surfaced here — offline, before
+/// any Tor bootstrap — rather than silently ignoring one of them. With no custom policy the
+/// default accounting policy is returned, in Under Attack Mode iff the toggle is set and
+/// emitting circuit events iff a sink was supplied.
+///
+/// Extracted from `serve` so the resolution is unit-testable with no live Tor network.
+fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: bool, events: Option<Arc<dyn SecurityEventSink>>) -> Result<Arc<dyn CircuitPolicy>> {
+	if let Some(policy) = custom {
+		if under_attack || events.is_some() {
+			bail!("the default-policy toggles under_attack()/circuit_events() conflict with a custom circuit_policy(); configure those on your own policy instead");
+		}
+		return Ok(policy);
+	}
+	let mut policy = AccountingCircuitPolicy::new().under_attack(under_attack);
+	if let Some(sink) = events {
+		policy = policy.with_events(sink);
+	}
+	Ok(Arc::new(policy))
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -495,6 +600,9 @@ pub struct OnionServiceBuilder {
 	skin: SkinChoice,
 	tls: Tls,
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
+	under_attack: bool,
+	circuit_events: Option<Arc<dyn SecurityEventSink>>,
+	restricted_discovery: Option<RestrictedDiscovery>,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 }
 
@@ -550,6 +658,69 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub fn circuit_policy(mut self, policy: Arc<dyn CircuitPolicy>) -> Self {
 		self.circuit_policy = Some(policy);
+		self
+	}
+
+	/// Under Attack Mode: force *every new rendezvous circuit* through the Skin
+	/// challenge gate before it is served (onyums ROADMAP Phase 2).
+	///
+	/// This is an explicit opt-*up* into a stricter posture for when the service is
+	/// actively under a flood: it configures the default [`AccountingCircuitPolicy`]
+	/// so that [`on_new_circuit`](onyums_skin::CircuitPolicy::on_new_circuit) returns
+	/// [`Challenge`](onyums_skin::CircuitAction::Challenge) for every circuit, not
+	/// only the ones the policy would otherwise flag. Leave it off (the default) for
+	/// normal operation.
+	///
+	/// Conflicts with a custom [`circuit_policy`](Self::circuit_policy): that policy
+	/// owns its own Under-Attack decision, so setting both is an error surfaced from
+	/// [`Self::serve`] (offline, before any Tor bootstrap). Set Under Attack Mode on
+	/// your own policy instead — `AccountingCircuitPolicy::new().under_attack(true)`.
+	#[must_use]
+	pub const fn under_attack(mut self, on: bool) -> Self {
+		self.under_attack = on;
+		self
+	}
+
+	/// Surface the *circuit-layer* security events — per-circuit rejects, whole-circuit
+	/// teardowns, and Under-Attack-Mode challenges — to a [`SecurityEventSink`] (onyums
+	/// ROADMAP Phase 2 → Phase 4 observability).
+	///
+	/// This wires the sink into the default [`AccountingCircuitPolicy`], which otherwise
+	/// stays silent. The complementary *HTTP-gate* events (challenge issued/passed/failed,
+	/// WAF blocks, rate-limit trips) are configured on the Skin gate itself — build it with
+	/// [`Skin::builder`] and call `.events(sink)`, then pass it via [`Self::skin`] — so
+	/// feeding one shared sink to both call sites gives you the full observability stream.
+	///
+	/// Like [`Self::under_attack`], this configures the *default* policy and conflicts with
+	/// a custom [`circuit_policy`](Self::circuit_policy) (which owns its own event sink via
+	/// `AccountingCircuitPolicy::with_events`); setting both is an error from [`Self::serve`].
+	#[must_use]
+	pub fn circuit_events(mut self, sink: Arc<dyn SecurityEventSink>) -> Self {
+		self.circuit_events = Some(sink);
+		self
+	}
+
+	/// Enable v3 client authorization / restricted discovery for the listed clients
+	/// (onyums ROADMAP Phase 2).
+	///
+	/// Given an [`onyums_skin::RestrictedDiscovery`] allowlist (nickname → x25519
+	/// [`ClientAuthKey`]), the service publishes a descriptor whose introduction
+	/// points and keys are encrypted to those clients only. An unlisted client cannot
+	/// discover the service at all — `DoS` resistance enforced in descriptor crypto,
+	/// upstream of the Skin HTTP gate rather than in place of it.
+	///
+	/// This is an opt-*down* in reachability (from "anyone with the address" to "only
+	/// these clients"), a deliberate, named decision. Omit it to stay publicly
+	/// discoverable. An empty allowlist is rejected by [`Self::serve`] — enabling
+	/// restricted discovery with no clients would hide the service from everyone.
+	///
+	/// Build the allowlist from `.auth` files (`RestrictedDiscovery::from_auth_files`)
+	/// or by authorizing [`ClientAuthKey`]s directly. Restricted discovery is a
+	/// DoS-resistance mechanism, *not* a substitute for authentication: removing a
+	/// client does not immediately revoke an already-connected one.
+	#[must_use]
+	pub fn authorized_clients(mut self, allowlist: RestrictedDiscovery) -> Self {
+		self.restricted_discovery = Some(allowlist);
 		self
 	}
 
@@ -609,25 +780,27 @@ impl OnionServiceBuilder {
 		let port_router = Arc::new(build_port_router(self.raw_handlers)?);
 
 		// Insert the onyums-skin gate ahead of the application on the HTTP path
-		// (Phase 2 Skin integration). Secure-by-default unless the caller opted down
-		// with `no_skin`. `Router::layer` keeps the `Router` type, so the rest of the
-		// serve path is unchanged.
-		let app = apply_skin(app, self.skin);
-
-		// Phase 3 TLS-first: derive the pure, `Copy` plaintext-enforcement decision
-		// once. In strict mode every HTTPS response carries an HSTS header so a
-		// conforming client never silently downgrades (a no-op under the default
-		// upgrade policy); the matching port-80 rejection is applied in the
-		// rendezvous loop's port dispatch.
+		// (Phase 2 Skin integration) + Phase 3 TLS-first HSTS. Derive the pure, `Copy`
+		// plaintext-enforcement decision once (also threaded into the port dispatch
+		// below), then assemble the full application-facing stack. Secure-by-default
+		// unless the caller opted down with `no_skin`.
 		let plaintext = self.tls.plaintext_policy();
-		let app = apply_hsts(app, plaintext);
+		let app = build_serve_router(app, self.skin, plaintext);
 
 		// The per-circuit Tor-layer gate. Secure-by-default but non-disruptive: an
-		// accept-all accounting policy unless the caller supplied a tuned one.
-		let policy: Arc<dyn CircuitPolicy> = self.circuit_policy.unwrap_or_else(|| Arc::new(AccountingCircuitPolicy::new()));
+		// accept-all accounting policy unless the caller supplied a tuned one, or the
+		// Under Attack Mode toggle asked the default policy to challenge every circuit.
+		// A custom policy combined with the toggle is a conflict caught offline here.
+		let policy = resolve_circuit_policy(self.circuit_policy, self.under_attack, self.circuit_events)?;
+
+		// Phase 2 v3 client authorization: assemble the onion service config (nickname +
+		// optional restricted-discovery allowlist) offline, so a bad nickname or an
+		// empty/invalid allowlist fails before any Tor bootstrap. `None` keeps the
+		// service publicly discoverable — today's default behaviour.
+		let svc_cfg = build_onion_service_config(&nickname, self.restricted_discovery.as_ref())?;
 
 		let client = setup_tor_client().await?;
-		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
+		let (service, address, request_stream) = initialize_onion_service(&client, svc_cfg)?;
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
 		// Bundle everything the loop threads down to each served stream into one
@@ -751,15 +924,54 @@ async fn handle_http_redirect(stream_request: StreamRequest, requested_host: Str
 	hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).http1_only().serve_connection(stream, hyper_service).await.map_err(|err| anyhow::anyhow!("Error serving HTTP redirect: {err}"))
 }
 
+/// Per-connection identity threaded to the application via axum's connect-info
+/// extractor.
+///
+/// Over Tor there is no client IP, so [`socket_addr`](Self::socket_addr) is always
+/// `None`; the meaningful identity is [`circuit_id`](Self::circuit_id) — the host-assigned
+/// id of the rendezvous circuit the request arrived on. Two requests sharing a
+/// `circuit_id` came over the same circuit (the closest Tor analogue to "same client
+/// connection"), which is the handle for per-circuit isolation of application state. Use
+/// the typed helpers ([`is_over_tor`](Self::is_over_tor), [`circuit`](Self::circuit),
+/// [`same_circuit`](Self::same_circuit)) rather than matching on the raw fields.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionInfo {
 	pub circuit_id: Option<String>,
 	pub socket_addr: Option<SocketAddr>,
 }
 
+impl ConnectionInfo {
+	/// Whether this connection arrived over a Tor rendezvous circuit — i.e. a
+	/// [`circuit_id`](Self::circuit_id) is known. Always true for onion-served requests;
+	/// `false` only for a default/synthetic `ConnectionInfo` (e.g. a request-level test).
+	#[must_use]
+	pub const fn is_over_tor(&self) -> bool {
+		self.circuit_id.is_some()
+	}
+
+	/// The per-rendezvous-circuit identifier, if known — the key for isolating
+	/// application state per Tor circuit.
+	#[must_use]
+	pub fn circuit(&self) -> Option<&str> {
+		self.circuit_id.as_deref()
+	}
+
+	/// Whether `self` and `other` came over the *same* known rendezvous circuit.
+	///
+	/// Returns `false` if either side's circuit is unknown — an unknown circuit is never
+	/// treated as matching, so this is safe to gate circuit-isolation decisions on.
+	#[must_use]
+	pub fn same_circuit(&self, other: &Self) -> bool {
+		matches!((self.circuit(), other.circuit()), (Some(a), Some(b)) if a == b)
+	}
+}
+
 impl AxumConnected<Request<Incoming>> for ConnectionInfo {
 	fn connect_info(target: Request<Incoming>) -> Self {
-		Self { circuit_id: target.extensions().get::<Self>().unwrap().circuit_id.clone(), socket_addr: None }
+		// onyums' serve path injects the per-connection `ConnectionInfo` as a request
+		// extension; if it is somehow absent, fall back to an empty (non-Tor) info rather
+		// than panicking the connection task.
+		target.extensions().get::<Self>().cloned().unwrap_or_default()
 	}
 }
 
@@ -1087,6 +1299,225 @@ mod tests {
 		let result = OnionService::builder().router(app).nickname("raw_reserved").route_port(443, RawTcpHandler::new("127.0.0.1:9000")).serve().await;
 		let err = result.err().expect("a reserved-port registration should error");
 		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn builder_records_under_attack_toggle() {
+		let builder = OnionServiceBuilder::default();
+		assert!(!builder.under_attack, "Under Attack Mode is off by default");
+		let builder = builder.under_attack(true);
+		assert!(builder.under_attack, "toggle records on the builder");
+	}
+
+	#[test]
+	fn under_attack_toggle_challenges_every_circuit() {
+		use onyums_skin::CircuitAction;
+		// With no custom policy and the toggle on, the resolved default policy
+		// challenges every new circuit.
+		let policy = resolve_circuit_policy(None, true, None).expect("default policy under attack");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Challenge);
+	}
+
+	#[test]
+	fn default_circuit_policy_accepts_every_circuit() {
+		use onyums_skin::CircuitAction;
+		// The default (toggle off) policy is accept-all on a fresh circuit — unchanged
+		// behaviour, purely the accounting substrate.
+		let policy = resolve_circuit_policy(None, false, None).expect("default accept-all policy");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Accept);
+	}
+
+	#[test]
+	fn under_attack_conflicts_with_a_custom_circuit_policy() {
+		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new());
+		let err = resolve_circuit_policy(Some(custom), true, None).err().expect("under_attack + custom policy must conflict");
+		assert!(err.to_string().contains("under_attack"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn custom_circuit_policy_passes_through_without_the_toggle() {
+		use onyums_skin::CircuitAction;
+		// A custom policy is handed back untouched when the toggle is off; its own caps
+		// (here a stream cap that only trips later) are preserved.
+		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new().max_streams(5));
+		let policy = resolve_circuit_policy(Some(custom), false, None).expect("custom policy passes through");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Accept);
+	}
+
+	#[tokio::test]
+	async fn builder_under_attack_conflicts_before_bootstrap() {
+		// Router, nickname, a custom policy, and the toggle are all set, so validation
+		// reaches the policy resolution — which rejects the conflict before any Tor
+		// bootstrap (offline).
+		let app = Router::new().route("/", get(|| async { "hi" }));
+		let result = OnionService::builder()
+			.router(app)
+			.nickname("ua_conflict")
+			.circuit_policy(Arc::new(AccountingCircuitPolicy::new()))
+			.under_attack(true)
+			.serve()
+			.await;
+		let err = result.err().expect("a conflicting under_attack + custom policy should error");
+		assert!(err.to_string().contains("under_attack"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn skin_client_key_parses_into_arti_descriptor_key() {
+		// The cross-crate contract behind restricted-discovery wiring: skin's canonical
+		// `descriptor:x25519:<BASE32>` rendering is exactly what Arti's
+		// `HsClientDescEncKey` parses, and Arti renders it back identically. Guards
+		// against a base32 case / format drift between the two crates.
+		let key = ClientAuthKey::from_bytes([13u8; 32]);
+		let parsed: HsClientDescEncKey = key.to_string().parse().expect("a skin client key must parse as an Arti client descriptor key");
+		assert_eq!(parsed.to_string(), key.to_string(), "Arti must round-trip skin's canonical key form");
+	}
+
+	#[test]
+	fn builder_records_authorized_clients() {
+		let mut allow = RestrictedDiscovery::new();
+		allow.authorize("alice", ClientAuthKey::from_bytes([3u8; 32]));
+		let builder = OnionServiceBuilder::default().authorized_clients(allow);
+		let recorded = builder.restricted_discovery.as_ref().expect("allowlist recorded on the builder");
+		assert_eq!(recorded.len(), 1);
+	}
+
+	#[test]
+	fn restricted_discovery_config_assembles_offline() {
+		// A non-empty allowlist assembles into a valid onion service config with no live
+		// Tor network — Arti's own config validation runs during `build`.
+		let mut allow = RestrictedDiscovery::new();
+		allow.authorize("alice", ClientAuthKey::from_bytes([7u8; 32]));
+		allow.authorize("bob", ClientAuthKey::from_bytes([42u8; 32]));
+		build_onion_service_config("restricted_svc", Some(&allow)).expect("restricted-discovery config builds offline");
+	}
+
+	#[test]
+	fn config_without_restricted_discovery_still_builds() {
+		// The default publicly-discoverable path is unchanged when no allowlist is set.
+		build_onion_service_config("plain_svc", None).expect("plain config builds offline");
+	}
+
+	#[test]
+	fn empty_allowlist_is_rejected_offline() {
+		// Enabling restricted discovery with no clients would hide the service from
+		// everyone — rejected before any bootstrap.
+		let allow = RestrictedDiscovery::new();
+		let err = build_onion_service_config("empty_allow", Some(&allow)).expect_err("an empty allowlist must be rejected");
+		assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn invalid_client_nickname_is_rejected_offline() {
+		// A nickname that is not a valid Tor client slug (spaces) surfaces offline as a
+		// clear error rather than a late launch failure.
+		let mut allow = RestrictedDiscovery::new();
+		allow.authorize("not a slug", ClientAuthKey::from_bytes([1u8; 32]));
+		let err = build_onion_service_config("bad_nick", Some(&allow)).expect_err("an invalid client nickname must be rejected");
+		assert!(err.to_string().contains("nickname"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn builder_empty_allowlist_errors_before_bootstrap() {
+		// Router and nickname are set, so validation reaches the config assembly, which
+		// rejects the empty allowlist before any Tor bootstrap (offline).
+		let app = Router::new().route("/", get(|| async { "hi" }));
+		let result = OnionService::builder().router(app).nickname("empty_ac").authorized_clients(RestrictedDiscovery::new()).serve().await;
+		let err = result.err().expect("an empty authorized_clients allowlist should error");
+		assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn builder_records_circuit_events_sink() {
+		use onyums_skin::CapturingSink;
+		let builder = OnionServiceBuilder::default().circuit_events(Arc::new(CapturingSink::new()));
+		assert!(builder.circuit_events.is_some(), "the sink is recorded on the builder");
+	}
+
+	#[test]
+	fn circuit_events_are_emitted_under_attack() {
+		use onyums_skin::CapturingSink;
+		// A default policy with a sink, under attack: the challenged circuit records one event.
+		let sink = Arc::new(CapturingSink::new());
+		let policy = resolve_circuit_policy(None, true, Some(sink.clone())).expect("default policy with events");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), onyums_skin::CircuitAction::Challenge);
+		assert_eq!(sink.len(), 1, "the challenged circuit should emit one security event");
+	}
+
+	#[test]
+	fn circuit_events_silent_when_accepting() {
+		use onyums_skin::CapturingSink;
+		// With no attack and no cap tripped, an accepted circuit emits nothing — the sink
+		// only sees non-Accept actions.
+		let sink = Arc::new(CapturingSink::new());
+		let policy = resolve_circuit_policy(None, false, Some(sink.clone())).expect("default policy with events");
+		let _ = policy.on_new_circuit(&CircuitId(1));
+		assert!(sink.is_empty(), "an accepted circuit emits no event");
+	}
+
+	#[test]
+	fn circuit_events_conflict_with_a_custom_policy() {
+		use onyums_skin::CapturingSink;
+		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new());
+		let err = resolve_circuit_policy(Some(custom), false, Some(Arc::new(CapturingSink::new()))).err().expect("a sink + custom policy must conflict");
+		assert!(err.to_string().contains("circuit_policy"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn serve_router_gates_and_adds_hsts_under_strict_tls() {
+		use http_body_util::BodyExt as _;
+		use tower::ServiceExt as _;
+
+		// The full serve-path stack under the secure default + strict TLS: an uncleared
+		// request is intercepted by the gate (never reaching the app) AND the response
+		// carries HSTS. Exercises the composition serve() builds, with no live Tor.
+		let app = build_serve_router(Router::new().route("/", get(|| async { "secret" })), SkinChoice::Default, Tls::Strict.plaintext_policy());
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		let hsts = response.headers().get("strict-transport-security").expect("strict TLS must emit HSTS on the gate's own response");
+		assert_eq!(hsts, "max-age=63072000; includeSubDomains");
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		assert!(!String::from_utf8_lossy(&body).contains("secret"), "the gated app must not leak through the composed stack");
+	}
+
+	#[tokio::test]
+	async fn serve_router_no_skin_reaches_app_without_hsts_under_upgrade() {
+		use http_body_util::BodyExt as _;
+		use tower::ServiceExt as _;
+
+		// Opt-down: no gate + upgrade TLS — the app is reached and no HSTS is added.
+		let app = build_serve_router(Router::new().route("/", get(|| async { "reached" })), SkinChoice::Disabled, Tls::Upgrade.plaintext_policy());
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		assert!(response.headers().get("strict-transport-security").is_none(), "upgrade TLS emits no HSTS");
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		assert_eq!(String::from_utf8_lossy(&body), "reached", "no_skin lets the request reach the app");
+	}
+
+	#[test]
+	fn connection_info_circuit_isolation_helpers() {
+		let a = ConnectionInfo { circuit_id: Some("7".into()), socket_addr: None };
+		let a_again = ConnectionInfo { circuit_id: Some("7".into()), socket_addr: None };
+		let b = ConnectionInfo { circuit_id: Some("9".into()), socket_addr: None };
+		let unknown = ConnectionInfo::default();
+
+		assert!(a.is_over_tor(), "a known circuit id means the request came over Tor");
+		assert!(!unknown.is_over_tor(), "a default info is not over Tor");
+		assert_eq!(a.circuit(), Some("7"));
+		assert_eq!(unknown.circuit(), None);
+
+		assert!(a.same_circuit(&a_again), "the same circuit id is the same circuit");
+		assert!(!a.same_circuit(&b), "different circuit ids are different circuits");
+		assert!(!a.same_circuit(&unknown), "a known circuit never matches an unknown one");
+		assert!(!unknown.same_circuit(&unknown), "two unknown circuits are not a known-same circuit");
+	}
+
+	#[test]
+	fn arti_stack_is_reexported() {
+		// Compile-time proof that the arti stack is reachable through onyums, so a
+		// downstream needn't add its own version-skew-prone arti dependency. If any
+		// re-export path breaks, this stops compiling.
+		type _Client = crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime>;
+		type _Key = crate::tor_hscrypto::pk::HsClientDescEncKey;
+		type _Cfg = crate::tor_hsservice::config::OnionServiceConfigBuilder;
+		type _Cell = crate::tor_cell::relaycell::msg::End;
 	}
 
 	#[tokio::test]

@@ -46,7 +46,7 @@
 - [ ] Bootstrap & descriptor-upload progress as a stream/callback (so `ready()` provably means published + reachable)
 - [ ] Per-service metrics on the handle — active circuits, connection counts, intro-point health, PoW effort, descriptor republish times
 - [ ] Multiple services on one shared `TorClient` — bootstrap once, launch N onion services
-- [ ] Circuit-isolation controls via an enriched `ConnectionInfo` (beyond `circuit_id` + always-`None` `socket_addr`)
+- [x] Circuit-isolation controls via an enriched `ConnectionInfo` — typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers (and a non-panicking connect-info fallback)
 
 ## Phase 5 — Framework layer: batteries-included MVC over axum — `0.9+`
 

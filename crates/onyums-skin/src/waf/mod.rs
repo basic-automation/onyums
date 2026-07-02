@@ -212,6 +212,20 @@ pub struct Waf {
 	/// Used by [`score`](Self::score) and the scoring [`inspect`](Self::inspect) path; the free
 	/// [`anomaly_score`] function keeps using the unmodified defaults.
 	weights: [u32; WafCategory::ALL.len()],
+	/// Operator-authored custom rules expressed in the [`FilterExpr`](crate::filter::FilterExpr)
+	/// language — whole-request predicates evaluated alongside the built-in signature set (see
+	/// [`custom_rule`](Self::custom_rule)). Empty by default.
+	custom: Vec<CustomRule>,
+}
+
+/// A custom operator rule authored in the filter-expression language: a whole-request
+/// [`FilterExpr`](crate::filter::FilterExpr) predicate paired with a stable id and a
+/// [`WafCategory`]. Built and appended by [`Waf::custom_rule`] / [`Waf::custom_expr_rule`];
+/// matches report `location = "custom"`.
+struct CustomRule {
+	id: &'static str,
+	category: WafCategory,
+	expr: crate::filter::FilterExpr,
 }
 
 impl Waf {
@@ -229,7 +243,7 @@ impl Waf {
 		for cat in WafCategory::ALL {
 			weights[cat.index()] = cat.weight();
 		}
-		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights })
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights, custom: Vec::new() })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -333,6 +347,61 @@ impl Waf {
 	#[must_use]
 	pub fn category_weight(&self, category: WafCategory) -> u32 {
 		self.weights[category.index()]
+	}
+
+	/// Add an operator-authored custom rule written in the
+	/// [`FilterExpr`](crate::filter::FilterExpr) rule language — the same string grammar the
+	/// [edge rules](crate::edge::EdgeMatch::expr) use — parsed with
+	/// [`FilterExpr::parse`](crate::filter::FilterExpr::parse). Unlike the regex signature rules
+	/// (which match field *content*), a custom rule is a whole-request predicate over the
+	/// method, path, query, and headers (`method eq "POST" and path starts_with "/wp-login"`),
+	/// so it blocks a request *shape* the built-in signatures do not describe. A firing custom
+	/// rule reports `location = "custom"` under the given `id` and `category`, and — like any
+	/// other match — contributes its category weight to [anomaly scoring](Self::scoring_threshold).
+	///
+	/// In first-match mode a built-in signature match still takes precedence (custom rules are
+	/// evaluated after the signature fields); in scoring mode custom hits are summed with the rest.
+	///
+	/// # Errors
+	/// Returns the [`ParseError`](crate::filter::ParseError) from the filter parser if `rule`
+	/// fails to lex or parse (unknown field/operator, invalid regex, unbalanced group, …), so a
+	/// malformed operator rule is rejected up front rather than silently ignored.
+	pub fn custom_rule(mut self, id: &'static str, category: WafCategory, rule: &str) -> Result<Self, crate::filter::ParseError> {
+		let expr = crate::filter::FilterExpr::parse(rule)?;
+		self.custom.push(CustomRule { id, category, expr });
+		Ok(self)
+	}
+
+	/// Add a custom rule from an already-built [`FilterExpr`](crate::filter::FilterExpr) (the
+	/// programmatic counterpart of [`custom_rule`](Self::custom_rule), for rules assembled with
+	/// the [`Field`](crate::filter::Field) builders rather than parsed from a string).
+	#[must_use]
+	pub fn custom_expr_rule(mut self, id: &'static str, category: WafCategory, expr: crate::filter::FilterExpr) -> Self {
+		self.custom.push(CustomRule { id, category, expr });
+		self
+	}
+
+	/// The number of custom [`FilterExpr`](crate::filter::FilterExpr) rules added on top of the
+	/// signature ruleset (see [`custom_rule`](Self::custom_rule)).
+	#[must_use]
+	pub fn custom_rule_count(&self) -> usize {
+		self.custom.len()
+	}
+
+	/// The first custom [`FilterExpr`](crate::filter::FilterExpr) rule that matches the request,
+	/// as a [`WafMatch`] located at `"custom"`. `None` if no custom rule fires (or none exist).
+	fn match_custom(&self, parts: &Parts) -> Option<WafMatch> {
+		self.custom.iter().find(|r| r.expr.evaluate(parts)).map(|r| WafMatch { rule_id: r.id, category: r.category, location: "custom".to_owned(), score: None })
+	}
+
+	/// Append every matching custom rule to `out` (the collect-all counterpart of
+	/// [`match_custom`](Self::match_custom), for the scoring path).
+	fn match_custom_all(&self, parts: &Parts, out: &mut Vec<WafMatch>) {
+		for r in &self.custom {
+			if r.expr.evaluate(parts) {
+				out.push(WafMatch { rule_id: r.id, category: r.category, location: "custom".to_owned(), score: None });
+			}
+		}
 	}
 
 	/// Sum this WAF's (possibly overridden) per-category weights over a set of matches — the
@@ -444,6 +513,11 @@ impl Waf {
 				return Verdict::Block(m);
 			}
 		}
+		// Operator-authored custom rules run after the built-in signature fields, so a
+		// signature block keeps precedence in first-match mode.
+		if let Some(m) = self.match_custom(parts) {
+			return Verdict::Block(m);
+		}
 		Verdict::Allow
 	}
 
@@ -529,6 +603,8 @@ impl Waf {
 				self.inspect_field_all(s, &format!("header:{name}"), false, &mut out);
 			}
 		}
+		// Custom filter-expression rules contribute to the aggregate score too.
+		self.match_custom_all(parts, &mut out);
 		out
 	}
 }
@@ -629,6 +705,11 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
 		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
+		// Boolean-based blind SQLi beyond `or N=N` (which `sqli_or_tautology` already covers):
+		// `and` with any comparator, or `or` with `<`/`>`. Deliberately excludes `or N=N` so it
+		// does not double-count against `sqli_or_tautology` in anomaly scoring.
+		Rule { id: "sqli_boolean_condition", category: WafCategory::Sqli, pattern: r#"(?i)(\band\b\s+['"]?\d+\s*[=<>]|\bor\b\s+['"]?\d+\s*[<>])\s*['"]?\d+"# },
+		Rule { id: "sqli_oob_exec", category: WafCategory::Sqli, pattern: r"(?i)\b(xp_cmdshell|xp_dirtree|load_file|utl_http|dbms_ldap)\b" },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
@@ -636,6 +717,7 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xss_iframe_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*iframe\b" },
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
 		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
+		Rule { id: "xss_svg_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*svg\b" },
 		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
@@ -645,16 +727,21 @@ pub fn starter_rules() -> Vec<Rule> {
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
+		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
+		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
 		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
 		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
+		Rule { id: "ssrf_decimal_ip", category: WafCategory::Ssrf, pattern: r"(?i)\bhttps?://\d{8,10}(?:[:/]|\b)" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
 		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
+		Rule { id: "code_ssti_template", category: WafCategory::CodeInjection, pattern: r"\{\{\s*\d+\s*[*]\s*\d+\s*\}\}" },
+		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"rO0AB[A-Za-z0-9+/=]{2,}" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -825,6 +912,123 @@ mod tests {
 		for uri in ["/blog/data-structures-101", "/shop/cats-and-dogs", "/docs/php-vs-python", "/files/binary-data"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn crs_growth_rules_match_their_signatures() {
+		// The signatures added in the OWASP-CRS coverage-growth pass each fire on a
+		// representative payload.
+		let waf = Waf::starter();
+		// XSS via the SVG vector (SVG markup can carry script / event handlers). Uses a bare
+		// tag so the SVG rule, not the event-handler rule, is the match.
+		assert_eq!(waf.inspect_str("<svg width=1 height=1>", "target").unwrap().rule_id, "xss_svg_tag");
+		// `$(...)` command substitution, which the separator-prefixed shell rule misses.
+		assert_eq!(waf.inspect_str("q=$(whoami)", "target").unwrap().rule_id, "cmdi_command_substitution");
+		// Windows command injection after a shell separator (the existing rule is Unix-centric).
+		assert_eq!(waf.inspect_str("x=1&dir c:\\", "target").unwrap().rule_id, "cmdi_windows_command");
+		// SSRF via a decimal-encoded IPv4 (127.0.0.1 as the integer 2130706433).
+		assert_eq!(waf.inspect_str("url=http://2130706433/latest", "target").unwrap().category, WafCategory::Ssrf);
+		// Boolean-based blind SQLi with `and` / a comparison operator (not just `or N=N`).
+		assert_eq!(waf.inspect_str("id=5 AND 1=1", "target").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("id=5 OR 7<9", "target").unwrap().rule_id, "sqli_boolean_condition");
+	}
+
+	#[test]
+	fn crs_growth_rules_keep_false_positives_low() {
+		// Benign requests that brush near the new signatures must still pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/gallery/svgoptimizer",         // "svg" as a substring, not a tag
+			"/pricing?plans=3",              // a bare number, no boolean operator
+			"/directory/listing",           // "dir" as a path word, no separator
+			"/go/http-status-codes",        // "http" without a decimal-IP host
+			"/search?q=cats+and+dogs",      // "and" without a numeric comparison
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn crs_growth_batch_two_rules_match() {
+		// The second CRS coverage batch: OOB/exec SQLi escalation, `{{7*7}}` template SSTI, and
+		// the base64 Java-serialized-object marker.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("q=';EXEC xp_cmdshell('dir')--", "target").unwrap().rule_id, "sqli_oob_exec");
+		assert_eq!(waf.inspect_str("name={{7*7}}", "target").unwrap().rule_id, "code_ssti_template");
+		assert_eq!(waf.inspect_str("data=rO0ABXNyABBqYXZh", "target").unwrap().rule_id, "code_java_serialized");
+	}
+
+	#[test]
+	fn crs_growth_batch_two_keeps_false_positives_low() {
+		let waf = Waf::starter();
+		for uri in ["/files/upload", "/templates/starter-kit", "/docs/load-testing", "/blog/70-rules"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn custom_filter_expr_rule_blocks_matching_shape() {
+		// An operator authors a rule in the filter language that describes a request *shape*
+		// the signature rules do not: POST to a login path. A matching request is blocked and
+		// reports the custom id at location "custom"; a request of a different shape passes.
+		let waf = Waf::starter().custom_rule("block_wp_login", WafCategory::ProtocolAnomaly, r#"method eq "POST" and path starts_with "/wp-login""#).unwrap();
+		assert_eq!(waf.custom_rule_count(), 1);
+		let v = waf.inspect(&parts("POST", "/wp-login.php"));
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, "block_wp_login");
+		assert_eq!(m.location, "custom");
+		assert_eq!(m.category, WafCategory::ProtocolAnomaly);
+		// A GET to the same path, and a POST elsewhere, do not match the shape.
+		assert_eq!(waf.inspect(&parts("GET", "/wp-login.php")), Verdict::Allow);
+		assert_eq!(waf.inspect(&parts("POST", "/api/items")), Verdict::Allow);
+	}
+
+	#[test]
+	fn custom_rule_rejects_a_malformed_expression() {
+		// A rule string that does not parse is rejected up front, not silently dropped.
+		assert!(Waf::starter().custom_rule("bad", WafCategory::Sqli, r#"frob eq "x""#).is_err());
+	}
+
+	#[test]
+	fn custom_expr_rule_from_the_field_builder() {
+		// The programmatic counterpart: a rule built with the Field DSL rather than parsed.
+		use crate::filter::Field;
+		use axum::http::HeaderName;
+		let waf = Waf::starter().custom_expr_rule("hdr_flag", WafCategory::ProtocolAnomaly, Field::header(HeaderName::from_static("x-attack")).contains("1"));
+		let mut p = parts("GET", "/");
+		p.headers.insert("x-attack", "value-1".parse().unwrap());
+		assert_eq!(blocked(&waf.inspect(&p)).rule_id, "hdr_flag");
+	}
+
+	#[test]
+	fn built_in_signature_takes_precedence_over_custom_in_first_match() {
+		// A request that trips both a signature (XSS in the query) and a custom shape rule
+		// reports the signature in first-match mode, since custom rules run after the fields.
+		let waf = Waf::starter().custom_rule("catch_all_get", WafCategory::ProtocolAnomaly, r#"method eq "GET""#).unwrap();
+		let mut p = parts("GET", "/search");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let v = waf.inspect(&p);
+		let m = blocked(&v);
+		assert_eq!(m.category, WafCategory::Xss, "the signature block wins over the broad custom rule");
+	}
+
+	#[test]
+	fn custom_rule_contributes_to_anomaly_scoring() {
+		use crate::filter::Field;
+		use axum::http::HeaderName;
+		// In scoring mode a custom rule's category weight is summed with the signature hits: a
+		// lone SQLi header (5) is under a threshold of 8, but adding a custom ProtocolAnomaly
+		// rule (3) on the same request reaches it.
+		let attack = || {
+			let mut p = parts("GET", "/");
+			p.headers.insert("user-agent", "1 UNION SELECT pw".parse().unwrap());
+			p
+		};
+		let base = Waf::starter().scoring_threshold(8);
+		assert_eq!(base.inspect(&attack()), Verdict::Allow, "SQLi alone (5) is below the threshold of 8");
+		let with_custom = Waf::starter().scoring_threshold(8).custom_expr_rule("ua_present", WafCategory::ProtocolAnomaly, Field::header(HeaderName::from_static("user-agent")).contains("UNION"));
+		let v = with_custom.inspect(&attack());
+		assert_eq!(blocked(&v).score, Some(8), "SQLi (5) + custom anomaly (3) reaches the threshold");
 	}
 
 	#[test]

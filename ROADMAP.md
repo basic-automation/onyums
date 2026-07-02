@@ -30,7 +30,7 @@
 - [x] Skin integration: `.skin(...)` / `.no_skin()` / `.circuit_policy(...)` builder surface
 - [x] Skin integration: Under Attack Mode toggle on the builder — force every new circuit through the gate
 - [ ] Skin integration: feed Skin's adaptive-difficulty signal from onyums-observed circuit/request rate (intro-layer PoW effort is not surfaced by Arti)
-- [ ] Surface Skin's security events (challenge / WAF / rate-limit / teardown) into the Phase 4 observability stream
+- [x] Surface Skin's security events (challenge / WAF / rate-limit / teardown) into the Phase 4 observability stream — circuit-layer events via `.circuit_events(sink)`; HTTP-gate events via `Skin::builder().events(sink)` + `.skin(...)`
 
 ## Phase 3 — TLS-first transport & protocol versatility — `0.7`
 

@@ -44,7 +44,7 @@ extern crate rcgen;
 use std::sync::Arc;
 
 pub use axum::*;
-pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, Skin};
+pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, SecurityEvent, SecurityEventSink, Skin};
 use onyums_skin::CircuitId;
 
 /// Re-export the arti stack onyums is built on, so downstream crates can depend on the
@@ -551,20 +551,28 @@ fn build_port_router(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<Por
 
 /// Resolve the per-rendezvous-circuit [`CircuitPolicy`] from the builder's choices.
 ///
-/// The Under Attack Mode toggle ([`OnionServiceBuilder::under_attack`]) configures the
-/// *default* [`AccountingCircuitPolicy`] to challenge every new circuit. A caller-supplied
-/// [`circuit_policy`](OnionServiceBuilder::circuit_policy) owns its own Under-Attack
-/// decision, so combining the two is a configuration error surfaced here — offline, before
+/// The default-policy toggles — Under Attack Mode ([`OnionServiceBuilder::under_attack`])
+/// and the circuit-event sink ([`OnionServiceBuilder::circuit_events`]) — configure the
+/// *default* [`AccountingCircuitPolicy`]. A caller-supplied
+/// [`circuit_policy`](OnionServiceBuilder::circuit_policy) owns those decisions itself, so
+/// combining it with either toggle is a configuration error surfaced here — offline, before
 /// any Tor bootstrap — rather than silently ignoring one of them. With no custom policy the
-/// default accounting policy is returned, in Under Attack Mode iff the toggle is set.
+/// default accounting policy is returned, in Under Attack Mode iff the toggle is set and
+/// emitting circuit events iff a sink was supplied.
 ///
 /// Extracted from `serve` so the resolution is unit-testable with no live Tor network.
-fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: bool) -> Result<Arc<dyn CircuitPolicy>> {
-	match (custom, under_attack) {
-		(Some(_), true) => bail!("under_attack() configures the default circuit policy and conflicts with a custom circuit_policy(); set under_attack on your own policy instead"),
-		(Some(policy), false) => Ok(policy),
-		(None, on) => Ok(Arc::new(AccountingCircuitPolicy::new().under_attack(on))),
+fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: bool, events: Option<Arc<dyn SecurityEventSink>>) -> Result<Arc<dyn CircuitPolicy>> {
+	if let Some(policy) = custom {
+		if under_attack || events.is_some() {
+			bail!("the default-policy toggles under_attack()/circuit_events() conflict with a custom circuit_policy(); configure those on your own policy instead");
+		}
+		return Ok(policy);
 	}
+	let mut policy = AccountingCircuitPolicy::new().under_attack(under_attack);
+	if let Some(sink) = events {
+		policy = policy.with_events(sink);
+	}
+	Ok(Arc::new(policy))
 }
 
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
@@ -579,6 +587,7 @@ pub struct OnionServiceBuilder {
 	tls: Tls,
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
 	under_attack: bool,
+	circuit_events: Option<Arc<dyn SecurityEventSink>>,
 	restricted_discovery: Option<RestrictedDiscovery>,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 }
@@ -655,6 +664,25 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub const fn under_attack(mut self, on: bool) -> Self {
 		self.under_attack = on;
+		self
+	}
+
+	/// Surface the *circuit-layer* security events — per-circuit rejects, whole-circuit
+	/// teardowns, and Under-Attack-Mode challenges — to a [`SecurityEventSink`] (onyums
+	/// ROADMAP Phase 2 → Phase 4 observability).
+	///
+	/// This wires the sink into the default [`AccountingCircuitPolicy`], which otherwise
+	/// stays silent. The complementary *HTTP-gate* events (challenge issued/passed/failed,
+	/// WAF blocks, rate-limit trips) are configured on the Skin gate itself — build it with
+	/// [`Skin::builder`] and call `.events(sink)`, then pass it via [`Self::skin`] — so
+	/// feeding one shared sink to both call sites gives you the full observability stream.
+	///
+	/// Like [`Self::under_attack`], this configures the *default* policy and conflicts with
+	/// a custom [`circuit_policy`](Self::circuit_policy) (which owns its own event sink via
+	/// `AccountingCircuitPolicy::with_events`); setting both is an error from [`Self::serve`].
+	#[must_use]
+	pub fn circuit_events(mut self, sink: Arc<dyn SecurityEventSink>) -> Self {
+		self.circuit_events = Some(sink);
 		self
 	}
 
@@ -755,7 +783,7 @@ impl OnionServiceBuilder {
 		// accept-all accounting policy unless the caller supplied a tuned one, or the
 		// Under Attack Mode toggle asked the default policy to challenge every circuit.
 		// A custom policy combined with the toggle is a conflict caught offline here.
-		let policy = resolve_circuit_policy(self.circuit_policy, self.under_attack)?;
+		let policy = resolve_circuit_policy(self.circuit_policy, self.under_attack, self.circuit_events)?;
 
 		// Phase 2 v3 client authorization: assemble the onion service config (nickname +
 		// optional restricted-discovery allowlist) offline, so a bad nickname or an
@@ -1239,7 +1267,7 @@ mod tests {
 		use onyums_skin::CircuitAction;
 		// With no custom policy and the toggle on, the resolved default policy
 		// challenges every new circuit.
-		let policy = resolve_circuit_policy(None, true).expect("default policy under attack");
+		let policy = resolve_circuit_policy(None, true, None).expect("default policy under attack");
 		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Challenge);
 	}
 
@@ -1248,14 +1276,14 @@ mod tests {
 		use onyums_skin::CircuitAction;
 		// The default (toggle off) policy is accept-all on a fresh circuit — unchanged
 		// behaviour, purely the accounting substrate.
-		let policy = resolve_circuit_policy(None, false).expect("default accept-all policy");
+		let policy = resolve_circuit_policy(None, false, None).expect("default accept-all policy");
 		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Accept);
 	}
 
 	#[test]
 	fn under_attack_conflicts_with_a_custom_circuit_policy() {
 		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new());
-		let err = resolve_circuit_policy(Some(custom), true).err().expect("under_attack + custom policy must conflict");
+		let err = resolve_circuit_policy(Some(custom), true, None).err().expect("under_attack + custom policy must conflict");
 		assert!(err.to_string().contains("under_attack"), "unexpected error: {err}");
 	}
 
@@ -1265,7 +1293,7 @@ mod tests {
 		// A custom policy is handed back untouched when the toggle is off; its own caps
 		// (here a stream cap that only trips later) are preserved.
 		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new().max_streams(5));
-		let policy = resolve_circuit_policy(Some(custom), false).expect("custom policy passes through");
+		let policy = resolve_circuit_policy(Some(custom), false, None).expect("custom policy passes through");
 		assert_eq!(policy.on_new_circuit(&CircuitId(1)), CircuitAction::Accept);
 	}
 
@@ -1349,6 +1377,42 @@ mod tests {
 		let result = OnionService::builder().router(app).nickname("empty_ac").authorized_clients(RestrictedDiscovery::new()).serve().await;
 		let err = result.err().expect("an empty authorized_clients allowlist should error");
 		assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn builder_records_circuit_events_sink() {
+		use onyums_skin::CapturingSink;
+		let builder = OnionServiceBuilder::default().circuit_events(Arc::new(CapturingSink::new()));
+		assert!(builder.circuit_events.is_some(), "the sink is recorded on the builder");
+	}
+
+	#[test]
+	fn circuit_events_are_emitted_under_attack() {
+		use onyums_skin::CapturingSink;
+		// A default policy with a sink, under attack: the challenged circuit records one event.
+		let sink = Arc::new(CapturingSink::new());
+		let policy = resolve_circuit_policy(None, true, Some(sink.clone())).expect("default policy with events");
+		assert_eq!(policy.on_new_circuit(&CircuitId(1)), onyums_skin::CircuitAction::Challenge);
+		assert_eq!(sink.len(), 1, "the challenged circuit should emit one security event");
+	}
+
+	#[test]
+	fn circuit_events_silent_when_accepting() {
+		use onyums_skin::CapturingSink;
+		// With no attack and no cap tripped, an accepted circuit emits nothing — the sink
+		// only sees non-Accept actions.
+		let sink = Arc::new(CapturingSink::new());
+		let policy = resolve_circuit_policy(None, false, Some(sink.clone())).expect("default policy with events");
+		let _ = policy.on_new_circuit(&CircuitId(1));
+		assert!(sink.is_empty(), "an accepted circuit emits no event");
+	}
+
+	#[test]
+	fn circuit_events_conflict_with_a_custom_policy() {
+		use onyums_skin::CapturingSink;
+		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new());
+		let err = resolve_circuit_policy(Some(custom), false, Some(Arc::new(CapturingSink::new()))).err().expect("a sink + custom policy must conflict");
+		assert!(err.to_string().contains("circuit_policy"), "unexpected error: {err}");
 	}
 
 	#[test]

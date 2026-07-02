@@ -212,6 +212,20 @@ pub struct Waf {
 	/// Used by [`score`](Self::score) and the scoring [`inspect`](Self::inspect) path; the free
 	/// [`anomaly_score`] function keeps using the unmodified defaults.
 	weights: [u32; WafCategory::ALL.len()],
+	/// Operator-authored custom rules expressed in the [`FilterExpr`](crate::filter::FilterExpr)
+	/// language — whole-request predicates evaluated alongside the built-in signature set (see
+	/// [`custom_rule`](Self::custom_rule)). Empty by default.
+	custom: Vec<CustomRule>,
+}
+
+/// A custom operator rule authored in the filter-expression language: a whole-request
+/// [`FilterExpr`](crate::filter::FilterExpr) predicate paired with a stable id and a
+/// [`WafCategory`]. Built and appended by [`Waf::custom_rule`] / [`Waf::custom_expr_rule`];
+/// matches report `location = "custom"`.
+struct CustomRule {
+	id: &'static str,
+	category: WafCategory,
+	expr: crate::filter::FilterExpr,
 }
 
 impl Waf {
@@ -229,7 +243,7 @@ impl Waf {
 		for cat in WafCategory::ALL {
 			weights[cat.index()] = cat.weight();
 		}
-		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights })
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights, custom: Vec::new() })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -333,6 +347,61 @@ impl Waf {
 	#[must_use]
 	pub fn category_weight(&self, category: WafCategory) -> u32 {
 		self.weights[category.index()]
+	}
+
+	/// Add an operator-authored custom rule written in the
+	/// [`FilterExpr`](crate::filter::FilterExpr) rule language — the same string grammar the
+	/// [edge rules](crate::edge::EdgeMatch::expr) use — parsed with
+	/// [`FilterExpr::parse`](crate::filter::FilterExpr::parse). Unlike the regex signature rules
+	/// (which match field *content*), a custom rule is a whole-request predicate over the
+	/// method, path, query, and headers (`method eq "POST" and path starts_with "/wp-login"`),
+	/// so it blocks a request *shape* the built-in signatures do not describe. A firing custom
+	/// rule reports `location = "custom"` under the given `id` and `category`, and — like any
+	/// other match — contributes its category weight to [anomaly scoring](Self::scoring_threshold).
+	///
+	/// In first-match mode a built-in signature match still takes precedence (custom rules are
+	/// evaluated after the signature fields); in scoring mode custom hits are summed with the rest.
+	///
+	/// # Errors
+	/// Returns the [`ParseError`](crate::filter::ParseError) from the filter parser if `rule`
+	/// fails to lex or parse (unknown field/operator, invalid regex, unbalanced group, …), so a
+	/// malformed operator rule is rejected up front rather than silently ignored.
+	pub fn custom_rule(mut self, id: &'static str, category: WafCategory, rule: &str) -> Result<Self, crate::filter::ParseError> {
+		let expr = crate::filter::FilterExpr::parse(rule)?;
+		self.custom.push(CustomRule { id, category, expr });
+		Ok(self)
+	}
+
+	/// Add a custom rule from an already-built [`FilterExpr`](crate::filter::FilterExpr) (the
+	/// programmatic counterpart of [`custom_rule`](Self::custom_rule), for rules assembled with
+	/// the [`Field`](crate::filter::Field) builders rather than parsed from a string).
+	#[must_use]
+	pub fn custom_expr_rule(mut self, id: &'static str, category: WafCategory, expr: crate::filter::FilterExpr) -> Self {
+		self.custom.push(CustomRule { id, category, expr });
+		self
+	}
+
+	/// The number of custom [`FilterExpr`](crate::filter::FilterExpr) rules added on top of the
+	/// signature ruleset (see [`custom_rule`](Self::custom_rule)).
+	#[must_use]
+	pub fn custom_rule_count(&self) -> usize {
+		self.custom.len()
+	}
+
+	/// The first custom [`FilterExpr`](crate::filter::FilterExpr) rule that matches the request,
+	/// as a [`WafMatch`] located at `"custom"`. `None` if no custom rule fires (or none exist).
+	fn match_custom(&self, parts: &Parts) -> Option<WafMatch> {
+		self.custom.iter().find(|r| r.expr.evaluate(parts)).map(|r| WafMatch { rule_id: r.id, category: r.category, location: "custom".to_owned(), score: None })
+	}
+
+	/// Append every matching custom rule to `out` (the collect-all counterpart of
+	/// [`match_custom`](Self::match_custom), for the scoring path).
+	fn match_custom_all(&self, parts: &Parts, out: &mut Vec<WafMatch>) {
+		for r in &self.custom {
+			if r.expr.evaluate(parts) {
+				out.push(WafMatch { rule_id: r.id, category: r.category, location: "custom".to_owned(), score: None });
+			}
+		}
 	}
 
 	/// Sum this WAF's (possibly overridden) per-category weights over a set of matches — the
@@ -444,6 +513,11 @@ impl Waf {
 				return Verdict::Block(m);
 			}
 		}
+		// Operator-authored custom rules run after the built-in signature fields, so a
+		// signature block keeps precedence in first-match mode.
+		if let Some(m) = self.match_custom(parts) {
+			return Verdict::Block(m);
+		}
 		Verdict::Allow
 	}
 
@@ -529,6 +603,8 @@ impl Waf {
 				self.inspect_field_all(s, &format!("header:{name}"), false, &mut out);
 			}
 		}
+		// Custom filter-expression rules contribute to the aggregate score too.
+		self.match_custom_all(parts, &mut out);
 		out
 	}
 }
@@ -867,6 +943,71 @@ mod tests {
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn custom_filter_expr_rule_blocks_matching_shape() {
+		// An operator authors a rule in the filter language that describes a request *shape*
+		// the signature rules do not: POST to a login path. A matching request is blocked and
+		// reports the custom id at location "custom"; a request of a different shape passes.
+		let waf = Waf::starter().custom_rule("block_wp_login", WafCategory::ProtocolAnomaly, r#"method eq "POST" and path starts_with "/wp-login""#).unwrap();
+		assert_eq!(waf.custom_rule_count(), 1);
+		let v = waf.inspect(&parts("POST", "/wp-login.php"));
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, "block_wp_login");
+		assert_eq!(m.location, "custom");
+		assert_eq!(m.category, WafCategory::ProtocolAnomaly);
+		// A GET to the same path, and a POST elsewhere, do not match the shape.
+		assert_eq!(waf.inspect(&parts("GET", "/wp-login.php")), Verdict::Allow);
+		assert_eq!(waf.inspect(&parts("POST", "/api/items")), Verdict::Allow);
+	}
+
+	#[test]
+	fn custom_rule_rejects_a_malformed_expression() {
+		// A rule string that does not parse is rejected up front, not silently dropped.
+		assert!(Waf::starter().custom_rule("bad", WafCategory::Sqli, r#"frob eq "x""#).is_err());
+	}
+
+	#[test]
+	fn custom_expr_rule_from_the_field_builder() {
+		// The programmatic counterpart: a rule built with the Field DSL rather than parsed.
+		use crate::filter::Field;
+		use axum::http::HeaderName;
+		let waf = Waf::starter().custom_expr_rule("hdr_flag", WafCategory::ProtocolAnomaly, Field::header(HeaderName::from_static("x-attack")).contains("1"));
+		let mut p = parts("GET", "/");
+		p.headers.insert("x-attack", "value-1".parse().unwrap());
+		assert_eq!(blocked(&waf.inspect(&p)).rule_id, "hdr_flag");
+	}
+
+	#[test]
+	fn built_in_signature_takes_precedence_over_custom_in_first_match() {
+		// A request that trips both a signature (XSS in the query) and a custom shape rule
+		// reports the signature in first-match mode, since custom rules run after the fields.
+		let waf = Waf::starter().custom_rule("catch_all_get", WafCategory::ProtocolAnomaly, r#"method eq "GET""#).unwrap();
+		let mut p = parts("GET", "/search");
+		p.headers.insert("user-agent", "<script>x</script>".parse().unwrap());
+		let v = waf.inspect(&p);
+		let m = blocked(&v);
+		assert_eq!(m.category, WafCategory::Xss, "the signature block wins over the broad custom rule");
+	}
+
+	#[test]
+	fn custom_rule_contributes_to_anomaly_scoring() {
+		use crate::filter::Field;
+		use axum::http::HeaderName;
+		// In scoring mode a custom rule's category weight is summed with the signature hits: a
+		// lone SQLi header (5) is under a threshold of 8, but adding a custom ProtocolAnomaly
+		// rule (3) on the same request reaches it.
+		let attack = || {
+			let mut p = parts("GET", "/");
+			p.headers.insert("user-agent", "1 UNION SELECT pw".parse().unwrap());
+			p
+		};
+		let base = Waf::starter().scoring_threshold(8);
+		assert_eq!(base.inspect(&attack()), Verdict::Allow, "SQLi alone (5) is below the threshold of 8");
+		let with_custom = Waf::starter().scoring_threshold(8).custom_expr_rule("ua_present", WafCategory::ProtocolAnomaly, Field::header(HeaderName::from_static("user-agent")).contains("UNION"));
+		let v = with_custom.inspect(&attack());
+		assert_eq!(blocked(&v).score, Some(8), "SQLi (5) + custom anomaly (3) reaches the threshold");
 	}
 
 	#[test]

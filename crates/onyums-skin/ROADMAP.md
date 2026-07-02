@@ -45,9 +45,12 @@
 - [x] Multi-instance coordination — `HmacClearanceStore::derived` shared-secret key derivation + `with_verify_key` zero-downtime rotation
 - [x] Edge rules — `edge::EdgeRules` match→action engine (redirect / block / header transform), incl. `https_upgrade()`
 - [x] Response cache — `cache::ResponseCache`, bounded + TTL-expiring, `Cache-Control`-aware, keyed on `(method, host, path+query)`
-- [ ] Wire `edge::EdgeRules` and `cache::ResponseCache` into `SkinLayer` (host-integration slice)
-- [ ] WAF custom-rule path adopts `FilterExpr::parse` — operator-authored string rules end to end
+- [x] Wire `edge::EdgeRules` and `cache::ResponseCache` into `SkinLayer` (host-integration slice) — `SkinBuilder::edge_rules(...)` runs the ruleset between WAF inspection and the gate (redirect/block short-circuit, header transforms ride out on the forwarded response); `SkinBuilder::response_cache(...)` serves cleared GET/HEAD hits from a bounded, `Cache-Control`-honoring store without re-running the inner router
+- [x] WAF custom-rule path adopts `FilterExpr::parse` — `Waf::custom_rule(id, category, rule_str)` / `custom_expr_rule(...)`: operator-authored whole-request predicates in the filter language, evaluated alongside the signature set (first-match: after the signature fields; scoring: summed in), reporting `location = "custom"`
 - [ ] OWASP-CRS coverage growth — keep porting rules into the pure-Rust engine (no Coraza/FFI escape hatch, ever)
+  - Sensitive-file access signatures from CRS 4.26.0: `.dockerenv`, `.DS_Store`, `META-INF/`, `WEB-INF/`, and prefix-guarded `.profile` (<https://www.linuxcompatible.org/story/owasp-crs-4260-released>) — extend the PathTraversal class beyond the current `/etc/passwd`-style targets
+  - Scanner / tool-fingerprint signatures — CRS 4.26.0 added explicit WhatWAF + ghauri detection and a refreshed user-agent list (same source); a small curated set of attack-tool UA/behaviour signatures complements the existing `BotHeuristics` (Tor strips the IP, but the tool's request shape survives)
+  - Track CRSLang: CRS is replacing Seclang with a YAML rule language in its next major release (<https://coreruleset.org/>) — a reference point for `FilterExpr`'s string grammar as the operator-facing rule surface
 
 ## Open questions (each resolves into a task once decided)
 

@@ -27,11 +27,36 @@ let gated: Router = app.layer(Skin::secure_default().into_layer());
 Built out: the gate core (PoW/tarpit challenge chain, `hmac`-signed clearance,
 `governor` rate limiting), the Tor dimension (`CircuitPolicy` + `AccountingCircuitPolicy`
 with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
-expression language + curated ruleset + anomaly scoring), observability (typed
-`SecurityEvent`s, metrics, request-shape baselining), and Phase-5 frontier work: JA4H
-fingerprinting, request-shape bot heuristics, an opt-in EquiX PoW backend, edge
-rules/caching, multi-instance clearance-key coordination, and **restricted-discovery
-orchestration** (below).
+expression language + curated ruleset + anomaly scoring + operator-authored custom
+rules), observability (typed `SecurityEvent`s, metrics, request-shape baselining), and
+Phase-5 frontier work: JA4H fingerprinting, request-shape bot heuristics, an opt-in
+EquiX PoW backend, edge rules and response caching **wired into the gate**, multi-instance
+clearance-key coordination, and **restricted-discovery orchestration** (below).
+
+### Tuning the gate — edge rules, caching, custom WAF rules
+
+`Skin::builder()` composes the gate. Edge rules run ahead of the clearance check (a
+redirect or block short-circuits before any challenge; header transforms ride out on
+the response), a bounded response cache serves cleared `GET`/`HEAD` hits without
+re-running the app, and custom WAF rules block request *shapes* the signatures don't
+describe — all authored in the same `FilterExpr` string language:
+
+```rust
+use onyums_skin::{EdgeRules, ResponseCache, Skin, WafCategory, Waf};
+
+let skin = Skin::builder()
+    .waf(
+        Waf::starter()
+            // Operator rule in the filter language, parsed up front.
+            .custom_rule("block_wp_login", WafCategory::ProtocolAnomaly,
+                r#"method eq "POST" and path starts_with "/wp-login""#)?,
+    )
+    // HTTP→HTTPS upgrade (install on the plaintext listener); or any match→action set.
+    .edge_rules(EdgeRules::https_upgrade())
+    // Serve hot, Cache-Control-cacheable GET/HEAD paths from a bounded in-process store.
+    .response_cache(ResponseCache::new(256))
+    .build();
+```
 
 ### Restricted discovery — the strongest, upstream gate
 

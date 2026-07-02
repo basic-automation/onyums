@@ -30,7 +30,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{
-	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
+	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -58,6 +58,7 @@ pub struct Skin {
 	challenge: ChallengeChain,
 	ratelimit: Option<SkinRateLimit>,
 	waf: Option<Waf>,
+	edge: Option<EdgeRules>,
 	sink: Arc<dyn SecurityEventSink>,
 	cookie_name: String,
 	submit_path: String,
@@ -168,7 +169,20 @@ impl Skin {
 			return Decision::Respond(waf_block_response(&m));
 		}
 
-		// 1. Already cleared? Rate-limit on the token id, then forward.
+		// 1. Edge rules run ahead of the gate: a matching redirect or block short-circuits
+		//    the request without ever minting a clearance or solving a challenge, while
+		//    header transforms accumulate and ride out on the eventual forwarded response
+		//    (see [`crate::edge`]). WAF inspection still runs first (above) so a signature
+		//    attack cannot be smuggled past inspection by an edge rule.
+		let edge_headers = match &self.edge {
+			Some(edge) => match edge.evaluate(parts) {
+				EdgeDecision::Forward { response_headers } => response_headers,
+				short_circuit => return Decision::Respond(short_circuit.into_response().expect("a redirect/block edge decision always yields a response")),
+			},
+			None => Vec::new(),
+		};
+
+		// 2. Already cleared? Rate-limit on the token id, then forward.
 		if let Some(clearance) = self.read_clearance(parts) {
 			if let Some(rl) = &self.ratelimit
 				&& !rl.check(&clearance.id)
@@ -176,10 +190,10 @@ impl Skin {
 				self.sink.record(&SecurityEvent::RateLimited { token: clearance.id });
 				return Decision::Respond((StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded.").into_response());
 			}
-			return Decision::Forward;
+			return Decision::Forward { response_headers: edge_headers };
 		}
 
-		// 2. A submission to the Skin-owned route: verify and, on success, mint.
+		// 3. A submission to the Skin-owned route: verify and, on success, mint.
 		if parts.uri.path() == self.submit_path {
 			if self.challenge.verify(parts) {
 				// Phase 1: the submission route is the JS PoW path, so the minted level
@@ -195,7 +209,7 @@ impl Skin {
 			return Decision::Respond(self.present_challenge(parts));
 		}
 
-		// 3. No clearance: gate the request.
+		// 4. No clearance: gate the request.
 		Decision::Respond(self.present_challenge(parts))
 	}
 }
@@ -222,8 +236,12 @@ enum Decision {
 	/// Serve this response without touching the inner app (interstitial, redirect,
 	/// 403, 429).
 	Respond(Response),
-	/// The client is cleared — forward to the wrapped service.
-	Forward,
+	/// The client is cleared — forward to the wrapped service, then apply any buffered
+	/// edge [`HeaderMutation`]s to the response it produces.
+	Forward {
+		/// Edge header transforms to apply to the app's response, in match order.
+		response_headers: Vec<HeaderMutation>,
+	},
 }
 
 /// A [`tower_layer::Layer`] that wraps a service with the Skin gate. Cheap to clone
@@ -271,7 +289,7 @@ where
 			let (parts, body) = req.into_parts();
 			match skin.decide(&parts) {
 				Decision::Respond(resp) => Ok(resp),
-				Decision::Forward => {
+				Decision::Forward { response_headers } => {
 					// The request cleared the gate. If body inspection is enabled, buffer
 					// up to the cap and scan it before it reaches the app — a body over the
 					// cap is refused rather than forwarded uninspected.
@@ -291,7 +309,12 @@ where
 						},
 						None => body,
 					};
-					inner.call(axum::extract::Request::from_parts(parts, body)).await
+					let mut resp = inner.call(axum::extract::Request::from_parts(parts, body)).await?;
+					// Apply the edge header transforms the ruleset accumulated for this request.
+					if !response_headers.is_empty() {
+						apply_response_headers(&response_headers, resp.headers_mut());
+					}
+					Ok(resp)
 				}
 			}
 		})
@@ -306,6 +329,7 @@ pub struct SkinBuilder {
 	challenges: Vec<Box<dyn Challenge>>,
 	ratelimit: Option<SkinRateLimit>,
 	waf: Option<Waf>,
+	edge: Option<EdgeRules>,
 	sink: Option<Arc<dyn SecurityEventSink>>,
 	cookie_name: String,
 	submit_path: String,
@@ -316,7 +340,7 @@ pub struct SkinBuilder {
 
 impl Default for SkinBuilder {
 	fn default() -> Self {
-		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, sink: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
+		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, edge: None, sink: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
 	}
 }
 
@@ -352,6 +376,22 @@ impl SkinBuilder {
 	#[must_use]
 	pub fn events(mut self, sink: Arc<dyn SecurityEventSink>) -> Self {
 		self.sink = Some(sink);
+		self
+	}
+
+	/// Install a set of [`EdgeRules`](crate::edge::EdgeRules) that run ahead of the gate
+	/// (off by default). A matching redirect or block short-circuits the request before any
+	/// clearance or challenge work; matching header transforms are applied to the response
+	/// the app produces for a cleared request. The WAF (when configured) still inspects
+	/// first, so an edge rule can never carry a signature attack past inspection.
+	///
+	/// The canonical use is the HTTP→HTTPS upgrade
+	/// ([`EdgeRules::https_upgrade`](crate::edge::EdgeRules::https_upgrade)), which the host
+	/// installs only on its plaintext listener (Skin cannot see the scheme from the request
+	/// — see the [`edge`](crate::edge) module docs).
+	#[must_use]
+	pub fn edge_rules(mut self, rules: EdgeRules) -> Self {
+		self.edge = Some(rules);
 		self
 	}
 
@@ -406,7 +446,7 @@ impl SkinBuilder {
 	/// Finish building the gate.
 	#[must_use]
 	pub fn build(self) -> Skin {
-		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, sink: self.sink.unwrap_or_else(|| Arc::new(TracingSink)), cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
+		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, edge: self.edge, sink: self.sink.unwrap_or_else(|| Arc::new(TracingSink)), cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
 	}
 }
 
@@ -452,7 +492,7 @@ mod tests {
 		let (skin, _store) = pow_gate();
 		match skin.decide(&bare_parts("/")) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::OK), // PoW interstitial
-			Decision::Forward => panic!("an uncleared request must be challenged, not forwarded"),
+			Decision::Forward { .. } => panic!("an uncleared request must be challenged, not forwarded"),
 		}
 	}
 
@@ -461,7 +501,7 @@ mod tests {
 		let (skin, store) = pow_gate();
 		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
 		let parts = parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"));
-		assert!(matches!(skin.decide(&parts), Decision::Forward));
+		assert!(matches!(skin.decide(&parts), Decision::Forward { .. }));
 	}
 
 	#[test]
@@ -506,7 +546,7 @@ mod tests {
 		let submission = bare_parts(&format!("{DEFAULT_SUBMIT_PATH}?puzzle={envelope}&nonce={nonce_b64}"));
 		let resp = match skin.decide(&submission) {
 			Decision::Respond(resp) => resp,
-			Decision::Forward => panic!("a fresh submission has no clearance cookie, so it cannot forward"),
+			Decision::Forward { .. } => panic!("a fresh submission has no clearance cookie, so it cannot forward"),
 		};
 		assert_eq!(resp.status(), StatusCode::SEE_OTHER);
 		assert_eq!(resp.headers().get(header::LOCATION).unwrap(), DEFAULT_RETURN_PATH);
@@ -528,7 +568,7 @@ mod tests {
 				assert_eq!(resp.status(), StatusCode::OK);
 				assert!(resp.headers().get(header::SET_COOKIE).is_none_or(|c| !c.to_str().unwrap().starts_with(DEFAULT_COOKIE)));
 			}
-			Decision::Forward => panic!("a bad submission must not forward"),
+			Decision::Forward { .. } => panic!("a bad submission must not forward"),
 		}
 	}
 
@@ -540,7 +580,7 @@ mod tests {
 		let cookie = format!("{DEFAULT_COOKIE}={token}");
 
 		// First request within the burst forwards.
-		assert!(matches!(skin.decide(&parts_with_cookie("/", &cookie)), Decision::Forward));
+		assert!(matches!(skin.decide(&parts_with_cookie("/", &cookie)), Decision::Forward { .. }));
 		// The bucket is now drained; a second immediate request is throttled.
 		let mut throttled = false;
 		for _ in 0..5 {
@@ -565,7 +605,7 @@ mod tests {
 				assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
 				assert!(resp.headers().contains_key(header::SET_COOKIE));
 			}
-			Decision::Forward => panic!("a no-JS uncleared request must be challenged"),
+			Decision::Forward { .. } => panic!("a no-JS uncleared request must be challenged"),
 		}
 	}
 
@@ -616,7 +656,7 @@ mod tests {
 		let parts = Request::builder().uri("/").header("user-agent", "<script>alert(1)</script>").body(()).unwrap().into_parts().0;
 		match skin.decide(&parts) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
-			Decision::Forward => panic!("a signature attack must be blocked, not forwarded"),
+			Decision::Forward { .. } => panic!("a signature attack must be blocked, not forwarded"),
 		}
 	}
 
@@ -629,7 +669,7 @@ mod tests {
 		let parts = parts_with_cookie("/files/../../etc/passwd", &format!("{DEFAULT_COOKIE}={token}"));
 		match skin.decide(&parts) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
-			Decision::Forward => panic!("the WAF must block a cleared client's attack ahead of forwarding"),
+			Decision::Forward { .. } => panic!("the WAF must block a cleared client's attack ahead of forwarding"),
 		}
 	}
 
@@ -639,7 +679,7 @@ mod tests {
 		let (skin, _store) = waf_gate();
 		match skin.decide(&bare_parts("/articles/hello-world")) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::OK), // PoW interstitial
-			Decision::Forward => panic!("an uncleared benign request is challenged"),
+			Decision::Forward { .. } => panic!("an uncleared benign request is challenged"),
 		}
 	}
 
@@ -715,7 +755,7 @@ mod tests {
 		let (skin, _store) = pow_gate();
 		match skin.decide(&bare_parts("/files/../../etc/passwd")) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::OK),
-			Decision::Forward => panic!("uncleared request is challenged"),
+			Decision::Forward { .. } => panic!("uncleared request is challenged"),
 		}
 	}
 
@@ -826,7 +866,7 @@ mod tests {
 		let cookie = format!("{DEFAULT_COOKIE}={token}");
 
 		// Drain the burst, then flood until throttled.
-		assert!(matches!(skin.decide(&parts_with_cookie("/", &cookie)), Decision::Forward));
+		assert!(matches!(skin.decide(&parts_with_cookie("/", &cookie)), Decision::Forward { .. }));
 		for _ in 0..5 {
 			if let Decision::Respond(_) = skin.decide(&parts_with_cookie("/", &cookie)) {
 				break;
@@ -843,7 +883,7 @@ mod tests {
 	fn cleared_benign_request_emits_no_event() {
 		let (skin, store, sink) = observed_gate(30);
 		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
-		assert!(matches!(skin.decide(&parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"))), Decision::Forward));
+		assert!(matches!(skin.decide(&parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"))), Decision::Forward { .. }));
 		assert!(sink.is_empty(), "a clean, within-rate, cleared request is not a security event");
 	}
 
@@ -901,7 +941,7 @@ mod tests {
 			.build();
 		match skin.decide(&bare_parts("/")) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
-			Decision::Forward => panic!("a no-JS client against a JS-only chain must be rejected"),
+			Decision::Forward { .. } => panic!("a no-JS client against a JS-only chain must be rejected"),
 		}
 		assert_eq!(sink.events(), vec![SecurityEvent::ChallengeUnavailable]);
 	}
@@ -929,5 +969,127 @@ mod tests {
 		let _ = skin.decide(&bare_parts(&format!("{DEFAULT_SUBMIT_PATH}?puzzle={envelope}&nonce={nonce_b64}")));
 
 		assert_eq!(sink.events(), vec![SecurityEvent::ChallengePassed { level: ClearanceLevel::Pow }]);
+	}
+
+	/// A gate with an edge ruleset ahead of the PoW gate, over a known store.
+	fn edge_gate(rules: crate::edge::EdgeRules) -> (Skin, Arc<HmacClearanceStore>) {
+		let store = Arc::new(HmacClearanceStore::new(b"edge-test-secret".to_vec()));
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).edge_rules(rules).build();
+		(skin, store)
+	}
+
+	#[test]
+	fn edge_redirect_short_circuits_ahead_of_the_gate() {
+		// An uncleared request that matches an edge redirect is 301'd, never challenged: the
+		// edge rule fires before any clearance or PoW work.
+		let (skin, _store) = edge_gate(crate::edge::EdgeRules::https_upgrade());
+		let parts = Request::builder().uri("/login?next=/home").header(header::HOST, "svc.onion").body(()).unwrap().into_parts().0;
+		match skin.decide(&parts) {
+			Decision::Respond(resp) => {
+				assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+				assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "https://svc.onion/login?next=/home");
+			}
+			Decision::Forward { .. } => panic!("an edge redirect must short-circuit, not forward"),
+		}
+	}
+
+	#[test]
+	fn edge_block_short_circuits_uncleared_and_cleared_alike() {
+		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
+		let (skin, store) = edge_gate(EdgeRules::new().push(EdgeMatch::PathPrefix("/admin".into()), EdgeAction::Block(StatusCode::FORBIDDEN)));
+		// Uncleared: blocked outright rather than challenged.
+		match skin.decide(&bare_parts("/admin/panel")) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+			Decision::Forward { .. } => panic!("an edge block must short-circuit"),
+		}
+		// Even a validly-cleared client is blocked (the edge rule runs ahead of the forward).
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		match skin.decide(&parts_with_cookie("/admin/panel", &format!("{DEFAULT_COOKIE}={token}"))) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
+			Decision::Forward { .. } => panic!("an edge block must short-circuit even for a cleared client"),
+		}
+	}
+
+	#[test]
+	fn edge_header_transform_forwards_and_rides_out_on_the_response() {
+		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
+		use axum::http::{HeaderName, HeaderValue};
+		// A SetHeader edge rule does not short-circuit — a cleared request forwards carrying
+		// the mutation.
+		let rules = EdgeRules::new().push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")));
+		let (skin, store) = edge_gate(rules);
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		match skin.decide(&parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"))) {
+			Decision::Forward { response_headers } => assert_eq!(response_headers.len(), 1, "the header transform is buffered onto the forward"),
+			Decision::Respond(_) => panic!("a header transform must not short-circuit"),
+		}
+	}
+
+	#[tokio::test]
+	async fn edge_header_transform_is_applied_to_the_app_response() {
+		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
+		use axum::http::{HeaderName, HeaderValue};
+		let rules = EdgeRules::new()
+			.push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")))
+			.push(EdgeMatch::Any, EdgeAction::RemoveHeader(HeaderName::from_static("server")));
+		let (skin, store) = edge_gate(rules);
+		let app = Router::new().route("/", get(|| async { ([(HeaderName::from_static("server"), "onyums")], "hello") }));
+		let mut svc = skin.into_layer().layer(app);
+
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		let req = Request::builder().uri("/").header(header::COOKIE, format!("{DEFAULT_COOKIE}={token}")).body(Body::empty()).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::OK);
+		assert_eq!(resp.headers().get("x-frame-options").unwrap(), "DENY", "the edge Set rides out on the app response");
+		assert!(!resp.headers().contains_key("server"), "the edge Remove strips the app's header");
+		let body = resp.into_body().collect().await.unwrap().to_bytes();
+		assert_eq!(&body[..], b"hello");
+	}
+
+	#[tokio::test]
+	async fn edge_redirect_reaches_the_client_through_the_service() {
+		// End to end: an uncleared request over the layered service is redirected, never
+		// touching the inner app.
+		let (skin, _store) = edge_gate(crate::edge::EdgeRules::https_upgrade());
+		let app = Router::new().route("/secret", get(|| async { "SECRET" }));
+		let mut svc = skin.into_layer().layer(app);
+
+		let req = Request::builder().uri("/secret").header(header::HOST, "svc.onion").body(Body::empty()).unwrap();
+		let resp = svc.call(req).await.unwrap();
+		assert_eq!(resp.status(), StatusCode::MOVED_PERMANENTLY);
+		assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "https://svc.onion/secret");
+		let body = resp.into_body().collect().await.unwrap().to_bytes();
+		assert!(!body.windows(6).any(|w| w == b"SECRET"), "a redirected request must not reach the inner app");
+	}
+
+	#[test]
+	fn waf_blocks_ahead_of_a_matching_edge_redirect() {
+		use crate::edge::EdgeRules;
+		// A request that both trips the WAF and matches a (would-be) edge redirect is blocked
+		// by the WAF: inspection runs before edge evaluation, so an edge rule can never carry
+		// a signature attack past the WAF.
+		let store = Arc::new(HmacClearanceStore::new(b"edge-waf-secret".to_vec()));
+		let skin = Skin::builder()
+			.store(store)
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
+			.waf(crate::waf::Waf::starter())
+			.edge_rules(EdgeRules::https_upgrade())
+			.build();
+		let parts = Request::builder().uri("/files/../../etc/passwd").header(header::HOST, "svc.onion").body(()).unwrap().into_parts().0;
+		match skin.decide(&parts) {
+			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN, "the WAF block wins over the edge redirect"),
+			Decision::Forward { .. } => panic!("a signature attack must be blocked, not forwarded"),
+		}
+	}
+
+	#[test]
+	fn no_edge_rules_by_default_leaves_forward_unchanged() {
+		// Without an edge ruleset, a cleared request forwards with no header mutations.
+		let (skin, store) = pow_gate();
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		match skin.decide(&parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"))) {
+			Decision::Forward { response_headers } => assert!(response_headers.is_empty()),
+			Decision::Respond(_) => panic!("a cleared request forwards"),
+		}
 	}
 }

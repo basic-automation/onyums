@@ -709,6 +709,7 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `and` with any comparator, or `or` with `<`/`>`. Deliberately excludes `or N=N` so it
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
 		Rule { id: "sqli_boolean_condition", category: WafCategory::Sqli, pattern: r#"(?i)(\band\b\s+['"]?\d+\s*[=<>]|\bor\b\s+['"]?\d+\s*[<>])\s*['"]?\d+"# },
+		Rule { id: "sqli_oob_exec", category: WafCategory::Sqli, pattern: r"(?i)\b(xp_cmdshell|xp_dirtree|load_file|utl_http|dbms_ldap)\b" },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
@@ -739,6 +740,8 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
 		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
+		Rule { id: "code_ssti_template", category: WafCategory::CodeInjection, pattern: r"\{\{\s*\d+\s*[*]\s*\d+\s*\}\}" },
+		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"rO0AB[A-Za-z0-9+/=]{2,}" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -941,6 +944,24 @@ mod tests {
 			"/go/http-status-codes",        // "http" without a decimal-IP host
 			"/search?q=cats+and+dogs",      // "and" without a numeric comparison
 		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn crs_growth_batch_two_rules_match() {
+		// The second CRS coverage batch: OOB/exec SQLi escalation, `{{7*7}}` template SSTI, and
+		// the base64 Java-serialized-object marker.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("q=';EXEC xp_cmdshell('dir')--", "target").unwrap().rule_id, "sqli_oob_exec");
+		assert_eq!(waf.inspect_str("name={{7*7}}", "target").unwrap().rule_id, "code_ssti_template");
+		assert_eq!(waf.inspect_str("data=rO0ABXNyABBqYXZh", "target").unwrap().rule_id, "code_java_serialized");
+	}
+
+	#[test]
+	fn crs_growth_batch_two_keeps_false_positives_low() {
+		let waf = Waf::starter();
+		for uri in ["/files/upload", "/templates/starter-kit", "/docs/load-testing", "/blog/70-rules"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

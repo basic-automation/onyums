@@ -31,7 +31,10 @@ use hyper_util::{
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
-use tor_hsservice::{config::OnionServiceConfigBuilder, HsNickname, RendRequest, RunningOnionService, StreamRequest};
+use tor_hsservice::{
+	config::{restricted_discovery::HsClientNickname, OnionServiceConfig, OnionServiceConfigBuilder}, HsNickname, RendRequest, RunningOnionService, StreamRequest
+};
+use tor_hscrypto::pk::HsClientDescEncKey;
 use tor_proto::client::stream::IncomingStreamRequest;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use safelog::DisplayRedacted;
@@ -41,7 +44,7 @@ extern crate rcgen;
 use std::sync::Arc;
 
 pub use axum::*;
-pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, Skin};
+pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, Skin};
 use onyums_skin::CircuitId;
 
 mod circuit_gate;
@@ -215,15 +218,68 @@ async fn setup_tor_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	client.config(config).create_bootstrapped().await.map_err(|_| anyhow::anyhow!("Failed to create bootstrapped Tor client."))
 }
 
-/// Launches an onion service with the given nickname.
+/// Apply a caller's authorized-clients allowlist to an [`OnionServiceConfigBuilder`]
+/// as Arti v3 restricted discovery (onyums ROADMAP Phase 2).
+///
+/// Restricted discovery encrypts the service descriptor (its introduction points and
+/// keys) to the listed clients' x25519 keys, so an unlisted client cannot even
+/// *discover* the service — a DoS-resistance measure enforced in descriptor crypto,
+/// upstream of every Skin HTTP layer. The allowlist is [`onyums_skin::RestrictedDiscovery`]
+/// (the orchestration half built in the skin crate); each entry's canonical
+/// `descriptor:x25519:<BASE32>` rendering is parsed straight into Arti's
+/// [`HsClientDescEncKey`], and each nickname into an [`HsClientNickname`] slug.
+///
+/// An empty allowlist is rejected: enabling restricted discovery with no authorized
+/// clients would hide the service from *everyone* (and Arti's own config validation
+/// rejects it too). Surfaced here so it fails offline, before any Tor bootstrap.
+///
+/// # Errors
+/// Returns an error if the allowlist is empty, a nickname is not a valid Tor client
+/// slug, or a key fails to parse into Arti's descriptor-encryption key type.
+fn apply_restricted_discovery(cfg: &mut OnionServiceConfigBuilder, allowlist: &RestrictedDiscovery) -> Result<()> {
+	if allowlist.is_empty() {
+		bail!("authorized_clients allowlist is empty: enabling restricted discovery with no clients would hide the service from everyone. Add at least one client key, or drop authorized_clients() to stay publicly discoverable");
+	}
+	let rd = cfg.restricted_discovery();
+	rd.enabled(true);
+	for (nickname, key) in allowlist.iter() {
+		let parsed_nickname = nickname.parse::<HsClientNickname>().map_err(|e| anyhow::anyhow!("invalid restricted-discovery client nickname {nickname:?}: {e}"))?;
+		// `ClientAuthKey`'s `Display` is the canonical `descriptor:x25519:<BASE32>` line,
+		// which is exactly what Arti's `HsClientDescEncKey` parses (case-insensitively).
+		let parsed_key = key.to_string().parse::<HsClientDescEncKey>().map_err(|e| anyhow::anyhow!("invalid restricted-discovery key for client {nickname:?}: {e}"))?;
+		rd.static_keys().access().push((parsed_nickname, parsed_key));
+	}
+	Ok(())
+}
+
+/// Build the [`OnionServiceConfig`] for `nickname`, applying restricted discovery if
+/// the caller supplied an authorized-clients allowlist.
+///
+/// Everything here is offline: the nickname parse, the restricted-discovery assembly,
+/// and Arti's own config validation all run before any Tor bootstrap, so a bad
+/// nickname or allowlist fails fast rather than after the network round-trip. Extracted
+/// from the launch path so it is unit-testable with no live Tor network.
+///
+/// # Errors
+/// Returns an error if the nickname fails to parse, the restricted-discovery allowlist
+/// is invalid (see [`apply_restricted_discovery`]), or the config fails to build.
+fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedDiscovery>) -> Result<OnionServiceConfig> {
+	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
+	let mut cfg = OnionServiceConfigBuilder::default();
+	cfg.nickname(nickname);
+	if let Some(allowlist) = allowlist {
+		apply_restricted_discovery(&mut cfg, allowlist)?;
+	}
+	cfg.build().map_err(|e| anyhow::anyhow!("Failed to build onion service config: {e}"))
+}
+
+/// Launches an onion service from an already-built [`OnionServiceConfig`].
 ///
 /// The returned request stream is self-contained (`use<>`) — it does not borrow
 /// the client — so callers can move the client elsewhere (e.g. into a handle)
 /// while keeping the stream.
-fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
+fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
 	event!(Level::INFO, "Launching onion service...");
-	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
-	let svc_cfg = OnionServiceConfigBuilder::default().nickname(nickname).build().map_err(|_| anyhow::anyhow!("Failed to build onion service config."))?;
 	client.launch_onion_service(svc_cfg)
 		.map_err(|_| anyhow::anyhow!("Failed to launch onion service."))?
 		.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
@@ -352,9 +408,10 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 	}
 }
 
-/// Initializes the onion service and returns the service and request stream.
-fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, nickname: &str) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
-	let (service, request_stream) = launch_onion_service(client, nickname)?;
+/// Initializes the onion service from a built config and returns the service and
+/// request stream.
+fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
+	let (service, request_stream) = launch_onion_service(client, svc_cfg)?;
 	let address = get_onion_address(&service)?;
 	Ok((service, address, request_stream))
 }
@@ -514,6 +571,7 @@ pub struct OnionServiceBuilder {
 	tls: Tls,
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
 	under_attack: bool,
+	restricted_discovery: Option<RestrictedDiscovery>,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 }
 
@@ -592,6 +650,30 @@ impl OnionServiceBuilder {
 		self
 	}
 
+	/// Enable v3 client authorization / restricted discovery for the listed clients
+	/// (onyums ROADMAP Phase 2).
+	///
+	/// Given an [`onyums_skin::RestrictedDiscovery`] allowlist (nickname → x25519
+	/// [`ClientAuthKey`]), the service publishes a descriptor whose introduction
+	/// points and keys are encrypted to those clients only. An unlisted client cannot
+	/// discover the service at all — `DoS` resistance enforced in descriptor crypto,
+	/// upstream of the Skin HTTP gate rather than in place of it.
+	///
+	/// This is an opt-*down* in reachability (from "anyone with the address" to "only
+	/// these clients"), a deliberate, named decision. Omit it to stay publicly
+	/// discoverable. An empty allowlist is rejected by [`Self::serve`] — enabling
+	/// restricted discovery with no clients would hide the service from everyone.
+	///
+	/// Build the allowlist from `.auth` files (`RestrictedDiscovery::from_auth_files`)
+	/// or by authorizing [`ClientAuthKey`]s directly. Restricted discovery is a
+	/// DoS-resistance mechanism, *not* a substitute for authentication: removing a
+	/// client does not immediately revoke an already-connected one.
+	#[must_use]
+	pub fn authorized_clients(mut self, allowlist: RestrictedDiscovery) -> Self {
+		self.restricted_discovery = Some(allowlist);
+		self
+	}
+
 	/// Register a raw [`StreamHandler`] to serve an arbitrary, non-HTTP port over
 	/// the onion service (onyums ROADMAP Phase 3 — protocol versatility).
 	///
@@ -667,8 +749,14 @@ impl OnionServiceBuilder {
 		// A custom policy combined with the toggle is a conflict caught offline here.
 		let policy = resolve_circuit_policy(self.circuit_policy, self.under_attack)?;
 
+		// Phase 2 v3 client authorization: assemble the onion service config (nickname +
+		// optional restricted-discovery allowlist) offline, so a bad nickname or an
+		// empty/invalid allowlist fails before any Tor bootstrap. `None` keeps the
+		// service publicly discoverable — today's default behaviour.
+		let svc_cfg = build_onion_service_config(&nickname, self.restricted_discovery.as_ref())?;
+
 		let client = setup_tor_client().await?;
-		let (service, address, request_stream) = initialize_onion_service(&client, &nickname)?;
+		let (service, address, request_stream) = initialize_onion_service(&client, svc_cfg)?;
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
 		// Bundle everything the loop threads down to each served stream into one
@@ -1188,6 +1276,71 @@ mod tests {
 			.await;
 		let err = result.err().expect("a conflicting under_attack + custom policy should error");
 		assert!(err.to_string().contains("under_attack"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn skin_client_key_parses_into_arti_descriptor_key() {
+		// The cross-crate contract behind restricted-discovery wiring: skin's canonical
+		// `descriptor:x25519:<BASE32>` rendering is exactly what Arti's
+		// `HsClientDescEncKey` parses, and Arti renders it back identically. Guards
+		// against a base32 case / format drift between the two crates.
+		let key = ClientAuthKey::from_bytes([13u8; 32]);
+		let parsed: HsClientDescEncKey = key.to_string().parse().expect("a skin client key must parse as an Arti client descriptor key");
+		assert_eq!(parsed.to_string(), key.to_string(), "Arti must round-trip skin's canonical key form");
+	}
+
+	#[test]
+	fn builder_records_authorized_clients() {
+		let mut allow = RestrictedDiscovery::new();
+		allow.authorize("alice", ClientAuthKey::from_bytes([3u8; 32]));
+		let builder = OnionServiceBuilder::default().authorized_clients(allow);
+		let recorded = builder.restricted_discovery.as_ref().expect("allowlist recorded on the builder");
+		assert_eq!(recorded.len(), 1);
+	}
+
+	#[test]
+	fn restricted_discovery_config_assembles_offline() {
+		// A non-empty allowlist assembles into a valid onion service config with no live
+		// Tor network — Arti's own config validation runs during `build`.
+		let mut allow = RestrictedDiscovery::new();
+		allow.authorize("alice", ClientAuthKey::from_bytes([7u8; 32]));
+		allow.authorize("bob", ClientAuthKey::from_bytes([42u8; 32]));
+		build_onion_service_config("restricted_svc", Some(&allow)).expect("restricted-discovery config builds offline");
+	}
+
+	#[test]
+	fn config_without_restricted_discovery_still_builds() {
+		// The default publicly-discoverable path is unchanged when no allowlist is set.
+		build_onion_service_config("plain_svc", None).expect("plain config builds offline");
+	}
+
+	#[test]
+	fn empty_allowlist_is_rejected_offline() {
+		// Enabling restricted discovery with no clients would hide the service from
+		// everyone — rejected before any bootstrap.
+		let allow = RestrictedDiscovery::new();
+		let err = build_onion_service_config("empty_allow", Some(&allow)).expect_err("an empty allowlist must be rejected");
+		assert!(err.to_string().contains("empty"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn invalid_client_nickname_is_rejected_offline() {
+		// A nickname that is not a valid Tor client slug (spaces) surfaces offline as a
+		// clear error rather than a late launch failure.
+		let mut allow = RestrictedDiscovery::new();
+		allow.authorize("not a slug", ClientAuthKey::from_bytes([1u8; 32]));
+		let err = build_onion_service_config("bad_nick", Some(&allow)).expect_err("an invalid client nickname must be rejected");
+		assert!(err.to_string().contains("nickname"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn builder_empty_allowlist_errors_before_bootstrap() {
+		// Router and nickname are set, so validation reaches the config assembly, which
+		// rejects the empty allowlist before any Tor bootstrap (offline).
+		let app = Router::new().route("/", get(|| async { "hi" }));
+		let result = OnionService::builder().router(app).nickname("empty_ac").authorized_clients(RestrictedDiscovery::new()).serve().await;
+		let err = result.err().expect("an empty authorized_clients allowlist should error");
+		assert!(err.to_string().contains("empty"), "unexpected error: {err}");
 	}
 
 	#[tokio::test]

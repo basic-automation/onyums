@@ -22,7 +22,7 @@
 ## Phase 2 — Abuse resistance, live by default — `0.6`
 
 - [ ] Proof-of-Work DoS defense at the intro layer (arti `tor-hspow`) — on by default, effort tunable, opt-down not opt-in
-- [ ] v3 client authorization / restricted discovery — `.authorized_clients([...])` builder API wiring `onyums_skin::RestrictedDiscovery` (`to_auth_files` / `AllowlistDiff`) into the Arti restricted-discovery config
+- [x] v3 client authorization / restricted discovery — `.authorized_clients([...])` builder API wiring `onyums_skin::RestrictedDiscovery` (`to_auth_files` / `AllowlistDiff`) into the Arti restricted-discovery config
 - [ ] Client x25519 auth-key generation (needs a crypto-dep decision — possibly Arti's job)
 - [x] Circuit policy hook — the one-off port gate in `handle_stream_request` generalized into a first-class policy callback
 - [x] Skin integration: `SkinLayer` inserted into the served `Router` (secure default **on**)

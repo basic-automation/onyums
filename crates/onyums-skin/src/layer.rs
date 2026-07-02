@@ -30,7 +30,7 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{
-	challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
+	cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_cacheable_method}, challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -59,6 +59,7 @@ pub struct Skin {
 	ratelimit: Option<SkinRateLimit>,
 	waf: Option<Waf>,
 	edge: Option<EdgeRules>,
+	cache: Option<Arc<ResponseCache>>,
 	sink: Arc<dyn SecurityEventSink>,
 	cookie_name: String,
 	submit_path: String,
@@ -309,7 +310,39 @@ where
 						},
 						None => body,
 					};
+
+					// Response cache (opt-in). Only safe/idempotent GET/HEAD are cacheable, so
+					// derive a key only for those. A fresh hit is served straight from the store —
+					// the inner router never runs — with the request's edge transforms re-applied,
+					// since cached entries hold the raw app response (edge headers are per-request).
+					let cache_key = skin.cache.as_ref().filter(|_| is_cacheable_method(&parts.method)).map(|_| CacheKey::from_parts(&parts));
+					if let (Some(cache), Some(key)) = (&skin.cache, &cache_key)
+						&& let Some(hit) = cache.get(key)
+					{
+						let mut resp = hit.into_response();
+						apply_response_headers(&response_headers, resp.headers_mut());
+						return Ok(resp);
+					}
+
 					let mut resp = inner.call(axum::extract::Request::from_parts(parts, body)).await?;
+
+					// Store a cacheable app response for next time, honoring its `Cache-Control`
+					// (a `no-store`/`no-cache`/`private` or absent/`max-age=0` response is never
+					// cached). Buffer the body once to store it, then rebuild the response.
+					if let (Some(cache), Some(key)) = (&skin.cache, cache_key)
+						&& let Some(ttl) = cache_control_ttl(resp.headers())
+					{
+						let (rparts, rbody) = resp.into_parts();
+						let bytes = match rbody.collect().await {
+							Ok(collected) => collected.to_bytes(),
+							// A body that fails mid-collect cannot be cached; surface a bare 502
+							// rather than a truncated response.
+							Err(_) => return Ok((StatusCode::BAD_GATEWAY, "Upstream response body error.").into_response()),
+						};
+						cache.store(key, CachedResponse::new(rparts.status, rparts.headers.clone(), bytes.to_vec()), ttl);
+						resp = Response::from_parts(rparts, Body::from(bytes));
+					}
+
 					// Apply the edge header transforms the ruleset accumulated for this request.
 					if !response_headers.is_empty() {
 						apply_response_headers(&response_headers, resp.headers_mut());
@@ -330,6 +363,7 @@ pub struct SkinBuilder {
 	ratelimit: Option<SkinRateLimit>,
 	waf: Option<Waf>,
 	edge: Option<EdgeRules>,
+	cache: Option<Arc<ResponseCache>>,
 	sink: Option<Arc<dyn SecurityEventSink>>,
 	cookie_name: String,
 	submit_path: String,
@@ -340,7 +374,7 @@ pub struct SkinBuilder {
 
 impl Default for SkinBuilder {
 	fn default() -> Self {
-		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, edge: None, sink: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
+		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, edge: None, cache: None, sink: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
 	}
 }
 
@@ -395,6 +429,20 @@ impl SkinBuilder {
 		self
 	}
 
+	/// Serve cleared `GET`/`HEAD` requests from a bounded, TTL-expiring
+	/// [`ResponseCache`](crate::cache::ResponseCache) (off by default). A fresh hit is
+	/// served without running the inner router — a latency win on a hot path over the
+	/// expensive rendezvous round-trip. Only responses the app marks cacheable via
+	/// `Cache-Control` (a positive `max-age`, not `no-store`/`no-cache`/`private`) are
+	/// stored; the cache runs *after* the gate, so an uncleared client is still challenged
+	/// before any hit is served. Edge header transforms are re-applied per request, never
+	/// cached.
+	#[must_use]
+	pub fn response_cache(mut self, cache: ResponseCache) -> Self {
+		self.cache = Some(Arc::new(cache));
+		self
+	}
+
 	/// Inspect requests with a [`Waf`] ahead of the gate (off by default). A blocked
 	/// request gets a `403` and never reaches the clearance check, the challenge, or
 	/// the app. Use [`Waf::starter`] for the built-in ruleset (as
@@ -446,7 +494,7 @@ impl SkinBuilder {
 	/// Finish building the gate.
 	#[must_use]
 	pub fn build(self) -> Skin {
-		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, edge: self.edge, sink: self.sink.unwrap_or_else(|| Arc::new(TracingSink)), cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
+		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, edge: self.edge, cache: self.cache, sink: self.sink.unwrap_or_else(|| Arc::new(TracingSink)), cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
 	}
 }
 
@@ -1091,5 +1139,107 @@ mod tests {
 			Decision::Forward { response_headers } => assert!(response_headers.is_empty()),
 			Decision::Respond(_) => panic!("a cleared request forwards"),
 		}
+	}
+
+	/// An app whose `/` handler counts its invocations and marks the response cacheable, so a
+	/// cache hit is provable by the counter not advancing. Returns the shared counter.
+	fn counting_cacheable_app() -> (Router, Arc<std::sync::atomic::AtomicUsize>) {
+		let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let counter = hits.clone();
+		let app = Router::new().route(
+			"/",
+			get(move || {
+				let counter = counter.clone();
+				async move {
+					let n = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+					([(header::CACHE_CONTROL, "max-age=60")], format!("hit {n}"))
+				}
+			}),
+		);
+		(app, hits)
+	}
+
+	/// A cleared request over a cache-enabled gate, reused across the cache tests.
+	fn cleared_get(store: &HmacClearanceStore) -> Request<Body> {
+		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		Request::builder().uri("/").header(header::COOKIE, format!("{DEFAULT_COOKIE}={token}")).body(Body::empty()).unwrap()
+	}
+
+	#[tokio::test]
+	async fn cache_serves_repeat_get_without_re_running_the_app() {
+		use std::sync::atomic::Ordering;
+		let store = Arc::new(HmacClearanceStore::new(b"cache-secret".to_vec()));
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).response_cache(ResponseCache::new(8)).build();
+		let (app, hits) = counting_cacheable_app();
+		let mut svc = skin.into_layer().layer(app);
+
+		// First cleared GET runs the app and populates the cache.
+		let first = svc.call(cleared_get(&store)).await.unwrap();
+		assert_eq!(first.status(), StatusCode::OK);
+		let first_body = first.into_body().collect().await.unwrap().to_bytes();
+		assert_eq!(&first_body[..], b"hit 0");
+		assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+		// Second identical GET is served from the cache — same body, app not re-run.
+		let second = svc.call(cleared_get(&store)).await.unwrap();
+		let second_body = second.into_body().collect().await.unwrap().to_bytes();
+		assert_eq!(&second_body[..], b"hit 0", "the cached body is served verbatim");
+		assert_eq!(hits.load(Ordering::SeqCst), 1, "a cache hit must not re-run the inner app");
+	}
+
+	#[tokio::test]
+	async fn cache_does_not_store_without_cache_control() {
+		use std::sync::atomic::Ordering;
+		// An app that never sets Cache-Control is never cached: every request re-runs it.
+		let store = Arc::new(HmacClearanceStore::new(b"cache-nocc-secret".to_vec()));
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).response_cache(ResponseCache::new(8)).build();
+		let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let counter = hits.clone();
+		let app = Router::new().route("/", get(move || {
+			let counter = counter.clone();
+			async move { counter.fetch_add(1, Ordering::SeqCst); "uncacheable" }
+		}));
+		let mut svc = skin.into_layer().layer(app);
+
+		let _ = svc.call(cleared_get(&store)).await.unwrap();
+		let _ = svc.call(cleared_get(&store)).await.unwrap();
+		assert_eq!(hits.load(Ordering::SeqCst), 2, "a response with no Cache-Control is never cached");
+	}
+
+	#[tokio::test]
+	async fn cache_never_serves_an_uncleared_client() {
+		use std::sync::atomic::Ordering;
+		// Populate the cache via a cleared request, then prove an uncleared client is still
+		// challenged (gets the interstitial, not the cached body).
+		let store = Arc::new(HmacClearanceStore::new(b"cache-gate-secret".to_vec()));
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).response_cache(ResponseCache::new(8)).build();
+		let (app, hits) = counting_cacheable_app();
+		let mut svc = skin.into_layer().layer(app);
+
+		let _ = svc.call(cleared_get(&store)).await.unwrap();
+		assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+		// No clearance cookie → the gate challenges before the cache is ever consulted.
+		let uncleared = Request::builder().uri("/").body(Body::empty()).unwrap();
+		let resp = svc.call(uncleared).await.unwrap();
+		let body = resp.into_body().collect().await.unwrap().to_bytes();
+		assert!(!body.windows(5).any(|w| w == b"hit 0"), "the cached body must never leak to an uncleared client");
+	}
+
+	#[tokio::test]
+	async fn cache_hit_still_gets_edge_header_transforms() {
+		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
+		use axum::http::{HeaderName, HeaderValue};
+		// A cached hit is served with the request's edge transforms freshly applied (they are
+		// not part of the stored entry).
+		let store = Arc::new(HmacClearanceStore::new(b"cache-edge-secret".to_vec()));
+		let rules = EdgeRules::new().push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")));
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).edge_rules(rules).response_cache(ResponseCache::new(8)).build();
+		let (app, _hits) = counting_cacheable_app();
+		let mut svc = skin.into_layer().layer(app);
+
+		let _ = svc.call(cleared_get(&store)).await.unwrap(); // populate
+		let hit = svc.call(cleared_get(&store)).await.unwrap(); // served from cache
+		assert_eq!(hit.headers().get("x-frame-options").unwrap(), "DENY", "edge transforms apply to a cache hit too");
 	}
 }

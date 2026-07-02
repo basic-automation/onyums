@@ -80,4 +80,4 @@ Non-goals: no inbound mail server; no heavy asset pipeline; no JS-*required* rea
 
 - [x] Re-export the arti stack we depend on (as we do `axum`) so downstreams can't version-skew
 - [x] Document the secure defaults and opt-downs loudly (README covers the Skin / TLS / `route_port` opt-downs)
-- [ ] In-process/loopback test mode so integration tests don't need the live Tor network (`test_serve` currently hits the real network)
+- [ ] In-process/loopback test mode so integration tests don't need the live Tor network (`test_serve` currently hits the real network) — *slice landed:* the composed application-facing stack (`build_serve_router`: gate + HSTS + app) is now `oneshot`-testable offline; *next slice:* a mock `RendRequest`/`StreamRequest` stream to drive `serve_circuits` without Tor

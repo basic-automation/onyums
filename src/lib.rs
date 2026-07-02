@@ -536,6 +536,20 @@ fn apply_hsts(app: Router, plaintext: tls_policy::PlaintextPolicy) -> Router {
 	}
 }
 
+/// Assemble the application-facing HTTP stack exactly as [`OnionServiceBuilder::serve`]
+/// layers it: the Skin abuse-defense gate (Phase 2) wrapping the caller's app, then the
+/// HSTS response header under a plaintext-reject TLS policy (Phase 3). This is the full
+/// request path a client hits *inside* the onion-encrypted TLS stream, minus the TLS
+/// transport itself.
+///
+/// Extracted from `serve` so the *composed* stack — not just its two halves in isolation
+/// ([`apply_skin`] / [`apply_hsts`]) — is testable end-to-end with
+/// `tower::ServiceExt::oneshot` and no live Tor network. First slice of an
+/// in-process/loopback test mode (cross-cutting roadmap item).
+fn build_serve_router(app: Router, skin: SkinChoice, plaintext: tls_policy::PlaintextPolicy) -> Router {
+	apply_hsts(apply_skin(app, skin), plaintext)
+}
+
 /// Assemble a [`PortRouter`] from the builder's `route_port` registrations,
 /// surfacing the first invalid registration (reserved/zero port, or a duplicate).
 ///
@@ -766,18 +780,12 @@ impl OnionServiceBuilder {
 		let port_router = Arc::new(build_port_router(self.raw_handlers)?);
 
 		// Insert the onyums-skin gate ahead of the application on the HTTP path
-		// (Phase 2 Skin integration). Secure-by-default unless the caller opted down
-		// with `no_skin`. `Router::layer` keeps the `Router` type, so the rest of the
-		// serve path is unchanged.
-		let app = apply_skin(app, self.skin);
-
-		// Phase 3 TLS-first: derive the pure, `Copy` plaintext-enforcement decision
-		// once. In strict mode every HTTPS response carries an HSTS header so a
-		// conforming client never silently downgrades (a no-op under the default
-		// upgrade policy); the matching port-80 rejection is applied in the
-		// rendezvous loop's port dispatch.
+		// (Phase 2 Skin integration) + Phase 3 TLS-first HSTS. Derive the pure, `Copy`
+		// plaintext-enforcement decision once (also threaded into the port dispatch
+		// below), then assemble the full application-facing stack. Secure-by-default
+		// unless the caller opted down with `no_skin`.
 		let plaintext = self.tls.plaintext_policy();
-		let app = apply_hsts(app, plaintext);
+		let app = build_serve_router(app, self.skin, plaintext);
 
 		// The per-circuit Tor-layer gate. Secure-by-default but non-disruptive: an
 		// accept-all accounting policy unless the caller supplied a tuned one, or the
@@ -1452,6 +1460,35 @@ mod tests {
 		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new());
 		let err = resolve_circuit_policy(Some(custom), false, Some(Arc::new(CapturingSink::new()))).err().expect("a sink + custom policy must conflict");
 		assert!(err.to_string().contains("circuit_policy"), "unexpected error: {err}");
+	}
+
+	#[tokio::test]
+	async fn serve_router_gates_and_adds_hsts_under_strict_tls() {
+		use http_body_util::BodyExt as _;
+		use tower::ServiceExt as _;
+
+		// The full serve-path stack under the secure default + strict TLS: an uncleared
+		// request is intercepted by the gate (never reaching the app) AND the response
+		// carries HSTS. Exercises the composition serve() builds, with no live Tor.
+		let app = build_serve_router(Router::new().route("/", get(|| async { "secret" })), SkinChoice::Default, Tls::Strict.plaintext_policy());
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		let hsts = response.headers().get("strict-transport-security").expect("strict TLS must emit HSTS on the gate's own response");
+		assert_eq!(hsts, "max-age=63072000; includeSubDomains");
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		assert!(!String::from_utf8_lossy(&body).contains("secret"), "the gated app must not leak through the composed stack");
+	}
+
+	#[tokio::test]
+	async fn serve_router_no_skin_reaches_app_without_hsts_under_upgrade() {
+		use http_body_util::BodyExt as _;
+		use tower::ServiceExt as _;
+
+		// Opt-down: no gate + upgrade TLS — the app is reached and no HSTS is added.
+		let app = build_serve_router(Router::new().route("/", get(|| async { "reached" })), SkinChoice::Disabled, Tls::Upgrade.plaintext_policy());
+		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
+		assert!(response.headers().get("strict-transport-security").is_none(), "upgrade TLS emits no HSTS");
+		let body = response.into_body().collect().await.unwrap().to_bytes();
+		assert_eq!(String::from_utf8_lossy(&body), "reached", "no_skin lets the request reach the app");
 	}
 
 	#[test]

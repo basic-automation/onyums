@@ -262,21 +262,49 @@ fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig
 		.map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))
 }
 
-/// Sets up and bootstraps a Tor client for the chosen identity mode.
+/// Sets up and bootstraps a Tor client for the given state/cache directories.
 ///
 /// Uses onyums-specific state and cache directories (see [`storage_dirs`]) rather
 /// than arti's shared `TorClientConfig::default()` location. This keeps the cache
 /// from growing without bound across runs while staying isolated from any sibling
 /// arti instance on the machine (e.g. an artiqwest client using `./tor/arti`),
-/// avoiding a state-directory collision. With `ephemeral` set, the keystore lives in
-/// a throwaway temp directory so the service's identity does not persist.
-async fn setup_tor_client(ephemeral: bool) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
+/// avoiding a state-directory collision. For an ephemeral service the caller passes a
+/// throwaway temp directory so the service's identity does not persist.
+async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	event!(Level::INFO, "Creating Tor client...");
-	let (state_dir, cache_dir) = storage_dirs(ephemeral);
-	let config = tor_client_config(&state_dir, &cache_dir)?;
+	let config = tor_client_config(state_dir, cache_dir)?;
 	let runtime = TokioNativeTlsRuntime::current().map_err(|_| anyhow::anyhow!("Failed to get current tokio runtime."))?;
 	let client = TorClient::with_runtime(runtime);
 	client.config(config).create_bootstrapped().await.map_err(|_| anyhow::anyhow!("Failed to create bootstrapped Tor client."))
+}
+
+/// The unique prefix every ephemeral state directory carries (see [`storage_dirs`]).
+/// Cleanup ([`remove_ephemeral_state_dir`]) refuses to delete any directory whose
+/// name does not start with this, so a bug that mis-threads a path can never remove
+/// a persistent or unrelated directory.
+const EPHEMERAL_DIR_PREFIX: &str = "onyums-ephemeral-";
+
+/// Best-effort removal of an ephemeral service's throwaway state directory, so the
+/// disposable identity key does not linger on disk after the service stops
+/// (onyums ROADMAP Phase 1).
+///
+/// As a safety belt this only removes a directory whose final component starts with
+/// [`EPHEMERAL_DIR_PREFIX`] — the exact shape [`storage_dirs`] mints — so it can
+/// never delete the persistent `./tor/onyums/state` tree or any unrelated path even
+/// if a wrong path is threaded in. A missing directory is a no-op; a removal failure
+/// (e.g. arti still holds a file open on Windows) is logged, not fatal — the OS
+/// reclaims the temp tree regardless.
+fn remove_ephemeral_state_dir(dir: &std::path::Path) {
+	let is_ephemeral = dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(EPHEMERAL_DIR_PREFIX));
+	if !is_ephemeral {
+		event!(Level::WARN, "refusing to remove non-ephemeral state dir {dir:?}");
+		return;
+	}
+	match std::fs::remove_dir_all(dir) {
+		Ok(()) => event!(Level::INFO, "removed ephemeral state dir {dir:?}"),
+		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+		Err(e) => event!(Level::WARN, "failed to remove ephemeral state dir {dir:?}: {e}"),
+	}
 }
 
 /// Apply a caller's authorized-clients allowlist to an [`OnionServiceConfigBuilder`]
@@ -494,6 +522,10 @@ pub struct OnionServiceHandle {
 	_client: Arc<TorClient<TokioNativeTlsRuntime>>,
 	cancel: CancellationToken,
 	task: Mutex<Option<JoinHandle<()>>>,
+	// Set only for an ephemeral service (see `OnionServiceBuilder::ephemeral`): the
+	// throwaway temp state dir, removed when the handle drops so the disposable
+	// identity key does not linger on disk.
+	ephemeral_state_dir: Option<std::path::PathBuf>,
 }
 
 impl OnionServiceHandle {
@@ -542,6 +574,18 @@ impl OnionServiceHandle {
 		let task = self.task.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
 		if let Some(task) = task {
 			let _ = task.await;
+		}
+	}
+}
+
+impl Drop for OnionServiceHandle {
+	fn drop(&mut self) {
+		// Dropping the handle tears down the onion service and its client; for an
+		// ephemeral service, also remove the throwaway keystore so the disposable
+		// identity key does not outlive the service on disk. Best-effort and guarded
+		// (see `remove_ephemeral_state_dir`).
+		if let Some(dir) = &self.ephemeral_state_dir {
+			remove_ephemeral_state_dir(dir);
 		}
 	}
 }
@@ -874,7 +918,12 @@ impl OnionServiceBuilder {
 		// service publicly discoverable — today's default behaviour.
 		let svc_cfg = build_onion_service_config(&nickname, self.restricted_discovery.as_ref())?;
 
-		let client = setup_tor_client(self.ephemeral).await?;
+		// Resolve the identity-mode directories (Phase 1). For an ephemeral service the
+		// state dir is a unique throwaway under temp; keep its path so the handle can
+		// remove it on drop. The persistent default keeps the fixed onyums tree.
+		let (state_dir, cache_dir) = storage_dirs(self.ephemeral);
+		let ephemeral_state_dir = self.ephemeral.then(|| std::path::PathBuf::from(&state_dir));
+		let client = setup_tor_client(&state_dir, &cache_dir).await?;
 		let (service, address, request_stream) = initialize_onion_service(&client, svc_cfg)?;
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
@@ -900,7 +949,7 @@ impl OnionServiceBuilder {
 			}
 		});
 
-		Ok(OnionServiceHandle { address, service, _client: client, cancel, task: Mutex::new(Some(task)) })
+		Ok(OnionServiceHandle { address, service, _client: client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir })
 	}
 }
 
@@ -1411,6 +1460,39 @@ mod tests {
 		tor_client_config(&state, &cache).expect("persistent client config builds offline");
 		let (state, cache) = storage_dirs(true);
 		tor_client_config(&state, &cache).expect("ephemeral client config builds offline");
+	}
+
+	#[test]
+	fn remove_ephemeral_state_dir_removes_our_throwaway_dir() {
+		// A directory shaped like one `storage_dirs` mints (populated with a fake
+		// keystore file) is removed wholesale.
+		let (state, _cache) = storage_dirs(true);
+		let dir = std::path::PathBuf::from(&state);
+		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
+		std::fs::write(dir.join("keystore").join("hs_ed25519_secret_key"), b"fake").expect("write fake key");
+		assert!(dir.exists());
+		remove_ephemeral_state_dir(&dir);
+		assert!(!dir.exists(), "the ephemeral state dir (and its contents) must be gone");
+	}
+
+	#[test]
+	fn remove_ephemeral_state_dir_refuses_non_ephemeral_paths() {
+		// The safety belt: a directory whose name lacks the ephemeral prefix is never
+		// removed, so a mis-threaded path can't delete a persistent tree.
+		let guard = std::env::temp_dir().join(format!("onyums-not-ephemeral-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+		std::fs::create_dir_all(&guard).expect("create non-ephemeral dir");
+		remove_ephemeral_state_dir(&guard);
+		assert!(guard.exists(), "a non-ephemeral dir must be left untouched");
+		std::fs::remove_dir_all(&guard).ok();
+	}
+
+	#[test]
+	fn remove_ephemeral_state_dir_is_a_noop_on_missing_dir() {
+		// Removing an already-absent ephemeral dir must not panic (idempotent cleanup).
+		let (state, _cache) = storage_dirs(true);
+		let dir = std::path::PathBuf::from(&state);
+		assert!(!dir.exists(), "a freshly-minted ephemeral path does not yet exist");
+		remove_ephemeral_state_dir(&dir); // must not panic
 	}
 
 	#[test]

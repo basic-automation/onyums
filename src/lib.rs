@@ -19,7 +19,7 @@
 use std::{net::SocketAddr, sync::Mutex};
 
 use anyhow::{bail, Result};
-use arti_client::{config::TorClientConfigBuilder, TorClient};
+use arti_client::{config::TorClientConfigBuilder, TorClient, TorClientConfig};
 use axum::extract::connect_info::Connected as AxumConnected;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -209,18 +209,71 @@ impl From<OnionAddress> for String {
 	}
 }
 
-/// Sets up and bootstraps a Tor client.
+/// The default persistent onyums state directory — home of the Arti keystore that
+/// holds the onion service's v3 identity key, so the `.onion` address is stable
+/// across restarts (onyums ROADMAP Phase 1). Kept under `./tor/onyums` rather than
+/// arti's shared default so onyums never collides with a sibling arti instance.
+const PERSISTENT_STATE_DIR: &str = "./tor/onyums/state";
+/// The default onyums cache directory (disposable per arti's `/var/cache` rules).
+/// Shared by both the persistent and ephemeral identity modes: the cached network
+/// directory is not identity-bearing, so an ephemeral service reuses it to avoid
+/// re-downloading the consensus on every throwaway launch.
+const CACHE_DIR: &str = "./tor/onyums/cache";
+
+/// Resolve the `(state_dir, cache_dir)` pair for the chosen identity mode
+/// (onyums ROADMAP Phase 1).
 ///
-/// Uses onyums-specific state and cache directories (`./tor/onyums/state`,
-/// `./tor/onyums/cache`) rather than arti's shared `TorClientConfig::default()`
-/// location. This keeps the cache from growing without bound across runs while
-/// staying isolated from any sibling arti instance on the machine (e.g. an
-/// artiqwest client using `./tor/arti`), avoiding a state-directory collision.
-async fn setup_tor_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
-	event!(Level::INFO, "Creating Tor client...");
-	let config = TorClientConfigBuilder::from_directories("./tor/onyums/state", "./tor/onyums/cache")
+/// Persistent (`ephemeral == false`, the default) returns the fixed
+/// [`PERSISTENT_STATE_DIR`], so the keystore — and therefore the `.onion` address —
+/// survives restarts. Ephemeral (`ephemeral == true`) returns a *unique*, throwaway
+/// state directory under the system temp dir, so each launch starts with an empty
+/// keystore, Arti generates a fresh identity key, and the service comes up on a new,
+/// disposable address that is never written to the persistent tree. The cache dir is
+/// [`CACHE_DIR`] in both modes (it holds no identity material).
+///
+/// This is a pure function so the directory logic is unit-testable with no live Tor
+/// network: the ephemeral path is distinct per call, the persistent path is stable.
+fn storage_dirs(ephemeral: bool) -> (String, String) {
+	if ephemeral {
+		// A unique per-launch suffix (pid + a CSPRNG draw) so two ephemeral services
+		// in one process — or successive restarts — never share a keystore and thus
+		// never reuse an address. The directory lives under the OS temp tree, outside
+		// the persistent `./tor/onyums` state.
+		let unique = format!("onyums-ephemeral-{}-{:016x}", std::process::id(), rand::random::<u64>());
+		let state_dir = std::env::temp_dir().join(unique);
+		(state_dir.to_string_lossy().into_owned(), CACHE_DIR.to_string())
+	} else {
+		(PERSISTENT_STATE_DIR.to_string(), CACHE_DIR.to_string())
+	}
+}
+
+/// Assemble a [`TorClientConfig`] for the given state/cache directories.
+///
+/// Extracted from [`setup_tor_client`] so the config assembly — the offline half of
+/// client setup — is unit-testable without bootstrapping the Tor network: `build`
+/// only validates and stores the directory paths (the dirs are created and the
+/// network reached later, at bootstrap).
+///
+/// # Errors
+/// Returns an error if Arti rejects the directory configuration.
+fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig> {
+	TorClientConfigBuilder::from_directories(state_dir, cache_dir)
 		.build()
-		.map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))?;
+		.map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))
+}
+
+/// Sets up and bootstraps a Tor client for the chosen identity mode.
+///
+/// Uses onyums-specific state and cache directories (see [`storage_dirs`]) rather
+/// than arti's shared `TorClientConfig::default()` location. This keeps the cache
+/// from growing without bound across runs while staying isolated from any sibling
+/// arti instance on the machine (e.g. an artiqwest client using `./tor/arti`),
+/// avoiding a state-directory collision. With `ephemeral` set, the keystore lives in
+/// a throwaway temp directory so the service's identity does not persist.
+async fn setup_tor_client(ephemeral: bool) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
+	event!(Level::INFO, "Creating Tor client...");
+	let (state_dir, cache_dir) = storage_dirs(ephemeral);
+	let config = tor_client_config(&state_dir, &cache_dir)?;
 	let runtime = TokioNativeTlsRuntime::current().map_err(|_| anyhow::anyhow!("Failed to get current tokio runtime."))?;
 	let client = TorClient::with_runtime(runtime);
 	client.config(config).create_bootstrapped().await.map_err(|_| anyhow::anyhow!("Failed to create bootstrapped Tor client."))
@@ -604,6 +657,7 @@ pub struct OnionServiceBuilder {
 	circuit_events: Option<Arc<dyn SecurityEventSink>>,
 	restricted_discovery: Option<RestrictedDiscovery>,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
+	ephemeral: bool,
 }
 
 impl OnionServiceBuilder {
@@ -753,6 +807,27 @@ impl OnionServiceBuilder {
 		self
 	}
 
+	/// Opt *down*: run a throwaway service whose identity does not persist
+	/// (onyums ROADMAP Phase 1).
+	///
+	/// By default onyums keeps its onion identity key in a persistent keystore
+	/// (`./tor/onyums/state`), so the `.onion` address is stable across restarts with
+	/// zero configuration. Calling `ephemeral()` instead points the keystore at a
+	/// unique, throwaway directory under the system temp dir (see [`storage_dirs`]):
+	/// each launch starts with an empty keystore, Arti mints a fresh identity key, and
+	/// the service comes up on a new, disposable address that is never written into the
+	/// persistent tree.
+	///
+	/// This is an explicit, named decision — never an unset flag — for services that
+	/// *want* a new address every run (a one-shot drop, a test fixture, a service whose
+	/// unlinkability across restarts is the point). The disposable network cache is
+	/// still shared, so an ephemeral launch does not re-download the consensus.
+	#[must_use]
+	pub const fn ephemeral(mut self) -> Self {
+		self.ephemeral = true;
+		self
+	}
+
 	/// Launch the onion service and return a handle once the address is known.
 	///
 	/// The Tor client is bootstrapped and the service launched before this
@@ -799,7 +874,7 @@ impl OnionServiceBuilder {
 		// service publicly discoverable — today's default behaviour.
 		let svc_cfg = build_onion_service_config(&nickname, self.restricted_discovery.as_ref())?;
 
-		let client = setup_tor_client().await?;
+		let client = setup_tor_client(self.ephemeral).await?;
 		let (service, address, request_stream) = initialize_onion_service(&client, svc_cfg)?;
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
@@ -1299,6 +1374,53 @@ mod tests {
 		let result = OnionService::builder().router(app).nickname("raw_reserved").route_port(443, RawTcpHandler::new("127.0.0.1:9000")).serve().await;
 		let err = result.err().expect("a reserved-port registration should error");
 		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn storage_dirs_persistent_are_the_fixed_onyums_paths() {
+		// The default (persistent) identity mode always resolves to the stable
+		// onyums directories, so the keystore — and thus the address — survives
+		// restarts. Two calls are identical.
+		let (state, cache) = storage_dirs(false);
+		assert_eq!(state, PERSISTENT_STATE_DIR);
+		assert_eq!(cache, CACHE_DIR);
+		let (state2, cache2) = storage_dirs(false);
+		assert_eq!((state, cache), (state2, cache2), "persistent dirs must be stable across calls");
+	}
+
+	#[test]
+	fn storage_dirs_ephemeral_are_unique_and_under_temp() {
+		// An ephemeral service must never reuse a keystore: each call yields a
+		// distinct state dir, located under the OS temp tree and outside the
+		// persistent `./tor/onyums` state. The disposable cache is still shared.
+		let (state_a, cache_a) = storage_dirs(true);
+		let (state_b, _cache_b) = storage_dirs(true);
+		assert_ne!(state_a, state_b, "two ephemeral launches must not share a keystore dir");
+		assert_ne!(state_a, PERSISTENT_STATE_DIR, "ephemeral state must not be the persistent tree");
+		let temp = std::env::temp_dir().to_string_lossy().into_owned();
+		assert!(state_a.starts_with(&temp), "ephemeral state {state_a} should live under the temp dir {temp}");
+		assert_eq!(cache_a, CACHE_DIR, "the disposable cache is shared across modes");
+	}
+
+	#[test]
+	fn tor_client_config_builds_offline_for_both_modes() {
+		// Config assembly is the offline half of client setup: it must build for
+		// both the persistent and ephemeral directory choices with no live Tor
+		// network (the dirs are only touched later, at bootstrap).
+		let (state, cache) = storage_dirs(false);
+		tor_client_config(&state, &cache).expect("persistent client config builds offline");
+		let (state, cache) = storage_dirs(true);
+		tor_client_config(&state, &cache).expect("ephemeral client config builds offline");
+	}
+
+	#[test]
+	fn builder_defaults_to_persistent_identity() {
+		// Stable identity by default (Phase 1): the ephemeral opt-down is off unless
+		// explicitly named.
+		let builder = OnionServiceBuilder::default();
+		assert!(!builder.ephemeral, "identity is persistent by default");
+		let builder = builder.ephemeral();
+		assert!(builder.ephemeral, "ephemeral() records the throwaway-identity opt-down");
 	}
 
 	#[test]

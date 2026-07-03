@@ -33,6 +33,17 @@ use crate::OnionAddress;
 /// (before the `.onion` suffix) — the longest possible vanity prefix.
 const ONION_ADDRESS_LEN: usize = 56;
 
+/// The 32-byte tag that prefixes the secret-key material in a Tor
+/// `hs_ed25519_secret_key` file — the 29-byte ASCII label
+/// `"== ed25519v1-secret: type0 =="` padded to 32 bytes with three NULs. This is
+/// the exact tag C tor writes and arti's `CTorServiceKeystore` validates, so a
+/// blob onyums renders is byte-identical to one Tor produces, and vice versa.
+const HS_ED25519_SECRET_TAG: &[u8; 32] = b"== ed25519v1-secret: type0 ==\x00\x00\x00";
+
+/// Total length of a Tor `hs_ed25519_secret_key` file: the 32-byte
+/// [`HS_ED25519_SECRET_TAG`] followed by the 64-byte *expanded* secret key.
+const HS_ED25519_SECRET_FILE_LEN: usize = HS_ED25519_SECRET_TAG.len() + 64;
+
 /// A mined keypair together with the `.onion` address it produces.
 ///
 /// Holds the secret key, so it does not derive [`Debug`] (the manual impl
@@ -68,6 +79,19 @@ impl VanityKey {
 	#[must_use]
 	pub fn expanded_secret_key_bytes(&self) -> [u8; 64] {
 		ExpandedKeypair::from(&Keypair::from_bytes(&self.secret_key)).to_secret_key_bytes()
+	}
+
+	/// Render this key as the contents of a Tor `hs_ed25519_secret_key` file (the
+	/// 96-byte tag + expanded-key blob).
+	///
+	/// Writing these bytes to `hs_ed25519_secret_key` produces a file byte-identical
+	/// to one C tor or arti would write for the same identity, so a mined vanity key
+	/// can be backed up or loaded into any Tor implementation — and
+	/// [`address_from_tor_secret_key_file`] reads it straight back to the same
+	/// [`address`](Self::address).
+	#[must_use]
+	pub fn to_tor_secret_key_file(&self) -> [u8; HS_ED25519_SECRET_FILE_LEN] {
+		tor_secret_key_file_from_expanded(self.expanded_secret_key_bytes())
 	}
 }
 
@@ -133,6 +157,78 @@ pub fn address_from_expanded_secret(bytes: [u8; 64]) -> Result<OnionAddress> {
 	let keypair = ExpandedKeypair::from_secret_key_bytes(bytes).ok_or_else(|| anyhow::anyhow!("invalid expanded ed25519 secret key"))?;
 	let hsid = HsId::from(HsIdKey::from(*keypair.public()));
 	Ok(OnionAddress::normalized(&hsid.display_unredacted().to_string()))
+}
+
+/// Extract the 64-byte *expanded* ed25519 secret key from the raw contents of a
+/// Tor `hs_ed25519_secret_key` file.
+///
+/// This is the on-disk identity format both C tor and arti's `CTorServiceKeystore`
+/// use: a 32-byte [`HS_ED25519_SECRET_TAG`] tag followed by the 64-byte expanded
+/// secret key (secret scalar || hash prefix), for a total of
+/// [`HS_ED25519_SECRET_FILE_LEN`] bytes. Reading this file is the first step of
+/// migrating an existing onion service into onyums without changing its address.
+///
+/// The bytes are validated fully: the exact length, the exact tag, and that the
+/// trailing 64 bytes are a well-formed expanded ed25519 keypair — so a truncated
+/// or corrupted file is rejected here, offline, rather than at launch.
+///
+/// # Errors
+/// Returns an error if the blob is the wrong length, carries the wrong tag, or does
+/// not contain a valid expanded ed25519 secret key.
+pub fn expanded_secret_from_tor_file(bytes: &[u8]) -> Result<[u8; 64]> {
+	if bytes.len() != HS_ED25519_SECRET_FILE_LEN {
+		bail!("hs_ed25519_secret_key must be {HS_ED25519_SECRET_FILE_LEN} bytes (32-byte tag + 64-byte expanded key), got {}", bytes.len());
+	}
+	let (tag, key) = bytes.split_at(HS_ED25519_SECRET_TAG.len());
+	if tag != HS_ED25519_SECRET_TAG.as_slice() {
+		bail!("hs_ed25519_secret_key has the wrong tag: not a Tor ed25519v1-secret type0 key file");
+	}
+	// The length was checked to be exactly `HS_ED25519_SECRET_FILE_LEN` (96) above and
+	// the tag is 32 bytes, so `key` is exactly 64 bytes — `copy_from_slice` cannot
+	// mismatch, keeping this path panic-free.
+	let mut expanded = [0_u8; 64];
+	expanded.copy_from_slice(key);
+	// Reject a key that carries the right tag but garbage material, so the error is
+	// caught here rather than surfacing as a launch failure later.
+	ExpandedKeypair::from_secret_key_bytes(expanded).ok_or_else(|| anyhow::anyhow!("hs_ed25519_secret_key does not contain a valid expanded ed25519 secret key"))?;
+	Ok(expanded)
+}
+
+/// Derive the `.onion` address a Tor `hs_ed25519_secret_key` file will serve.
+///
+/// The bring-your-own-identity migration check for operators moving an existing
+/// onion service into onyums: point this at the service's `hs_ed25519_secret_key`
+/// file contents and it returns the exact address onyums would serve from that key,
+/// so a migration can be confirmed to preserve the address *before* the key is wired
+/// into the keystore. Parses with [`expanded_secret_from_tor_file`] and derives with
+/// the same arti-canonical path as the miner.
+///
+/// # Errors
+/// Returns an error if the blob is not a valid Tor `hs_ed25519_secret_key` file (see
+/// [`expanded_secret_from_tor_file`]).
+pub fn address_from_tor_secret_key_file(bytes: &[u8]) -> Result<OnionAddress> {
+	address_from_expanded_secret(expanded_secret_from_tor_file(bytes)?)
+}
+
+/// Render a 64-byte *expanded* ed25519 secret key as the contents of a Tor
+/// `hs_ed25519_secret_key` file.
+///
+/// The inverse of [`expanded_secret_from_tor_file`]: prepends the 32-byte
+/// [`HS_ED25519_SECRET_TAG`] to the expanded key, yielding the exact 96-byte blob C
+/// tor and arti's keystore expect. Use it to export an onyums-held identity (e.g. a
+/// [`mined`](VanityKey) one) into the standard on-disk format — for a backup, or to
+/// seed another service — so a key can round-trip out of and back into any Tor
+/// implementation without changing its address.
+///
+/// This does not re-validate the input: callers hold an expanded key they already
+/// derived (from a seed or [`expanded_secret_from_tor_file`]), so it is
+/// well-formed by construction.
+#[must_use]
+pub fn tor_secret_key_file_from_expanded(expanded: [u8; 64]) -> [u8; HS_ED25519_SECRET_FILE_LEN] {
+	let mut out = [0_u8; HS_ED25519_SECRET_FILE_LEN];
+	out[..HS_ED25519_SECRET_TAG.len()].copy_from_slice(HS_ED25519_SECRET_TAG);
+	out[HS_ED25519_SECRET_TAG.len()..].copy_from_slice(&expanded);
+	out
 }
 
 /// Draw one candidate key and return it iff its address begins with `prefix`.
@@ -358,6 +454,50 @@ mod tests {
 		let a = address_from_secret_seed(&[1_u8; 32]);
 		let b = address_from_secret_seed(&[2_u8; 32]);
 		assert_ne!(a, b, "different secret seeds must produce different addresses");
+	}
+
+	#[test]
+	fn tor_file_round_trips_a_mined_key_to_the_same_address() {
+		// Export a mined key to the Tor `hs_ed25519_secret_key` format, then read it
+		// back: the parsed expanded key and derived address must equal the originals.
+		// This is the full migration loop — mine → write file → (re)import.
+		let key = mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
+		let blob = key.to_tor_secret_key_file();
+		assert_eq!(blob.len(), HS_ED25519_SECRET_FILE_LEN);
+		assert_eq!(&blob[..HS_ED25519_SECRET_TAG.len()], HS_ED25519_SECRET_TAG.as_slice(), "the blob must carry the canonical Tor tag");
+
+		let parsed = expanded_secret_from_tor_file(&blob).expect("our own rendered file must parse");
+		assert_eq!(parsed, key.expanded_secret_key_bytes(), "the round-tripped expanded key must match");
+		let address = address_from_tor_secret_key_file(&blob).expect("our own rendered file must yield an address");
+		assert_eq!(&address, key.address(), "the round-tripped address must equal the mined one");
+	}
+
+	#[test]
+	fn tor_file_render_matches_the_free_function() {
+		// The `VanityKey` convenience method is exactly the free renderer applied to
+		// the key's expanded bytes.
+		let key = mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
+		assert_eq!(key.to_tor_secret_key_file(), tor_secret_key_file_from_expanded(key.expanded_secret_key_bytes()));
+	}
+
+	#[test]
+	fn tor_file_rejects_wrong_length() {
+		// A truncated blob (tag + a too-short key) is rejected on length before any
+		// tag or key validation.
+		let short = vec![0_u8; HS_ED25519_SECRET_FILE_LEN - 1];
+		let err = expanded_secret_from_tor_file(&short).expect_err("a short blob must be rejected");
+		assert!(err.to_string().contains("bytes"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn tor_file_rejects_wrong_tag() {
+		// A correctly-sized blob with the wrong tag (e.g. the public-key tag) is
+		// rejected as not a secret-key file.
+		let key = mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
+		let mut blob = key.to_tor_secret_key_file();
+		blob[3] = b'X'; // corrupt the tag
+		let err = expanded_secret_from_tor_file(&blob).expect_err("a wrong tag must be rejected");
+		assert!(err.to_string().contains("tag"), "unexpected error: {err}");
 	}
 
 	#[test]

@@ -65,7 +65,7 @@ pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeF
 pub use raw_tcp::RawTcpHandler;
 pub use provided_cert::ProvidedCert;
 pub use tls_policy::Tls;
-pub use vanity::{address_from_expanded_secret, address_from_secret_seed, mine, mine_parallel, mine_within, validate_prefix, VanityKey};
+pub use vanity::{address_from_expanded_secret, address_from_secret_seed, address_from_tor_secret_key_file, expanded_secret_from_tor_file, mine, mine_parallel, mine_within, tor_secret_key_file_from_expanded, validate_prefix, VanityKey};
 
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
 use rcgen::generate_simple_self_signed;

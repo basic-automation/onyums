@@ -12,10 +12,10 @@ The posture is *secure and complete by default*: the hard, Tor-specific machiner
 - **One-liner serve** — `serve(app, "nickname")` is the full secure stack; the builder (`OnionService::builder()`) tunes or relaxes it.
 - **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF, plus an Under Attack Mode toggle and observable security events; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
 - **Restricted discovery (v3 client authorization)** — `.authorized_clients(...)` publishes a descriptor only the listed clients can decrypt, so an unlisted client cannot even discover the service; see [Restricted discovery](#restricted-discovery--v3-client-authorization).
-- **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()`, the typed `.onion` address, and `shutdown()`.
+- **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()`, a synchronous `status()` snapshot (typed `ServiceStatus`), the typed `.onion` address, and `shutdown()`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
-- **Stable identity** — a persistent keystore by default, plus vanity-address mining and address helpers (QR, `Onion-Location`); see [Address helpers](#address-helpers).
+- **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, bring-your-own-key migration from a Tor `hs_ed25519_secret_key` file, and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
 - **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity (typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers for per-circuit isolation); see [Websocket example](#websocket-example).
 - **Version-skew-proof arti** — the arti stack is re-exported (`onyums::arti_client`, `onyums::tor_hsservice`, `onyums::tor_hscrypto`, …) so downstreams use the exact versions onyums does, just like `axum`.
 
@@ -56,10 +56,21 @@ async fn main() {
 	handle.ready().await; // descriptor published, reachable
 	println!("Onion Address: {}", handle.onion_address());
 
+	// Poll the current health without blocking (still bootstrapping? degraded? broken?):
+	if handle.status().is_reachable() {
+		println!("service is reachable");
+	}
+
 	// ... serve for a while ...
 	handle.shutdown().await; // graceful stop
 }
 ```
+
+`status()` returns a stable `ServiceStatus` — `Shutdown` / `Bootstrapping` /
+`Reachable` / `DegradedReachable` / `Unreachable` / `Broken` — onyums' own
+projection of arti's onion-service state, so you can surface health at any moment
+instead of only awaiting first reachability with `ready()`.
+
 ****
 
 ## Abuse defense (Skin) — on by default
@@ -92,6 +103,7 @@ async fn main() {
 		// .tls(Tls::Strict)                     // make TLS non-negotiable (reject plaintext, emit HSTS)
 		// .tls(Tls::Provided(my_cert))          // serve your own CA-signed cert instead of self-signed
 		// .route_port(9735, raw_handler)        // serve another protocol (raw TCP, gRPC, SSH, ...) on a non-HTTP port
+		// .ephemeral()                          // throwaway identity — a fresh, disposable .onion each run
 		// .no_skin()                            // opt out of the gate entirely
 		.serve()
 		.await
@@ -215,7 +227,44 @@ Bring your own protocol by implementing the `StreamHandler` trait (one method: `
 
 ****
 
-## Address helpers
+## Identity & address helpers
+
+By default onyums keeps its onion identity key in a persistent keystore
+(`./tor/onyums/state`), so the `.onion` address is stable across restarts with zero
+configuration. `.ephemeral()` is the explicit opt-**down** to a throwaway identity —
+the keystore lives in a unique temp directory, so each launch mints a fresh,
+disposable address, and that directory is removed when the handle drops so the
+disposable key does not linger on disk:
+
+```rust
+use onyums::{OnionService, routing::get, Router};
+
+let handle = OnionService::builder()
+	.router(Router::new().route("/", get(|| async { "throwaway service" })))
+	.nickname("scratch")
+	.ephemeral() // fresh, disposable .onion address every run — never persisted
+	.serve()
+	.await
+	.unwrap();
+```
+
+**Bring your own identity.** To migrate an existing service into onyums without
+changing its address, read its Tor `hs_ed25519_secret_key` file and confirm the
+address *before* wiring anything up — onyums derives it with the same encoding arti
+serves, so the check is exact:
+
+```rust
+use onyums::address_from_tor_secret_key_file;
+
+let key_file = std::fs::read("hidden_service/hs_ed25519_secret_key").unwrap();
+let address = address_from_tor_secret_key_file(&key_file).expect("valid hs_ed25519_secret_key");
+println!("this key serves {address}"); // matches the service's existing address
+```
+
+A mined vanity key can also be exported to the same on-disk format
+(`VanityKey::to_tor_secret_key_file()`) for backup or to load into any Tor
+implementation. (Loading a BYO key directly into the live keystore is a
+forthcoming slice — it rides on an arti experimental API.)
 
 `handle.onion_address()` returns a typed `OnionAddress`, not a bare string, with the helpers an onion app actually needs:
 

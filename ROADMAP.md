@@ -14,8 +14,9 @@
 ## Phase 1 — Stable identity by default — `0.5`
 
 - [x] Persistent keystore is the default (`./tor/onyums/state`) — stable address across restarts with zero configuration
-- [ ] `.ephemeral()` opt-down for throwaway services (explicit, named decision — never an unset flag)
+- [x] `.ephemeral()` opt-down for throwaway services (explicit, named decision — never an unset flag) — a unique throwaway temp state dir per launch (offline-verified: `storage_dirs`/`tor_client_config`), removed on handle drop; uses only stable arti features. arti's *in-memory* ephemeral keystore (`ArtiEphemeralKeystore`) is gated behind the experimental, non-semver `ephemeral-keystore` feature and is **not in `full`** (<https://lib.rs/crates/arti-client/features>); onyums' in-process ephemeral tracks arti issue #1186. A future slice could adopt the in-memory keystore for a no-disk identity, at the cost of an experimental feature dep.
 - [ ] Bring-your-own identity key — import an existing v3 HS secret key to migrate a service without changing its address
+  - *Offline slice landed:* `expanded_secret_from_tor_file` / `address_from_tor_secret_key_file` parse a Tor `hs_ed25519_secret_key` file (32-byte `== ed25519v1-secret: type0 ==` tag + 64-byte expanded key) and derive the exact address it serves; `tor_secret_key_file_from_expanded` / `VanityKey::to_tor_secret_key_file` render the inverse blob. *Next slice (live Tor):* insert the key into the keystore and launch it — via arti's `launch_onion_service_with_hsid` (behind the experimental, non-semver `experimental-api` feature — <https://lib.rs/crates/arti-client/features>) or by mirroring arti's own `arti hss ctor-migrate` C-tor→native-keystore migration utility (Arti 1.4.6, <https://blog.torproject.org/arti_1_4_6_released/>). Needs a decision on taking the experimental-feature dependency.
 - [x] Vanity address mining (`mine` / `mine_parallel`) — parallelized across cores
 - [x] Address helpers — typed `OnionAddress`, validating `parse`, QR emission (`qr_terminal` / `qr_svg`), `Onion-Location` header pair
 
@@ -41,11 +42,12 @@
 - [x] `Tls::Provided(cert)` — bring-your-own CA-signed `.onion` cert (`ProvidedCert::from_pem` / `from_pem_files`)
 - [x] Arbitrary port → handler mapping — `StreamHandler` trait, `.route_port(port, handler)`, `RawTcpHandler`; ports 80/443 reserved for the built-in HTTP handler; reserved/zero/duplicate ports are clean `serve()` errors
 - [ ] Runtime-verify the live raw-serve path (routing table, builder validation, and the `RawTcpHandler` proxy are unit-tested offline; the live path needs a real Tor run)
-- [ ] Single onion service mode — explicit opt-down trading server-side anonymity for latency
+- [ ] Single onion service mode — explicit opt-down trading server-side anonymity for latency **(BLOCKED upstream on arti 0.43)** — the `Anonymity` enum exists (`Anonymity::DangerouslyNonAnonymous`) but the `anonymity` field in `OnionServiceConfig` is commented out in the pinned tor-hsservice 0.43 source ("We could skip this in v1"), so there is no config surface to set it. Re-check when the arti stack is bumped (see cross-cutting).
 
 ## Phase 4 — Observability & multi-service — `0.8`
 
 - [ ] Bootstrap & descriptor-upload progress as a stream/callback (so `ready()` provably means published + reachable)
+  - *Synchronous slice landed:* `OnionServiceHandle::status() -> ServiceStatus` — a stable, `#[non_exhaustive]`-proof projection of arti's onion-service `State` (Shutdown / Bootstrapping / Reachable / DegradedReachable / Unreachable / Broken, with `is_reachable()` mirroring arti's `is_fully_reachable`), unit-tested against every arti state offline. *Next slice:* a `status_events()` **stream** on the handle (project `RunningOnionService::status_events()`) so callers can watch the bootstrap → reachable → degraded transitions, not just poll a snapshot.
 - [ ] Per-service metrics on the handle — active circuits, connection counts, intro-point health, PoW effort, descriptor republish times
 - [ ] Multiple services on one shared `TorClient` — bootstrap once, launch N onion services
 - [x] Circuit-isolation controls via an enriched `ConnectionInfo` — typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers (and a non-panicking connect-info fallback)

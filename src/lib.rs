@@ -505,6 +505,71 @@ fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: 
 	Ok((service, address, request_stream))
 }
 
+/// A stable, high-level snapshot of an onion service's reachability
+/// (onyums ROADMAP Phase 4 — observability).
+///
+/// This is onyums' own projection of arti's `#[non_exhaustive]`
+/// [`tor_hsservice::status::State`], the same way [`OnionAddress`] and
+/// [`ConnectionInfo`] are typed projections of arti primitives: downstreams match on
+/// this exhaustively without a wildcard and without breaking when arti adds a state,
+/// and read reachability through [`is_reachable`](Self::is_reachable) rather than
+/// re-deriving arti's `is_fully_reachable` semantics. Read the current value from a
+/// running service via [`OnionServiceHandle::status`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceStatus {
+	/// Not launched, or shut down. Not reachable.
+	Shutdown,
+	/// Building introduction points and publishing the descriptor; no significant
+	/// problems yet, but not yet reachable. This is the state a freshly launched
+	/// service passes through before [`OnionServiceHandle::ready`] resolves.
+	Bootstrapping,
+	/// Believed fully reachable: satisfied with its introduction points and its
+	/// descriptor is up to date.
+	Reachable,
+	/// Reachable, but running degraded — fewer or less-satisfactory introduction
+	/// points than desired, though the descriptor is current.
+	DegradedReachable,
+	/// Running but unlikely to be reachable right now — recovering from a dead intro
+	/// point, a failed descriptor upload, or a similar transient problem.
+	Unreachable,
+	/// A problem onyums could not recover from. Not fully reachable.
+	Broken,
+}
+
+impl ServiceStatus {
+	/// Whether the service is *believed* to be reachable by clients.
+	///
+	/// Mirrors arti's `State::is_fully_reachable`: true for [`Reachable`](Self::Reachable)
+	/// and [`DegradedReachable`](Self::DegradedReachable). Like arti's, this is a
+	/// one-directional implication — `false` does not prove unreachability.
+	#[must_use]
+	pub const fn is_reachable(self) -> bool {
+		matches!(self, Self::Reachable | Self::DegradedReachable)
+	}
+}
+
+/// Project arti's `#[non_exhaustive]` onion-service [`State`](tor_hsservice::status::State)
+/// onto onyums' stable [`ServiceStatus`].
+///
+/// An unrecognized future arti state is conservatively reported as
+/// [`ServiceStatus::Unreachable`] — onyums never claims reachability for a state it
+/// does not understand. Pure and total, so it is unit-testable against every arti
+/// state with no live Tor network.
+fn project_service_status(state: tor_hsservice::status::State) -> ServiceStatus {
+	use tor_hsservice::status::State;
+	match state {
+		State::Shutdown => ServiceStatus::Shutdown,
+		State::Bootstrapping => ServiceStatus::Bootstrapping,
+		State::Running => ServiceStatus::Reachable,
+		State::DegradedReachable => ServiceStatus::DegradedReachable,
+		State::DegradedUnreachable | State::Recovering => ServiceStatus::Unreachable,
+		State::Broken => ServiceStatus::Broken,
+		// `State` is `#[non_exhaustive]`; treat any state arti adds later as
+		// not-reachable until onyums maps it explicitly.
+		_ => ServiceStatus::Unreachable,
+	}
+}
+
 /// A running onion service plus its controls.
 ///
 /// Returned by [`OnionServiceBuilder::serve`]. The accept loop runs on a spawned
@@ -533,6 +598,20 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub const fn onion_address(&self) -> &OnionAddress {
 		&self.address
+	}
+
+	/// The service's current high-level [`ServiceStatus`] — a synchronous snapshot
+	/// of its reachability, projected from arti's live status (onyums ROADMAP
+	/// Phase 4).
+	///
+	/// Unlike [`ready`](Self::ready), which *awaits* first reachability, this returns
+	/// immediately with wherever the service is now — still bootstrapping, reachable,
+	/// running degraded, or broken — so a caller can poll or surface health without
+	/// blocking. Reflects arti's `is_fully_reachable` semantics via
+	/// [`ServiceStatus::is_reachable`].
+	#[must_use]
+	pub fn status(&self) -> ServiceStatus {
+		project_service_status(self.service.status().state())
 	}
 
 	/// Resolve once the service is believed to be fully reachable — its
@@ -1711,6 +1790,35 @@ mod tests {
 		assert!(!a.same_circuit(&b), "different circuit ids are different circuits");
 		assert!(!a.same_circuit(&unknown), "a known circuit never matches an unknown one");
 		assert!(!unknown.same_circuit(&unknown), "two unknown circuits are not a known-same circuit");
+	}
+
+	#[test]
+	fn service_status_projects_every_arti_state() {
+		use tor_hsservice::status::State;
+		// Every known arti onion-service state maps onto onyums' stable projection.
+		// If arti adds or renames a state, this stops compiling (the `State` import)
+		// or the assertion drifts — a deliberate tripwire for the non_exhaustive enum.
+		assert_eq!(project_service_status(State::Shutdown), ServiceStatus::Shutdown);
+		assert_eq!(project_service_status(State::Bootstrapping), ServiceStatus::Bootstrapping);
+		assert_eq!(project_service_status(State::Running), ServiceStatus::Reachable);
+		assert_eq!(project_service_status(State::DegradedReachable), ServiceStatus::DegradedReachable);
+		assert_eq!(project_service_status(State::DegradedUnreachable), ServiceStatus::Unreachable);
+		assert_eq!(project_service_status(State::Recovering), ServiceStatus::Unreachable);
+		assert_eq!(project_service_status(State::Broken), ServiceStatus::Broken);
+	}
+
+	#[test]
+	fn service_status_reachability_matches_arti_semantics() {
+		use tor_hsservice::status::State;
+		// onyums' `is_reachable` must agree with arti's own `is_fully_reachable` for
+		// every known state — the projection must not change the reachability verdict.
+		for state in [State::Shutdown, State::Bootstrapping, State::Running, State::DegradedReachable, State::DegradedUnreachable, State::Recovering, State::Broken] {
+			assert_eq!(project_service_status(state).is_reachable(), state.is_fully_reachable(), "reachability disagreement for {state:?}");
+		}
+		// Spot-check the two reachable states and one non-reachable one directly.
+		assert!(ServiceStatus::Reachable.is_reachable());
+		assert!(ServiceStatus::DegradedReachable.is_reachable());
+		assert!(!ServiceStatus::Bootstrapping.is_reachable());
 	}
 
 	#[test]

@@ -740,6 +740,16 @@ pub fn starter_rules() -> Vec<Rule> {
 		// and — prefix-guarded so `/settings/profile` and `user.profile` stay clean — a
 		// dot-segment `.profile` shell startup file. <https://www.linuxcompatible.org/story/owasp-crs-4260-released>
 		Rule { id: "traversal_appserver_files", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.dockerenv\b|/\.ds_store\b|/(meta-inf|web-inf)/|/\.profile\b)" },
+		// Version-control metadata, framework dotfile configs, and secrets files probed over
+		// HTTP (OWASP-CRS restricted-files access, `RESTRICTED_FILES` / rule 930130): a `.git/`
+		// tree leak, an Apache `.htaccess`/`.htpasswd`, an IIS `web.config`, or the classic
+		// `/.env` secrets grab. Dot-segment/enclosing-slash anchored so `/.environment` and
+		// `/settings/gitignore-help` stay clean.
+		Rule { id: "traversal_vcs_config_files", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.git/|/\.svn/|/\.hg/|/\.bzr/|/\.env\b|/\.htaccess\b|/\.htpasswd\b|/\.gitignore\b|/web\.config\b)" },
+		// Editor/database backup & swap artifacts left in the webroot — a `config.php.bak`, a
+		// SQL dump, a vim `.swp`. High-signal source/secret disclosure; an operator serving such
+		// files deliberately can `disable_rule("traversal_backup_files")`.
+		Rule { id: "traversal_backup_files", category: WafCategory::PathTraversal, pattern: r"(?i)\.(bak|swp|swo|sql|dump)\b" },
 		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
@@ -1538,6 +1548,46 @@ mod tests {
 		// The index is still a bijection over every category.
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn crs_restricted_file_access_matches() {
+		// VCS trees, framework configs, secrets files, and backup/dump artifacts all attribute
+		// to the PathTraversal class.
+		let waf = Waf::starter();
+		for (uri, rule) in [
+			("/.git/config", "traversal_vcs_config_files"),
+			("/.svn/entries", "traversal_vcs_config_files"),
+			("/.env", "traversal_vcs_config_files"),
+			("/.env.production", "traversal_vcs_config_files"),
+			("/.htaccess", "traversal_vcs_config_files"),
+			("/web.config", "traversal_vcs_config_files"),
+			("/backups/db.sql", "traversal_backup_files"),
+			("/wp-config.php.bak", "traversal_backup_files"),
+			("/index.php.swp", "traversal_backup_files"),
+		] {
+			let v = waf.inspect(&parts("GET", uri));
+			let m = blocked(&v);
+			assert_eq!(m.rule_id, rule, "{uri} should trip {rule}");
+			assert_eq!(m.category, WafCategory::PathTraversal);
+		}
+	}
+
+	#[test]
+	fn crs_restricted_file_access_keeps_false_positives_low() {
+		// Look-alikes without the dot segment / enclosing slash, and paths that merely mention
+		// the tokens as words, must still pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/.environment-vars-guide",  // `.env` guarded by \b, "environment" != ".env\b"
+			"/settings/gitignore-help",  // no `/.gitignore` dot segment
+			"/blog/git-workflows",       // "git" as a word, not the `/.git/` tree
+			"/products/webcconfig-tool", // "webconfig" != "/web.config"
+			"/docs/backup-strategies",   // "backup" as a word, no `.bak` extension
+			"/blog/nosql-basics",        // "sql" inside "nosql", no `.sql` extension
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
 

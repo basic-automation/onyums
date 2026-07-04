@@ -762,6 +762,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
 		Rule { id: "ssrf_decimal_ip", category: WafCategory::Ssrf, pattern: r"(?i)\bhttps?://\d{8,10}(?:[:/]|\b)" },
+		// Obfuscated-loopback SSRF: the classic WAF-bypass encodings of 127.0.0.1 that the
+		// literal `ssrf_loopback_url` rule misses — hex host (`0x7f000001` / `0x7f.0.0.1`),
+		// octal host (`0177.0.0.1` / packed `017700000001`), and the IPv4-mapped IPv6 form
+		// (`[::ffff:127.0.0.1]`). Decimal (`2130706433`) is already caught by `ssrf_decimal_ip`.
+		Rule { id: "ssrf_obfuscated_loopback", category: WafCategory::Ssrf, pattern: r"(?i)://(0x0*7f[0-9a-f]{0,6}|0177[.0-7]|017700000001|\[::ffff:127\.0\.0\.1\])" },
+		// Cloud metadata reachable by DNS name rather than the 169.254.169.254 link-local IP —
+		// GCP's `metadata.google.internal`. A value-inspection SSRF target the IP/path rules miss.
+		Rule { id: "ssrf_metadata_hostname", category: WafCategory::Ssrf, pattern: r"(?i)\bmetadata\.google\.internal\b" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
@@ -1418,6 +1426,39 @@ mod tests {
 		assert_eq!(waf.inspect_str("next=file:///etc/hostname", "query").unwrap().category, WafCategory::Ssrf);
 		assert_eq!(waf.inspect_str("fetch=http://127.0.0.1:8080/admin", "query").unwrap().rule_id, "ssrf_loopback_url");
 		assert_eq!(waf.inspect_str("fetch=https://localhost/internal", "query").unwrap().rule_id, "ssrf_loopback_url");
+	}
+
+	#[test]
+	fn ssrf_obfuscated_loopback_is_blocked() {
+		// The obfuscated 127.0.0.1 encodings a naive literal rule misses all attribute to SSRF.
+		let waf = Waf::starter();
+		for u in [
+			"url=http://0x7f000001/latest",          // packed hex
+			"url=http://0x7f.0.0.1/x",                // dotted hex
+			"url=http://0177.0.0.1/admin",            // dotted octal
+			"url=http://017700000001/",               // packed octal
+			"url=http://[::ffff:127.0.0.1]/meta",     // IPv4-mapped IPv6
+		] {
+			assert_eq!(waf.inspect_str(u, "query").unwrap().rule_id, "ssrf_obfuscated_loopback", "{u} should trip obfuscated-loopback SSRF");
+		}
+		// GCP metadata by DNS name. Use the bare host (no `/computeMetadata` path, which would
+		// trip the lower-indexed `ssrf_cloud_metadata_path` first) so the hostname rule is what
+		// fires; either way the block is attributed to SSRF.
+		assert_eq!(waf.inspect_str("url=http://metadata.google.internal/", "query").unwrap().rule_id, "ssrf_metadata_hostname");
+	}
+
+	#[test]
+	fn ssrf_obfuscated_loopback_keeps_false_positives_low() {
+		// Benign URLs and hex/number-bearing paths that are not obfuscated loopbacks must pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/redirect?to=https://example.com/0x-hex-guide", // "0x" not after "://"
+			"/blog/ipv6-addressing",                          // topic mention
+			"/docs/google-cloud-metadata-api",                // hyphenated words, not the hostname
+			"/colors?hex=0x7fddaa",                           // a hex color param, no "://"
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

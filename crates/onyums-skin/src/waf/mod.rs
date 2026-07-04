@@ -723,6 +723,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
 		Rule { id: "traversal_sensitive_file", category: WafCategory::PathTraversal, pattern: r"(?i)(/etc/passwd|/etc/shadow|boot\.ini|win\.ini)" },
 		Rule { id: "traversal_proc_self", category: WafCategory::PathTraversal, pattern: r"(?i)/proc/self/(environ|cmdline|fd|maps)" },
+		// Container / app-server internal artifacts exposed by a traversal or a misrouted
+		// request (OWASP-CRS 4.26.0 restricted-files growth): the Docker container marker,
+		// the macOS directory-metadata file, the Java servlet `META-INF/`/`WEB-INF/` internals,
+		// and — prefix-guarded so `/settings/profile` and `user.profile` stay clean — a
+		// dot-segment `.profile` shell startup file. <https://www.linuxcompatible.org/story/owasp-crs-4260-released>
+		Rule { id: "traversal_appserver_files", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.dockerenv\b|/\.ds_store\b|/(meta-inf|web-inf)/|/\.profile\b)" },
 		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
@@ -962,6 +968,40 @@ mod tests {
 	fn crs_growth_batch_two_keeps_false_positives_low() {
 		let waf = Waf::starter();
 		for uri in ["/files/upload", "/templates/starter-kit", "/docs/load-testing", "/blog/70-rules"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn crs_appserver_sensitive_files_match() {
+		// The CRS 4.26.0 restricted-files growth: container/app-server internal artifacts each
+		// attribute to the PathTraversal class.
+		let waf = Waf::starter();
+		for (uri, why) in [
+			("/.dockerenv", "docker container marker"),
+			("/assets/.DS_Store", "macOS directory metadata"),
+			("/WEB-INF/web.xml", "java servlet internals"),
+			("/META-INF/MANIFEST.MF", "jar/war manifest"),
+			("/.profile", "dot-segment shell startup file"),
+		] {
+			let v = waf.inspect(&parts("GET", uri));
+			assert_eq!(blocked(&v).rule_id, "traversal_appserver_files", "{uri} ({why}) should trip the appserver-files rule");
+		}
+	}
+
+	#[test]
+	fn crs_appserver_sensitive_files_keep_false_positives_low() {
+		// The prefix guards keep look-alike benign paths clean: a `profile` page (no dot
+		// segment), a `.profiles` plural (word-boundary guard), and paths that merely mention
+		// the framework directory names as ordinary words must still pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/settings/profile",      // profile page, no `/.profile` dot segment
+			"/users/.profiles",       // plural, guarded by the trailing \b
+			"/blog/web-infrastructure", // "web-inf" as a substring of a word, not `/web-inf/`
+			"/docs/meta-information", // "meta-inf" as a substring, not the `/meta-inf/` dir
+			"/store/checkout",        // "store" is not `.ds_store`
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

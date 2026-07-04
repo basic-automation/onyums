@@ -7,7 +7,8 @@
 //! pass and uses `aho-corasick` internally for literal prefiltering, so adding more
 //! signatures stays cheap. The starter ruleset covers the classic signature classes
 //! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection / SSRF /
-//! server-side code & expression injection / protocol anomalies); it is **not**
+//! server-side code & expression injection / protocol anomalies / security-scanner
+//! fingerprints); it is **not**
 //! OWASP-CRS-complete — the 100%-Rust rule (no
 //! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
 //! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
@@ -85,11 +86,19 @@ pub enum WafCategory {
 	Xxe,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
+	/// Security-scanner / attack-tool fingerprint: a request that self-identifies as a known
+	/// offensive tool (sqlmap, nikto, ghauri, WhatWAF, nuclei, …) — usually via its
+	/// `User-Agent`, though the signature matches wherever the token appears. This is the
+	/// OWASP-CRS 913xxx "scanner detection" tier ported to the pure-Rust engine. It keys on a
+	/// literal *value in the request*, so it needs no client IP and survives directly over Tor;
+	/// it *complements* the softer [`BotHeuristics`](crate::bot::BotHeuristics) score by hard
+	/// blocking the unambiguously-hostile tools rather than merely weighting them.
+	ScannerDetection,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 10] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe];
+	pub const ALL: [WafCategory; 11] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -105,6 +114,7 @@ impl WafCategory {
 			Self::LdapInjection => "ldap_injection",
 			Self::Xxe => "xxe",
 			Self::ProtocolAnomaly => "protocol_anomaly",
+			Self::ScannerDetection => "scanner_detection",
 		}
 	}
 
@@ -117,7 +127,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -138,6 +148,7 @@ impl WafCategory {
 			Self::NoSqlInjection => 7,
 			Self::LdapInjection => 8,
 			Self::Xxe => 9,
+			Self::ScannerDetection => 10,
 		}
 	}
 }
@@ -764,6 +775,17 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
 		Rule { id: "anomaly_shellshock", category: WafCategory::ProtocolAnomaly, pattern: r"\(\)\s*\{" },
+		// --- Security-scanner / attack-tool fingerprints (OWASP-CRS 913xxx port) ---
+		// A self-identifying offensive tool, keyed on its `name/version` token (the form a tool's
+		// `User-Agent` carries). Requiring the trailing `/` is the false-positive guard: prose that
+		// merely *mentions* a tool (`/docs/sqlmap-guide`, `?q=how+to+use+wpscan`) lacks the version
+		// slash, so it stays clean, while a real `sqlmap/1.7`, `Nikto/2.1.6`, `ghauri/1.x`,
+		// `WhatWAF/…` UA trips. ghauri + WhatWAF are the CRS 4.26.0 additions.
+		// <https://www.linuxcompatible.org/story/owasp-crs-4260-released>
+		Rule { id: "scanner_security_tool", category: WafCategory::ScannerDetection, pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|gobuster|feroxbuster|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/" },
+		// Nmap's HTTP probe (NSE) carries a distinctive multi-word phrase rather than a `name/`
+		// version token, so it gets its own signature.
+		Rule { id: "scanner_nmap_nse", category: WafCategory::ScannerDetection, pattern: r"(?i)nmap scripting engine" },
 	]
 }
 
@@ -1514,6 +1536,55 @@ mod tests {
 		assert_eq!(WafCategory::Xxe.name(), "xxe");
 		assert_eq!(WafCategory::Xxe.weight(), WafCategory::Sqli.weight());
 		// The index is still a bijection over every category.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn scanner_detection_rules_match() {
+		// A self-identifying attack tool trips the ScannerDetection class wherever its
+		// `name/version` token lands — most naturally in the User-Agent header.
+		let waf = Waf::starter();
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "sqlmap/1.7.2#stable (http://sqlmap.org)".parse().unwrap());
+		let v = waf.inspect(&p);
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, "scanner_security_tool");
+		assert_eq!(m.category, WafCategory::ScannerDetection);
+		assert_eq!(m.location, "header:user-agent");
+		// The CRS 4.26.0 additions (ghauri, WhatWAF) and a classic (Nikto) all fire.
+		for ua in ["Mozilla/5.00 (Nikto/2.1.6)", "ghauri/1.3", "WhatWAF/2.0", "nuclei/3.1.0"] {
+			assert_eq!(waf.inspect_str(ua, "header:user-agent").unwrap().category, WafCategory::ScannerDetection, "{ua} should trip scanner detection");
+		}
+		// Nmap's NSE probe (no version slash) has its own rule.
+		assert_eq!(waf.inspect_str("Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org)", "header:user-agent").unwrap().rule_id, "scanner_nmap_nse");
+	}
+
+	#[test]
+	fn scanner_detection_keeps_false_positives_low() {
+		// The trailing-slash guard keeps prose that merely *names* a tool clean: a docs path,
+		// a blog comparison, and a search query (where `+` folds to a space) all pass because
+		// none carry the `name/version` token a real tool UA does.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/sqlmap-detection-guide",   // "sqlmap-", no version slash
+			"/blog/nikto-vs-nuclei",          // tool names as words, no slash
+			"/tools/nmap-cheatsheet",         // "nmap-", not the NSE phrase
+			"/search?q=how+to+use+wpscan",    // folds to "how to use wpscan", no slash
+			"/about/security-scanners",       // generic mention
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn scanner_category_metadata_is_stable() {
+		assert_eq!(WafCategory::ScannerDetection.name(), "scanner_detection");
+		assert_eq!(WafCategory::ScannerDetection.weight(), WafCategory::Sqli.weight());
+		assert_eq!(WafCategory::ALL[WafCategory::ScannerDetection.index()], WafCategory::ScannerDetection);
+		// The index is still a bijection over every category (now eleven).
+		assert_eq!(WafCategory::ALL.len(), 11);
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}

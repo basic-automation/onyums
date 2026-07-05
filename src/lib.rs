@@ -56,11 +56,13 @@ use onyums_skin::CircuitId;
 pub use {arti_client, tor_cell, tor_cert, tor_hscrypto, tor_hsservice, tor_llcrypto, tor_proto, tor_rtcompat};
 
 mod circuit_gate;
+mod client_auth;
 mod port_router;
 mod raw_tcp;
 mod provided_cert;
 mod tls_policy;
 mod vanity;
+pub use client_auth::ClientAuthKeypair;
 pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeFuture, StreamHandler};
 pub use raw_tcp::RawTcpHandler;
 pub use provided_cert::ProvidedCert;

@@ -107,7 +107,73 @@ impl ClientAuthKeypair {
 		let host = address.as_str().trim_end_matches(".onion");
 		format!("{host}:{KEY_PREFIX}{}", self.secret_base32())
 	}
+
+	/// Parse a `descriptor:x25519:<BASE32>` line carrying a *secret* key back into a
+	/// keypair, re-deriving the public half. This is the inverse of
+	/// [`secret_descriptor_line`](Self::secret_descriptor_line), completing the
+	/// import/export round-trip — an operator (or a client re-reading its own config)
+	/// can recover the keypair, and hence the authorized public key, from the stored
+	/// secret line.
+	///
+	/// Surrounding whitespace is trimmed; the `descriptor:x25519:` prefix is required.
+	///
+	/// # Errors
+	/// Returns [`ClientAuthKeypairError`] if the prefix is missing, the base32 is
+	/// malformed or non-canonical, or the key is not 32 bytes.
+	pub fn from_secret_descriptor_line(line: &str) -> Result<Self, ClientAuthKeypairError> {
+		let b32 = line.trim().strip_prefix(KEY_PREFIX).ok_or(ClientAuthKeypairError::MissingPrefix)?;
+		let bytes = base32_decode(b32)?;
+		let secret: [u8; 32] = bytes.as_slice().try_into().map_err(|_| ClientAuthKeypairError::WrongLength(bytes.len()))?;
+		Ok(Self::from_secret_bytes(secret))
+	}
+
+	/// Parse a full client-side `.auth_private` file body
+	/// `<host>:descriptor:x25519:<BASE32-secret>` — the inverse of
+	/// [`auth_private_line`](Self::auth_private_line) — returning the derived keypair
+	/// and the [`OnionAddress`] it is scoped to. The host is taken verbatim (with a
+	/// `.onion` suffix normalized on) exactly as [`auth_private_line`] wrote it; like
+	/// [`OnionAddress::normalized`] it is not re-validated as a real v3 address.
+	///
+	/// # Errors
+	/// Returns [`ClientAuthKeypairError::MissingHost`] if there is no `<host>:` prefix,
+	/// otherwise the same errors as [`from_secret_descriptor_line`](Self::from_secret_descriptor_line).
+	pub fn from_auth_private_line(line: &str) -> Result<(OnionAddress, Self), ClientAuthKeypairError> {
+		let (host, descriptor) = line.trim().split_once(':').ok_or(ClientAuthKeypairError::MissingHost)?;
+		let keypair = Self::from_secret_descriptor_line(descriptor)?;
+		Ok((OnionAddress::normalized(host), keypair))
+	}
 }
+
+/// Why parsing a [`ClientAuthKeypair`] from its text form failed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClientAuthKeypairError {
+	/// A `.auth_private` line had no `<host>:` prefix before the descriptor.
+	MissingHost,
+	/// The descriptor did not start with `descriptor:x25519:`.
+	MissingPrefix,
+	/// A character outside the RFC 4648 base32 alphabet was found (the byte offset
+	/// into the base32 portion).
+	InvalidChar(usize),
+	/// Trailing (padding) bits after the last full byte were non-zero — a
+	/// non-canonical encoding.
+	NonCanonical,
+	/// The key decoded to a length other than the required 32 bytes.
+	WrongLength(usize),
+}
+
+impl std::fmt::Display for ClientAuthKeypairError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::MissingHost => write!(f, "`.auth_private` line must start with `<host>:`"),
+			Self::MissingPrefix => write!(f, "client-auth secret must start with `{KEY_PREFIX}`"),
+			Self::InvalidChar(pos) => write!(f, "invalid base32 character at position {pos}"),
+			Self::NonCanonical => write!(f, "non-canonical base32: trailing bits are not zero"),
+			Self::WrongLength(len) => write!(f, "client-auth secret must be 32 bytes, got {len}"),
+		}
+	}
+}
+
+impl std::error::Error for ClientAuthKeypairError {}
 
 impl std::fmt::Debug for ClientAuthKeypair {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -137,6 +203,39 @@ fn base32_encode(bytes: &[u8]) -> String {
 		out.push(BASE32_ALPHABET[idx] as char);
 	}
 	out
+}
+
+/// Decode an RFC 4648 base32 string (either case, unpadded) into bytes, rejecting
+/// out-of-alphabet characters and non-zero trailing (padding) bits. The inverse of
+/// [`base32_encode`].
+fn base32_decode(s: &str) -> Result<Vec<u8>, ClientAuthKeypairError> {
+	let mut out = Vec::with_capacity(s.len() * 5 / 8);
+	let mut buffer: u64 = 0;
+	let mut bits: u32 = 0;
+	for (i, c) in s.bytes().enumerate() {
+		let val = base32_value(c).ok_or(ClientAuthKeypairError::InvalidChar(i))?;
+		buffer = (buffer << 5) | u64::from(val);
+		bits += 5;
+		if bits >= 8 {
+			bits -= 8;
+			out.push(((buffer >> bits) & 0xff) as u8);
+		}
+	}
+	if bits > 0 && (buffer & ((1 << bits) - 1)) != 0 {
+		return Err(ClientAuthKeypairError::NonCanonical);
+	}
+	Ok(out)
+}
+
+/// Map one base32 character (either case) to its 5-bit value, or `None` if it is
+/// not in the RFC 4648 alphabet.
+const fn base32_value(c: u8) -> Option<u8> {
+	match c {
+		b'A'..=b'Z' => Some(c - b'A'),
+		b'a'..=b'z' => Some(c - b'a'),
+		b'2'..=b'7' => Some(c - b'2' + 26),
+		_ => None,
+	}
 }
 
 #[cfg(test)]
@@ -212,6 +311,50 @@ mod tests {
 		// A freshly generated public key renders a valid canonical allowlist line.
 		let reparsed: ClientAuthKey = a.public_key().to_string().parse().expect("generated key parses");
 		assert_eq!(reparsed, a.public_key());
+	}
+
+	#[test]
+	fn secret_descriptor_line_round_trips() {
+		let pair = ClientAuthKeypair::from_secret_bytes(SECRET);
+		let line = pair.secret_descriptor_line();
+		let parsed = ClientAuthKeypair::from_secret_descriptor_line(&line).expect("parses");
+		assert_eq!(parsed.secret_bytes(), pair.secret_bytes());
+		assert_eq!(parsed.public_key(), pair.public_key());
+		// Whitespace tolerance.
+		let padded = format!("  {line}\n");
+		assert_eq!(ClientAuthKeypair::from_secret_descriptor_line(&padded).expect("parses").secret_bytes(), SECRET);
+	}
+
+	#[test]
+	fn auth_private_line_round_trips() {
+		let pair = ClientAuthKeypair::from_secret_bytes(SECRET);
+		let address = OnionAddress::normalized("abcdefghij.onion");
+		let line = pair.auth_private_line(&address);
+		let (parsed_addr, parsed) = ClientAuthKeypair::from_auth_private_line(&line).expect("parses");
+		assert_eq!(parsed_addr.as_str(), address.as_str());
+		assert_eq!(parsed.secret_bytes(), SECRET);
+		assert_eq!(parsed.public_key(), pair.public_key());
+	}
+
+	#[test]
+	fn parse_rejects_malformed_input() {
+		use ClientAuthKeypairError as E;
+		// Missing prefix.
+		assert_eq!(ClientAuthKeypair::from_secret_descriptor_line("x25519:AAAA").unwrap_err(), E::MissingPrefix);
+		// Out-of-alphabet character (`1` is not in the base32 alphabet).
+		assert!(matches!(ClientAuthKeypair::from_secret_descriptor_line("descriptor:x25519:1111"), Err(E::InvalidChar(_))));
+		// Wrong length: valid base32 but not 32 bytes.
+		assert!(matches!(ClientAuthKeypair::from_secret_descriptor_line("descriptor:x25519:AAAA"), Err(E::WrongLength(_))));
+		// `.auth_private` line with no host prefix.
+		assert_eq!(ClientAuthKeypair::from_auth_private_line("descriptorx25519nohost").unwrap_err(), E::MissingHost);
+	}
+
+	#[test]
+	fn base32_round_trips_and_rejects_noncanonical() {
+		let decoded = base32_decode(&base32_encode(&SECRET)).expect("round trips");
+		assert_eq!(decoded, SECRET);
+		// `AB` decodes to one byte with non-zero trailing bits → non-canonical.
+		assert_eq!(base32_decode("AB"), Err(ClientAuthKeypairError::NonCanonical));
 	}
 
 	#[test]

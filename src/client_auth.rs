@@ -24,7 +24,7 @@
 use rand::RngCore;
 use tor_llcrypto::pk::curve25519::{PublicKey, StaticSecret};
 
-use crate::{ClientAuthKey, OnionAddress};
+use crate::{ClientAuthKey, OnionAddress, RestrictedDiscovery};
 
 /// The `descriptor:x25519:` prefix Tor writes before the base32 key in both the
 /// server-side `<name>.auth` file and the client-side `.auth_private` line.
@@ -174,6 +174,25 @@ impl std::fmt::Display for ClientAuthKeypairError {
 }
 
 impl std::error::Error for ClientAuthKeypairError {}
+
+/// Provision a fresh authorized client for restricted discovery in one step.
+///
+/// Generates a keypair, authorizes its **public** half into `allowlist` under
+/// `nickname`, and returns the keypair so the operator can hand the client its
+/// [`auth_private_line`](ClientAuthKeypair::auth_private_line).
+///
+/// This is the onboarding capstone tying [`ClientAuthKeypair::generate`] to the
+/// [`RestrictedDiscovery`] allowlist the
+/// [`authorized_clients`](crate::OnionServiceBuilder::authorized_clients) builder
+/// consumes. If `nickname` was already authorized, its key is replaced — the
+/// returned keypair is the one now in effect. Only the public half is retained by
+/// the service; the secret lives solely in the returned keypair and must reach the
+/// client over a trusted channel.
+pub fn provision_client(allowlist: &mut RestrictedDiscovery, nickname: impl Into<String>) -> ClientAuthKeypair {
+	let keypair = ClientAuthKeypair::generate();
+	allowlist.authorize(nickname, keypair.public_key());
+	keypair
+}
 
 impl std::fmt::Debug for ClientAuthKeypair {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -355,6 +374,30 @@ mod tests {
 		assert_eq!(decoded, SECRET);
 		// `AB` decodes to one byte with non-zero trailing bits → non-canonical.
 		assert_eq!(base32_decode("AB"), Err(ClientAuthKeypairError::NonCanonical));
+	}
+
+	#[test]
+	fn provision_client_authorizes_the_public_half() {
+		let mut allowlist = RestrictedDiscovery::new();
+		let keypair = provision_client(&mut allowlist, "alice");
+		// The allowlist now carries exactly the public half under the nickname.
+		assert_eq!(allowlist.len(), 1);
+		assert_eq!(allowlist.key_for("alice"), Some(&keypair.public_key()));
+		assert!(allowlist.is_authorized(&keypair.public_key()));
+		// The `.auth` file body matches the keypair's public canonical line.
+		let files = allowlist.to_auth_files();
+		assert_eq!(files.get("alice.auth").map(String::as_str), Some(format!("{}\n", keypair.public_key()).as_str()));
+	}
+
+	#[test]
+	fn provision_client_replaces_an_existing_nickname() {
+		let mut allowlist = RestrictedDiscovery::new();
+		let first = provision_client(&mut allowlist, "bob");
+		let second = provision_client(&mut allowlist, "bob");
+		assert_eq!(allowlist.len(), 1);
+		// The nickname now maps to the second keypair; the first is displaced.
+		assert_eq!(allowlist.key_for("bob"), Some(&second.public_key()));
+		assert!(!allowlist.is_authorized(&first.public_key()));
 	}
 
 	#[test]

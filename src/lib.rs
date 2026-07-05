@@ -62,7 +62,7 @@ mod raw_tcp;
 mod provided_cert;
 mod tls_policy;
 mod vanity;
-pub use client_auth::{ClientAuthKeypair, ClientAuthKeypairError};
+pub use client_auth::{provision_client, ClientAuthKeypair, ClientAuthKeypairError};
 pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeFuture, StreamHandler};
 pub use raw_tcp::RawTcpHandler;
 pub use provided_cert::ProvidedCert;

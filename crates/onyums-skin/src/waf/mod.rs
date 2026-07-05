@@ -7,7 +7,8 @@
 //! pass and uses `aho-corasick` internally for literal prefiltering, so adding more
 //! signatures stays cheap. The starter ruleset covers the classic signature classes
 //! (SQLi / XSS / path traversal & file-inclusion wrappers / OS command injection / SSRF /
-//! server-side code & expression injection / protocol anomalies); it is **not**
+//! server-side code & expression injection / protocol anomalies / security-scanner
+//! fingerprints); it is **not**
 //! OWASP-CRS-complete — the 100%-Rust rule (no
 //! Coraza/ModSecurity FFI) means CRS coverage is reached by porting rules into this
 //! engine, never by linking a foreign one. Rules are operator-extensible: [`Waf::new`]
@@ -85,11 +86,19 @@ pub enum WafCategory {
 	Xxe,
 	/// Malformed or anomalous protocol input (control chars, header injection).
 	ProtocolAnomaly,
+	/// Security-scanner / attack-tool fingerprint: a request that self-identifies as a known
+	/// offensive tool (sqlmap, nikto, ghauri, WhatWAF, nuclei, …) — usually via its
+	/// `User-Agent`, though the signature matches wherever the token appears. This is the
+	/// OWASP-CRS 913xxx "scanner detection" tier ported to the pure-Rust engine. It keys on a
+	/// literal *value in the request*, so it needs no client IP and survives directly over Tor;
+	/// it *complements* the softer [`BotHeuristics`](crate::bot::BotHeuristics) score by hard
+	/// blocking the unambiguously-hostile tools rather than merely weighting them.
+	ScannerDetection,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 10] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe];
+	pub const ALL: [WafCategory; 11] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -105,6 +114,7 @@ impl WafCategory {
 			Self::LdapInjection => "ldap_injection",
 			Self::Xxe => "xxe",
 			Self::ProtocolAnomaly => "protocol_anomaly",
+			Self::ScannerDetection => "scanner_detection",
 		}
 	}
 
@@ -117,7 +127,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -138,6 +148,7 @@ impl WafCategory {
 			Self::NoSqlInjection => 7,
 			Self::LdapInjection => 8,
 			Self::Xxe => 9,
+			Self::ScannerDetection => 10,
 		}
 	}
 }
@@ -723,6 +734,22 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
 		Rule { id: "traversal_sensitive_file", category: WafCategory::PathTraversal, pattern: r"(?i)(/etc/passwd|/etc/shadow|boot\.ini|win\.ini)" },
 		Rule { id: "traversal_proc_self", category: WafCategory::PathTraversal, pattern: r"(?i)/proc/self/(environ|cmdline|fd|maps)" },
+		// Container / app-server internal artifacts exposed by a traversal or a misrouted
+		// request (OWASP-CRS 4.26.0 restricted-files growth): the Docker container marker,
+		// the macOS directory-metadata file, the Java servlet `META-INF/`/`WEB-INF/` internals,
+		// and — prefix-guarded so `/settings/profile` and `user.profile` stay clean — a
+		// dot-segment `.profile` shell startup file. <https://www.linuxcompatible.org/story/owasp-crs-4260-released>
+		Rule { id: "traversal_appserver_files", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.dockerenv\b|/\.ds_store\b|/(meta-inf|web-inf)/|/\.profile\b)" },
+		// Version-control metadata, framework dotfile configs, and secrets files probed over
+		// HTTP (OWASP-CRS restricted-files access, `RESTRICTED_FILES` / rule 930130): a `.git/`
+		// tree leak, an Apache `.htaccess`/`.htpasswd`, an IIS `web.config`, or the classic
+		// `/.env` secrets grab. Dot-segment/enclosing-slash anchored so `/.environment` and
+		// `/settings/gitignore-help` stay clean.
+		Rule { id: "traversal_vcs_config_files", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.git/|/\.svn/|/\.hg/|/\.bzr/|/\.env\b|/\.htaccess\b|/\.htpasswd\b|/\.gitignore\b|/web\.config\b)" },
+		// Editor/database backup & swap artifacts left in the webroot — a `config.php.bak`, a
+		// SQL dump, a vim `.swp`. High-signal source/secret disclosure; an operator serving such
+		// files deliberately can `disable_rule("traversal_backup_files")`.
+		Rule { id: "traversal_backup_files", category: WafCategory::PathTraversal, pattern: r"(?i)\.(bak|swp|swo|sql|dump)\b" },
 		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
@@ -735,6 +762,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
 		Rule { id: "ssrf_decimal_ip", category: WafCategory::Ssrf, pattern: r"(?i)\bhttps?://\d{8,10}(?:[:/]|\b)" },
+		// Obfuscated-loopback SSRF: the classic WAF-bypass encodings of 127.0.0.1 that the
+		// literal `ssrf_loopback_url` rule misses — hex host (`0x7f000001` / `0x7f.0.0.1`),
+		// octal host (`0177.0.0.1` / packed `017700000001`), and the IPv4-mapped IPv6 form
+		// (`[::ffff:127.0.0.1]`). Decimal (`2130706433`) is already caught by `ssrf_decimal_ip`.
+		Rule { id: "ssrf_obfuscated_loopback", category: WafCategory::Ssrf, pattern: r"(?i)://(0x0*7f[0-9a-f]{0,6}|0177[.0-7]|017700000001|\[::ffff:127\.0\.0\.1\])" },
+		// Cloud metadata reachable by DNS name rather than the 169.254.169.254 link-local IP —
+		// GCP's `metadata.google.internal`. A value-inspection SSRF target the IP/path rules miss.
+		Rule { id: "ssrf_metadata_hostname", category: WafCategory::Ssrf, pattern: r"(?i)\bmetadata\.google\.internal\b" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
@@ -758,6 +793,17 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
 		Rule { id: "anomaly_shellshock", category: WafCategory::ProtocolAnomaly, pattern: r"\(\)\s*\{" },
+		// --- Security-scanner / attack-tool fingerprints (OWASP-CRS 913xxx port) ---
+		// A self-identifying offensive tool, keyed on its `name/version` token (the form a tool's
+		// `User-Agent` carries). Requiring the trailing `/` is the false-positive guard: prose that
+		// merely *mentions* a tool (`/docs/sqlmap-guide`, `?q=how+to+use+wpscan`) lacks the version
+		// slash, so it stays clean, while a real `sqlmap/1.7`, `Nikto/2.1.6`, `ghauri/1.x`,
+		// `WhatWAF/…` UA trips. ghauri + WhatWAF are the CRS 4.26.0 additions.
+		// <https://www.linuxcompatible.org/story/owasp-crs-4260-released>
+		Rule { id: "scanner_security_tool", category: WafCategory::ScannerDetection, pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|gobuster|feroxbuster|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/" },
+		// Nmap's HTTP probe (NSE) carries a distinctive multi-word phrase rather than a `name/`
+		// version token, so it gets its own signature.
+		Rule { id: "scanner_nmap_nse", category: WafCategory::ScannerDetection, pattern: r"(?i)nmap scripting engine" },
 	]
 }
 
@@ -962,6 +1008,40 @@ mod tests {
 	fn crs_growth_batch_two_keeps_false_positives_low() {
 		let waf = Waf::starter();
 		for uri in ["/files/upload", "/templates/starter-kit", "/docs/load-testing", "/blog/70-rules"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn crs_appserver_sensitive_files_match() {
+		// The CRS 4.26.0 restricted-files growth: container/app-server internal artifacts each
+		// attribute to the PathTraversal class.
+		let waf = Waf::starter();
+		for (uri, why) in [
+			("/.dockerenv", "docker container marker"),
+			("/assets/.DS_Store", "macOS directory metadata"),
+			("/WEB-INF/web.xml", "java servlet internals"),
+			("/META-INF/MANIFEST.MF", "jar/war manifest"),
+			("/.profile", "dot-segment shell startup file"),
+		] {
+			let v = waf.inspect(&parts("GET", uri));
+			assert_eq!(blocked(&v).rule_id, "traversal_appserver_files", "{uri} ({why}) should trip the appserver-files rule");
+		}
+	}
+
+	#[test]
+	fn crs_appserver_sensitive_files_keep_false_positives_low() {
+		// The prefix guards keep look-alike benign paths clean: a `profile` page (no dot
+		// segment), a `.profiles` plural (word-boundary guard), and paths that merely mention
+		// the framework directory names as ordinary words must still pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/settings/profile",      // profile page, no `/.profile` dot segment
+			"/users/.profiles",       // plural, guarded by the trailing \b
+			"/blog/web-infrastructure", // "web-inf" as a substring of a word, not `/web-inf/`
+			"/docs/meta-information", // "meta-inf" as a substring, not the `/meta-inf/` dir
+			"/store/checkout",        // "store" is not `.ds_store`
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
@@ -1349,6 +1429,39 @@ mod tests {
 	}
 
 	#[test]
+	fn ssrf_obfuscated_loopback_is_blocked() {
+		// The obfuscated 127.0.0.1 encodings a naive literal rule misses all attribute to SSRF.
+		let waf = Waf::starter();
+		for u in [
+			"url=http://0x7f000001/latest",          // packed hex
+			"url=http://0x7f.0.0.1/x",                // dotted hex
+			"url=http://0177.0.0.1/admin",            // dotted octal
+			"url=http://017700000001/",               // packed octal
+			"url=http://[::ffff:127.0.0.1]/meta",     // IPv4-mapped IPv6
+		] {
+			assert_eq!(waf.inspect_str(u, "query").unwrap().rule_id, "ssrf_obfuscated_loopback", "{u} should trip obfuscated-loopback SSRF");
+		}
+		// GCP metadata by DNS name. Use the bare host (no `/computeMetadata` path, which would
+		// trip the lower-indexed `ssrf_cloud_metadata_path` first) so the hostname rule is what
+		// fires; either way the block is attributed to SSRF.
+		assert_eq!(waf.inspect_str("url=http://metadata.google.internal/", "query").unwrap().rule_id, "ssrf_metadata_hostname");
+	}
+
+	#[test]
+	fn ssrf_obfuscated_loopback_keeps_false_positives_low() {
+		// Benign URLs and hex/number-bearing paths that are not obfuscated loopbacks must pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/redirect?to=https://example.com/0x-hex-guide", // "0x" not after "://"
+			"/blog/ipv6-addressing",                          // topic mention
+			"/docs/google-cloud-metadata-api",                // hyphenated words, not the hostname
+			"/colors?hex=0x7fddaa",                           // a hex color param, no "://"
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn ssrf_category_metadata_is_stable() {
 		assert_eq!(WafCategory::Ssrf.name(), "ssrf");
 		assert_eq!(WafCategory::ALL[WafCategory::Ssrf.index()], WafCategory::Ssrf);
@@ -1474,6 +1587,95 @@ mod tests {
 		assert_eq!(WafCategory::Xxe.name(), "xxe");
 		assert_eq!(WafCategory::Xxe.weight(), WafCategory::Sqli.weight());
 		// The index is still a bijection over every category.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
+	fn crs_restricted_file_access_matches() {
+		// VCS trees, framework configs, secrets files, and backup/dump artifacts all attribute
+		// to the PathTraversal class.
+		let waf = Waf::starter();
+		for (uri, rule) in [
+			("/.git/config", "traversal_vcs_config_files"),
+			("/.svn/entries", "traversal_vcs_config_files"),
+			("/.env", "traversal_vcs_config_files"),
+			("/.env.production", "traversal_vcs_config_files"),
+			("/.htaccess", "traversal_vcs_config_files"),
+			("/web.config", "traversal_vcs_config_files"),
+			("/backups/db.sql", "traversal_backup_files"),
+			("/wp-config.php.bak", "traversal_backup_files"),
+			("/index.php.swp", "traversal_backup_files"),
+		] {
+			let v = waf.inspect(&parts("GET", uri));
+			let m = blocked(&v);
+			assert_eq!(m.rule_id, rule, "{uri} should trip {rule}");
+			assert_eq!(m.category, WafCategory::PathTraversal);
+		}
+	}
+
+	#[test]
+	fn crs_restricted_file_access_keeps_false_positives_low() {
+		// Look-alikes without the dot segment / enclosing slash, and paths that merely mention
+		// the tokens as words, must still pass.
+		let waf = Waf::starter();
+		for uri in [
+			"/.environment-vars-guide",  // `.env` guarded by \b, "environment" != ".env\b"
+			"/settings/gitignore-help",  // no `/.gitignore` dot segment
+			"/blog/git-workflows",       // "git" as a word, not the `/.git/` tree
+			"/products/webcconfig-tool", // "webconfig" != "/web.config"
+			"/docs/backup-strategies",   // "backup" as a word, no `.bak` extension
+			"/blog/nosql-basics",        // "sql" inside "nosql", no `.sql` extension
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn scanner_detection_rules_match() {
+		// A self-identifying attack tool trips the ScannerDetection class wherever its
+		// `name/version` token lands — most naturally in the User-Agent header.
+		let waf = Waf::starter();
+		let mut p = parts("GET", "/");
+		p.headers.insert("user-agent", "sqlmap/1.7.2#stable (http://sqlmap.org)".parse().unwrap());
+		let v = waf.inspect(&p);
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, "scanner_security_tool");
+		assert_eq!(m.category, WafCategory::ScannerDetection);
+		assert_eq!(m.location, "header:user-agent");
+		// The CRS 4.26.0 additions (ghauri, WhatWAF) and a classic (Nikto) all fire.
+		for ua in ["Mozilla/5.00 (Nikto/2.1.6)", "ghauri/1.3", "WhatWAF/2.0", "nuclei/3.1.0"] {
+			assert_eq!(waf.inspect_str(ua, "header:user-agent").unwrap().category, WafCategory::ScannerDetection, "{ua} should trip scanner detection");
+		}
+		// Nmap's NSE probe (no version slash) has its own rule.
+		assert_eq!(waf.inspect_str("Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org)", "header:user-agent").unwrap().rule_id, "scanner_nmap_nse");
+	}
+
+	#[test]
+	fn scanner_detection_keeps_false_positives_low() {
+		// The trailing-slash guard keeps prose that merely *names* a tool clean: a docs path,
+		// a blog comparison, and a search query (where `+` folds to a space) all pass because
+		// none carry the `name/version` token a real tool UA does.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/sqlmap-detection-guide",   // "sqlmap-", no version slash
+			"/blog/nikto-vs-nuclei",          // tool names as words, no slash
+			"/tools/nmap-cheatsheet",         // "nmap-", not the NSE phrase
+			"/search?q=how+to+use+wpscan",    // folds to "how to use wpscan", no slash
+			"/about/security-scanners",       // generic mention
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn scanner_category_metadata_is_stable() {
+		assert_eq!(WafCategory::ScannerDetection.name(), "scanner_detection");
+		assert_eq!(WafCategory::ScannerDetection.weight(), WafCategory::Sqli.weight());
+		assert_eq!(WafCategory::ALL[WafCategory::ScannerDetection.index()], WafCategory::ScannerDetection);
+		// The index is still a bijection over every category (now eleven).
+		assert_eq!(WafCategory::ALL.len(), 11);
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}

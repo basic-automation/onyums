@@ -27,8 +27,11 @@ let gated: Router = app.layer(Skin::secure_default().into_layer());
 Built out: the gate core (PoW/tarpit challenge chain, `hmac`-signed clearance,
 `governor` rate limiting), the Tor dimension (`CircuitPolicy` + `AccountingCircuitPolicy`
 with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
-expression language + curated ruleset + anomaly scoring + operator-authored custom
-rules), observability (typed `SecurityEvent`s, metrics, request-shape baselining), and
+expression language + a curated OWASP-CRS-derived ruleset — injection/XSS/traversal/SSRF
+plus restricted-file access and a `ScannerDetection` class that hard-blocks
+self-identifying attack tools like sqlmap/nikto/ghauri/nuclei — anomaly scoring, and
+operator-authored custom rules), observability (typed `SecurityEvent`s, metrics,
+request-shape baselining), and
 Phase-5 frontier work: JA4H fingerprinting, request-shape bot heuristics, an opt-in
 EquiX PoW backend, edge rules and response caching **wired into the gate**, multi-instance
 clearance-key coordination, and **restricted-discovery orchestration** (below).

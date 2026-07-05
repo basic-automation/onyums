@@ -188,6 +188,29 @@ impl std::error::Error for ClientAuthKeypairError {}
 /// returned keypair is the one now in effect. Only the public half is retained by
 /// the service; the secret lives solely in the returned keypair and must reach the
 /// client over a trusted channel.
+///
+/// # Example
+/// ```
+/// use onyums::{provision_client, ClientAuthKeypair, OnionAddress, RestrictedDiscovery};
+///
+/// // Operator side: provision a client into a restricted-discovery allowlist.
+/// let mut allowlist = RestrictedDiscovery::new();
+/// let alice = provision_client(&mut allowlist, "alice");
+/// assert!(allowlist.is_authorized(&alice.public_key()));
+///
+/// // The allowlist feeds the builder via `.authorized_clients(allowlist)`, and
+/// // renders the server-side `authorized_clients/alice.auth` file body.
+/// assert!(allowlist.to_auth_files().contains_key("alice.auth"));
+///
+/// // Client side: hand Alice the `.auth_private` line for her ClientOnionAuthDir.
+/// let address = OnionAddress::normalized("examplev3address.onion");
+/// let line = alice.auth_private_line(&address);
+///
+/// // The keypair (and hence the authorized public key) round-trips back from it.
+/// let (addr, recovered) = ClientAuthKeypair::from_auth_private_line(&line).unwrap();
+/// assert_eq!(recovered.public_key(), alice.public_key());
+/// assert_eq!(addr.as_str(), address.as_str());
+/// ```
 pub fn provision_client(allowlist: &mut RestrictedDiscovery, nickname: impl Into<String>) -> ClientAuthKeypair {
 	let keypair = ClientAuthKeypair::generate();
 	allowlist.authorize(nickname, keypair.public_key());

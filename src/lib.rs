@@ -5,7 +5,7 @@
 //! Onyums is a simple axum wrapper for serving tor onion services.
 //!
 //! # Example
-//! ```rust
+//! ```rust,no_run
 //! use onyums::{serve, routing::get, Router};
 //!
 //! #[tokio::main]
@@ -15,6 +15,8 @@
 //!     serve(app, "my_onion").await.unwrap();
 //! }
 //! ```
+//! `no_run`: `serve` binds the live Tor network and runs until stopped, so the
+//! example is compiled and type-checked but never executed under `cargo test`.
 
 use std::{net::SocketAddr, sync::Mutex};
 

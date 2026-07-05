@@ -616,6 +616,21 @@ impl OnionServiceHandle {
 		project_service_status(self.service.status().state())
 	}
 
+	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
+	/// bootstrap → reachable → degraded lifecycle rather than poll
+	/// [`status`](Self::status) (onyums ROADMAP Phase 4).
+	///
+	/// Projects arti's `status_events()` through the same stable, exhaustive
+	/// [`ServiceStatus`] mapping as [`status`](Self::status), so downstreams match
+	/// without a wildcard and without breaking when arti adds a state. Backed by a
+	/// watch channel: the stream yields the current status immediately, then one item
+	/// per change (intermediate transitions between polls may be coalesced). The
+	/// stream is independent of this handle — it stays live for as long as the
+	/// underlying service does.
+	pub fn status_events(&self) -> impl Stream<Item = ServiceStatus> + use<> {
+		self.service.status_events().map(|status| project_service_status(status.state()))
+	}
+
 	/// Resolve once the service is believed to be fully reachable — its
 	/// descriptor is published and its introduction points are satisfactory.
 	///

@@ -826,6 +826,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
 		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
 		Rule { id: "xss_svg_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*svg\b" },
+		// HTML5 XSS vectors the small handler set above misses (OWASP-CRS 941 port). Newer event
+		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
+		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
+		Rule { id: "xss_html5_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(animation(start|end|iteration)|transitionend|pointer(over|down|enter|rawupdate)|beforetoggle|beforeprint|pageshow|hashchange|wheel)\s*=" },
+		// Injection-only attributes: an iframe `srcdoc` carrying inline markup, and a `formaction`
+		// that hijacks a form's submit target. Reflected into a response these are near-always an
+		// XSS vector; an operator legitimately reflecting them can disable this rule.
+		Rule { id: "xss_dangerous_attribute", category: WafCategory::Xss, pattern: r"(?i)\b(srcdoc|formaction)\s*=" },
 		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
@@ -1099,6 +1107,28 @@ mod tests {
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect_str("<iframe src=//evil", "target").unwrap().rule_id, "xss_iframe_tag");
 		assert_eq!(waf.inspect_str("href=data:text/html;base64,PHN2Zz4=", "target").unwrap().rule_id, "xss_data_html_uri");
+	}
+
+	#[test]
+	fn html5_xss_vectors_match() {
+		// The OWASP-CRS 941 HTML5 additions: newer auto-firing event handlers and the
+		// injection-only `srcdoc` / `formaction` attributes all attribute to the Xss class.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("x=<xss onanimationstart=alert(1)>", "query").unwrap().rule_id, "xss_html5_event_handler");
+		assert_eq!(waf.inspect_str("x=<a onpointerover=alert(1)>", "query").unwrap().rule_id, "xss_html5_event_handler");
+		assert_eq!(waf.inspect_str("x=<details ontoggle=alert(1)>", "query").unwrap().category, WafCategory::Xss);
+		assert_eq!(waf.inspect_str("x=<z srcdoc=PHNjcmlwdD4>", "query").unwrap().rule_id, "xss_dangerous_attribute");
+		assert_eq!(waf.inspect_str("x=<button formaction=javascript:alert(1)>", "query").unwrap().category, WafCategory::Xss);
+	}
+
+	#[test]
+	fn html5_xss_rules_keep_false_positives_low() {
+		// Params that merely start with `on`/contain `action` but are not event handlers or the
+		// dangerous attributes stay clean.
+		let waf = Waf::starter();
+		for uri in ["/settings?onboarding=done", "/form?action=save", "/docs/pointer-events-css", "/page?transition=fade"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

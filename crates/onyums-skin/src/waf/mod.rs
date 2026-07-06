@@ -889,6 +889,25 @@ pub fn starter_rules() -> Vec<Rule> {
 		// ordinary two-part names like `archive.tar.gz`, `photo.jpg.webp`, or `data.csv.zip` never
 		// end in an executable extension. <https://www.linuxcompatible.org/story/owasp-crs-4250-lts-and-339-released/>
 		Rule { id: "code_double_extension_upload", category: WafCategory::CodeInjection, pattern: r"(?i)\.(jpe?g|png|gif|bmp|webp|pdf|txt|docx?|xlsx?|csv|zip|gz|rar|html?)\s*\.(php[0-9]?|phtml|phar|jspx?|aspx?|cgi|pl|py|sh|exe|bat|cmd)\b" },
+		// PHP code injection (OWASP-CRS 933xxx port): an injected `<?php` / `<?=` open tag, a PHP
+		// superglobal reference (`$_GET`/`$_POST`/`$_REQUEST`/…) smuggled into input, and the
+		// PHP-specific command-exec / info-leak functions. Kept to PHP-unambiguous tokens
+		// (the open tag requires `php`/`=` so an XML `<?` processing instruction stays clean;
+		// the funcs are PHP-only names, not the generic `system`/`eval` shared with other langs)
+		// so false positives stay low. <https://coreruleset.org/>
+		Rule { id: "code_php_open_tag", category: WafCategory::CodeInjection, pattern: r"(?i)<\?(php|=)" },
+		Rule { id: "code_php_superglobal", category: WafCategory::CodeInjection, pattern: r"(?i)\$_(get|post|request|server|cookie|session|env|files)\b" },
+		Rule { id: "code_php_dangerous_call", category: WafCategory::CodeInjection, pattern: r"(?i)\b(phpinfo|shell_exec|passthru|proc_open|pcntl_exec|base64_decode)\s*\(" },
+		// Java / JVM code execution (OWASP-CRS 944xxx port): the `Runtime.getRuntime().exec(...)`
+		// idiom and `new ProcessBuilder(...)`, the two canonical JVM process-spawn gadgets that
+		// deserialization and OGNL/SpEL payloads reach for. Anchored on the fully-qualified Java
+		// idioms (not a bare `.exec(`, which JS regexes also use) to keep false positives low.
+		Rule { id: "code_java_runtime_exec", category: WafCategory::CodeInjection, pattern: r"(?i)(runtime\s*\.\s*getruntime\s*\(\s*\)|new\s+processbuilder\b)" },
+		// Node.js command execution (OWASP-CRS 934/node port): pulling in `child_process` or
+		// calling its exec/spawn family — the standard Node RCE sink behind prototype-pollution
+		// and template-injection chains. Keyed on the module require plus the `child_process.<fn>`
+		// call form, both Node-specific, so ordinary prose stays clean.
+		Rule { id: "code_node_child_process", category: WafCategory::CodeInjection, pattern: r#"(?i)(require\s*\(\s*['"]child_process['"]|child_process\s*\.\s*(exec|execsync|spawn|spawnsync|fork))"# },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -1731,6 +1750,45 @@ mod tests {
 		// Benign requests mentioning braces/dollars or the word "code" must still pass.
 		let waf = Waf::starter();
 		for uri in ["/articles/json-${schema}-guide", "/pricing?total=7", "/docs/php-serialization-explained", "/blog/clean-code-tips"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn php_code_injection_rules_match() {
+		// OWASP-CRS 933xxx PHP port: open tag, superglobal, and a PHP-specific dangerous call.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("t=<?php system($_GET[c]);?>", "query").unwrap().category, WafCategory::CodeInjection);
+		assert_eq!(waf.inspect_str("v=<?= 1 + 1 ?>", "query").unwrap().rule_id, "code_php_open_tag");
+		assert_eq!(waf.inspect_str("x=$_REQUEST[cmd]", "query").unwrap().rule_id, "code_php_superglobal");
+		assert_eq!(waf.inspect_str("q=phpinfo()", "query").unwrap().rule_id, "code_php_dangerous_call");
+		assert_eq!(waf.inspect_str("d=shell_exec ('ls')", "query").unwrap().rule_id, "code_php_dangerous_call");
+	}
+
+	#[test]
+	fn java_and_node_code_execution_rules_match() {
+		// OWASP-CRS 944/node port: the JVM process-spawn gadgets and the Node child_process sink.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("p=Runtime.getRuntime().exec('id')", "query").unwrap().rule_id, "code_java_runtime_exec");
+		assert_eq!(waf.inspect_str("p=new ProcessBuilder('sh','-c','id')", "query").unwrap().rule_id, "code_java_runtime_exec");
+		assert_eq!(waf.inspect_str("m=require('child_process').exec('id')", "query").unwrap().rule_id, "code_node_child_process");
+		assert_eq!(waf.inspect_str("m=child_process.spawnSync('id')", "query").unwrap().rule_id, "code_node_child_process");
+	}
+
+	#[test]
+	fn php_java_node_rules_keep_false_positives_low() {
+		// Prose and identifiers that brush near the new tokens but are not the attack forms stay
+		// clean: an XML processing instruction, a docs page mentioning the runtime, a variable
+		// named like a superglobal without the `$_` prefix, and a benign "child processes" page.
+		let waf = Waf::starter();
+		// A real `<?xml` processing instruction must not trip the PHP open-tag rule.
+		assert!(waf.inspect_str(r#"<?xml version="1.0"?>"#, "query").is_none(), "<?xml PI should not false-positive");
+		for uri in [
+			"/docs/java-runtime-environment",      // "runtime" as a word, no getRuntime() call
+			"/settings?get_posts=10",              // `get_posts`, not a `$_` superglobal
+			"/blog/understanding-child-processes", // "child process" prose, no require/call
+			"/api/base64-encoding-guide",          // mentions base64 without the decode call
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

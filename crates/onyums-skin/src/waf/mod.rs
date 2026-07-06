@@ -491,8 +491,17 @@ impl Waf {
 		}
 		// 4. Match the decoded form, but only when normalization actually changed it
 		//    (nothing encoded → raw was the whole story, already checked).
-		if norm.decoded != raw {
-			return self.match_raw(&norm.decoded, location);
+		if norm.decoded != raw
+			&& let Some(m) = self.match_raw(&norm.decoded, location)
+		{
+			return Some(m);
+		}
+		// 5. Match the comment-stripped, whitespace-collapsed form of the decoded string, to
+		//    close the whitespace/comment-padding evasion (`UNION/**/SELECT`, `AND  1=1`). Only
+		//    when the transform actually changed something (a plain payload skips this pass).
+		let stripped = strip_sql_comments_collapse_ws(&norm.decoded);
+		if stripped != norm.decoded {
+			return self.match_raw(&stripped, location);
 		}
 		None
 	}
@@ -587,6 +596,18 @@ impl Waf {
 			let mut decoded = Vec::new();
 			self.match_all_raw(&norm.decoded, location, &mut decoded);
 			for m in decoded {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// The comment-stripped / whitespace-collapsed form contributes its matches too, deduped
+		// by rule id within this field, so padding-evaded signatures still surface in scoring.
+		let stripped = strip_sql_comments_collapse_ws(&norm.decoded);
+		if stripped != norm.decoded {
+			let mut extra = Vec::new();
+			self.match_all_raw(&stripped, location, &mut extra);
+			for m in extra {
 				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
 					out.push(m);
 				}
@@ -689,6 +710,74 @@ fn percent_decode_once(input: &str) -> (String, bool) {
 		i += 1;
 	}
 	(String::from_utf8_lossy(&out).into_owned(), changed)
+}
+
+/// Strip SQL block comments and collapse internal whitespace, producing a canonical form for
+/// the WAF to match alongside the raw and percent-decoded forms. This closes the
+/// whitespace/comment-padding evasion class (OWASP-CRS 4.25.0 LTS rule 933111,
+/// CVE-2026-33691): an attacker splits a keyword sequence with `/**/` or excess whitespace
+/// (`UNION/**/SELECT`, `OR/**/1=1`, `id=1  AND  1=1`) to slip past a space-sensitive
+/// signature. Two transforms, in order:
+///
+/// 1. **Block comments** — an ordinary `/* … */` is elided to a single space (MySQL treats it
+///    as a token separator), so `UNION/**/SELECT` normalizes to `UNION SELECT`. A MySQL
+///    *executable* comment `/*!12345 … */` keeps its payload (the delimiters and any version
+///    digits become spaces), so `/*!50000UNION*/SELECT` normalizes to `UNION SELECT` too.
+/// 2. **Whitespace** — every run of ASCII whitespace collapses to one space, and the result is
+///    trimmed, so padding like `AND    1=1` folds to `AND 1=1`.
+///
+/// Splitting a keyword *inside* a token (`un/**/ion`) is left broken on purpose: MySQL does not
+/// rejoin it either, so `un ion` is correctly not the `union` keyword. Decoding works on raw
+/// bytes and finishes with [`String::from_utf8_lossy`], mirroring [`percent_decode_once`].
+fn strip_sql_comments_collapse_ws(input: &str) -> String {
+	let b = input.as_bytes();
+	let mut out: Vec<u8> = Vec::with_capacity(b.len());
+	let mut i = 0;
+	while i < b.len() {
+		if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+			if b.get(i + 2) == Some(&b'!') {
+				// MySQL executable comment: drop `/*!` and any version digits, keep the payload.
+				i += 3;
+				while i < b.len() && b[i].is_ascii_digit() {
+					i += 1;
+				}
+				out.push(b' ');
+			} else {
+				// Ordinary block comment: elide the whole `/* … */` to one separator space.
+				i += 2;
+				while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+					i += 1;
+				}
+				i = (i + 2).min(b.len());
+				out.push(b' ');
+			}
+			continue;
+		}
+		// Closing delimiter of an executable comment whose opener was already elided.
+		if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+			out.push(b' ');
+			i += 2;
+			continue;
+		}
+		out.push(b[i]);
+		i += 1;
+	}
+	// Collapse runs of ASCII whitespace to a single space, then trim the ends.
+	let text = String::from_utf8_lossy(&out);
+	let mut collapsed = String::with_capacity(text.len());
+	let mut in_ws = false;
+	for ch in text.chars() {
+		if ch.is_ascii_whitespace() {
+			if !in_ws {
+				collapsed.push(' ');
+				in_ws = true;
+			}
+		} else {
+			collapsed.push(ch);
+			in_ws = false;
+		}
+	}
+	collapsed.trim().to_owned()
 }
 
 /// The numeric value of a single hex digit, or `None` if `b` is not `[0-9A-Fa-f]`.
@@ -1271,6 +1360,40 @@ mod tests {
 		// A legitimately percent-encoded space in a title is decoded but matches nothing.
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/search?q=hello%20world")), Verdict::Allow);
+	}
+
+	#[test]
+	fn strip_sql_comments_collapse_ws_transforms() {
+		// Ordinary block comments become a separator space; MySQL executable comments keep their
+		// payload; whitespace runs collapse; a plain string is unchanged.
+		assert_eq!(strip_sql_comments_collapse_ws("UNION/**/SELECT"), "UNION SELECT");
+		assert_eq!(strip_sql_comments_collapse_ws("id=1/*x*/AND/*y*/1=1"), "id=1 AND 1=1");
+		assert_eq!(strip_sql_comments_collapse_ws("/*!50000UNION*/SELECT"), "UNION SELECT");
+		assert_eq!(strip_sql_comments_collapse_ws("AND    1=1"), "AND 1=1");
+		assert_eq!(strip_sql_comments_collapse_ws("un/**/ion"), "un ion"); // keyword split stays broken
+		assert_eq!(strip_sql_comments_collapse_ws("plain value"), "plain value");
+	}
+
+	#[test]
+	fn comment_padded_sqli_is_caught_after_normalization() {
+		// The whitespace/comment-padding evasion (CVE-2026-33691 / CRS 933111): `/**/` and excess
+		// whitespace split the `union … select` keyword pair so it evades the raw form, but the
+		// comment-stripped / whitespace-collapsed pass folds it back and the SQLi rule fires.
+		let waf = Waf::starter();
+		for payload in ["1 UNION/**/SELECT password", "1 UNION/*!50000*/SELECT password", "1 union   select null"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after normalization"));
+			assert_eq!(m.category, WafCategory::Sqli, "{payload}");
+		}
+	}
+
+	#[test]
+	fn comment_normalization_keeps_false_positives_low() {
+		// A benign request that merely contains a `/* */` comment or double spaces but no attack
+		// keyword stays clean after normalization.
+		let waf = Waf::starter();
+		for uri in ["/snippets?css=.a%20/*%20note%20*/%20.b", "/docs/c-comment-syntax", "/search?q=hello%20%20world"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

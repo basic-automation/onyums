@@ -781,6 +781,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
 		Rule { id: "nosqli_json_operator", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(ne|gt|gte|lt|lte|in|nin|regex|exists|where|expr|or|nor|and|not)"\s*:"# },
+		// ORM lookup-operator injection (OWASP-CRS 4.28.0) — Django/SQLAlchemy double-underscore
+		// query lookups used for blind data extraction: `?user__password__startswith=a`, and the
+		// `__contains`/`__regex`/`__gt` comparison family. The ORM analog of the Mongo `[$ne]` rule:
+		// a `__`-prefixed lookup keyword immediately before the `=` marks a query key exploiting the
+		// ORM's filter DSL rather than an ordinary field. The `__` prefix plus the anchored `=` is
+		// the false-positive guard — a benign `field=value` never carries a `__lookup=` suffix.
+		// <https://www.linuxcompatible.org/story/owasp-crs-v4280-drops-with-critical-security-fixes-and-first-lts-track>
+		Rule { id: "nosqli_orm_lookup", category: WafCategory::NoSqlInjection, pattern: r"(?i)__(i?startswith|i?endswith|i?contains|iexact|i?regex|isnull|gte?|lte?)\s*=" },
 		// --- LDAP injection (search-filter break-out; value inspection, no client IP) ---
 		Rule { id: "ldapi_filter_break", category: WafCategory::LdapInjection, pattern: r"\)\s*\(\s*[|&!]" },
 		Rule { id: "ldapi_wildcard_break", category: WafCategory::LdapInjection, pattern: r"[*]\s*\)\s*\(" },
@@ -1503,10 +1511,40 @@ mod tests {
 	}
 
 	#[test]
-	fn nosql_injection_rules_keep_false_positives_low() {
-		// Benign requests mentioning prices, JSON, or array params must still pass.
+	fn orm_lookup_injection_rule_matches() {
+		// Django/SQLAlchemy ORM double-underscore lookups (OWASP-CRS 4.28.0) used for blind
+		// extraction all attribute to the NoSqlInjection class via the `nosqli_orm_lookup` rule.
 		let waf = Waf::starter();
-		for uri in ["/products?price[min]=10&price[max]=99", "/api/users?sort=name", "/blog/mongodb-vs-postgres", "/cart?items[0]=42"] {
+		for (q, why) in [
+			("user__password__startswith=a", "blind prefix extraction"),
+			("email__icontains=@evil", "case-insensitive substring probe"),
+			("name__regex=^admin", "regex lookup"),
+			("age__gte=18", "comparison lookup"),
+			("token__isnull=false", "isnull lookup"),
+			("slug__iendswith=.php", "case-insensitive suffix probe"),
+		] {
+			let m = waf.inspect_str(q, "query").unwrap_or_else(|| panic!("{q} ({why}) should trip the ORM lookup rule"));
+			assert_eq!(m.rule_id, "nosqli_orm_lookup", "{q} ({why})");
+			assert_eq!(m.category, WafCategory::NoSqlInjection);
+		}
+	}
+
+	#[test]
+	fn nosql_injection_rules_keep_false_positives_low() {
+		// Benign requests mentioning prices, JSON, or array params must still pass. The ORM
+		// lookup rule needs a `__lookup=` suffix, so ordinary double-underscore names
+		// (`dunder__name`, a param that merely *contains* a lookup word without the `__` prefix)
+		// stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/products?price[min]=10&price[max]=99",
+			"/api/users?sort=name",
+			"/blog/mongodb-vs-postgres",
+			"/cart?items[0]=42",
+			"/search?contains=widget",       // "contains" as a plain key, no `__` prefix
+			"/py/__init__=1",                // dunder that is not an ORM lookup keyword
+			"/opt?newsletter_optin=true",    // single-underscore opt-in, not `__in=`
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

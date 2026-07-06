@@ -721,6 +721,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
 		Rule { id: "sqli_boolean_condition", category: WafCategory::Sqli, pattern: r#"(?i)(\band\b\s+['"]?\d+\s*[=<>]|\bor\b\s+['"]?\d+\s*[<>])\s*['"]?\d+"# },
 		Rule { id: "sqli_oob_exec", category: WafCategory::Sqli, pattern: r"(?i)\b(xp_cmdshell|xp_dirtree|load_file|utl_http|dbms_ldap)\b" },
+		// Quote-wrapped string tautology (OWASP-CRS 4.28.0 quote-evasion audit) — the classic
+		// `' OR 'a'='a` / `" AND "x"="x` auth-bypass the numeric `sqli_or_tautology` misses because
+		// the equality is between two *quoted strings*, not digits. Keyed on the quote →
+		// `or`/`and` → quote → `<value>` → quote → `=` → quote shape; the trailing `=` between
+		// quoted operands is the false-positive guard, so benign `'red' or 'blue'` phrasing (no
+		// quoted equality) stays clean.
+		// <https://www.linuxcompatible.org/story/owasp-crs-v4280-drops-with-critical-security-fixes-and-first-lts-track>
+		Rule { id: "sqli_string_tautology", category: WafCategory::Sqli, pattern: r#"(?i)['"]\s*\b(or|and)\b\s*['"][^'"]{0,64}['"]\s*=\s*['"]"# },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
@@ -874,6 +882,32 @@ mod tests {
 		let waf = Waf::starter();
 		let m = waf.inspect_str("name=x' OR 1=1 --", "target").unwrap();
 		assert_eq!(m.category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn sqli_string_tautology_is_blocked() {
+		// The quote-wrapped string tautology the numeric `sqli_or_tautology` misses (OWASP-CRS
+		// 4.28.0 quote-evasion): `' OR 'a'='a`, `" AND "x"="x`, spacing-tolerant.
+		let waf = Waf::starter();
+		for payload in ["name=admin' OR 'a'='a", r#"u=x" AND "1"="1"#, "p=' or '1' = '1"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip a SQLi rule"));
+			assert_eq!(m.rule_id, "sqli_string_tautology", "{payload}");
+			assert_eq!(m.category, WafCategory::Sqli);
+		}
+	}
+
+	#[test]
+	fn sqli_string_tautology_keeps_false_positives_low() {
+		// Quoted prose with `or`/`and` but no quoted-equality stays clean — the trailing `='` is
+		// the guard.
+		let waf = Waf::starter();
+		for uri in [
+			"/search?q=red+or+blue",
+			"/filter?tags=cats+and+dogs",
+			"/quotes?text=to+be+or+not+to+be",
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

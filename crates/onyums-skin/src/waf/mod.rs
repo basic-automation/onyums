@@ -756,6 +756,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
+		// Shell fork-bomb resource-exhaustion payload (OWASP-CRS 4.25.0 LTS, PL2) — the classic
+		// `:(){ :|:& };:`. Keyed on the recursive self-pipe-into-background `:|:&` rather than the
+		// `(){` function-definition head, so it is a distinct signal from `anomaly_shellshock`'s
+		// `() {` (a fork bomb trips both, honestly — the recursion and the function def are two
+		// separate anomalies). The colon-pipe-colon-ampersand sequence does not occur in benign
+		// HTTP, so no extra guard is needed. <https://www.linuxcompatible.org/story/owasp-crs-4250-lts-and-339-released/>
+		Rule { id: "cmdi_fork_bomb", category: WafCategory::CommandInjection, pattern: r":\s*\|\s*:\s*&" },
 		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
 		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
@@ -957,6 +964,38 @@ mod tests {
 		let mut p = parts("GET", "/");
 		p.headers.insert("user-agent", "() { :; }; echo vuln".parse().unwrap());
 		assert_eq!(blocked(&waf.inspect(&p)).rule_id, "anomaly_shellshock");
+	}
+
+	#[test]
+	fn fork_bomb_signature_matches() {
+		// The classic `:(){ :|:& };:` fork bomb and its whitespace-spread variant both trip the
+		// dedicated command-injection signature on the recursive `:|:&` self-pipe. `cmdi_fork_bomb`
+		// sits earlier in the ruleset than `anomaly_shellshock`, so a full fork bomb (which also
+		// carries `(){`) reports the fork-bomb id in first-match mode.
+		let waf = Waf::starter();
+		for payload in [":(){ :|:& };:", ":(){ : | : & };:"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the fork-bomb rule"));
+			assert_eq!(m.rule_id, "cmdi_fork_bomb", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+		// The recursion is also visible to the collect-all path alongside shellshock's function
+		// head, since a fork bomb is genuinely both anomalies. (Carried in a header to avoid the
+		// `{}|` characters that `http::Uri` parsing rejects.)
+		let mut p = parts("GET", "/");
+		p.headers.insert("x-payload", ":(){ :|:& };:".parse().unwrap());
+		let all = waf.inspect_all(&p);
+		assert!(all.iter().any(|m| m.rule_id == "cmdi_fork_bomb"), "fork-bomb recursion should be reported");
+		assert!(all.iter().any(|m| m.rule_id == "anomaly_shellshock"), "shellshock function head should also be reported");
+	}
+
+	#[test]
+	fn fork_bomb_rule_keeps_false_positives_low() {
+		// Benign strings carrying colons or pipes but not the colon-pipe-colon-ampersand recursion
+		// stay clean: a time range, an alternation filter, a piped shell-doc URL.
+		let waf = Waf::starter();
+		for uri in ["/calendar?slot=09:00|10:00", "/logs?level=info|warn|error", "/docs/using-the-pipe-operator"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

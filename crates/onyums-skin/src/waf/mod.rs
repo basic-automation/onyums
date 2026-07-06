@@ -491,8 +491,17 @@ impl Waf {
 		}
 		// 4. Match the decoded form, but only when normalization actually changed it
 		//    (nothing encoded → raw was the whole story, already checked).
-		if norm.decoded != raw {
-			return self.match_raw(&norm.decoded, location);
+		if norm.decoded != raw
+			&& let Some(m) = self.match_raw(&norm.decoded, location)
+		{
+			return Some(m);
+		}
+		// 5. Match the comment-stripped, whitespace-collapsed form of the decoded string, to
+		//    close the whitespace/comment-padding evasion (`UNION/**/SELECT`, `AND  1=1`). Only
+		//    when the transform actually changed something (a plain payload skips this pass).
+		let stripped = strip_sql_comments_collapse_ws(&norm.decoded);
+		if stripped != norm.decoded {
+			return self.match_raw(&stripped, location);
 		}
 		None
 	}
@@ -587,6 +596,18 @@ impl Waf {
 			let mut decoded = Vec::new();
 			self.match_all_raw(&norm.decoded, location, &mut decoded);
 			for m in decoded {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// The comment-stripped / whitespace-collapsed form contributes its matches too, deduped
+		// by rule id within this field, so padding-evaded signatures still surface in scoring.
+		let stripped = strip_sql_comments_collapse_ws(&norm.decoded);
+		if stripped != norm.decoded {
+			let mut extra = Vec::new();
+			self.match_all_raw(&stripped, location, &mut extra);
+			for m in extra {
 				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
 					out.push(m);
 				}
@@ -691,6 +712,74 @@ fn percent_decode_once(input: &str) -> (String, bool) {
 	(String::from_utf8_lossy(&out).into_owned(), changed)
 }
 
+/// Strip SQL block comments and collapse internal whitespace, producing a canonical form for
+/// the WAF to match alongside the raw and percent-decoded forms. This closes the
+/// whitespace/comment-padding evasion class (OWASP-CRS 4.25.0 LTS rule 933111,
+/// CVE-2026-33691): an attacker splits a keyword sequence with `/**/` or excess whitespace
+/// (`UNION/**/SELECT`, `OR/**/1=1`, `id=1  AND  1=1`) to slip past a space-sensitive
+/// signature. Two transforms, in order:
+///
+/// 1. **Block comments** — an ordinary `/* … */` is elided to a single space (MySQL treats it
+///    as a token separator), so `UNION/**/SELECT` normalizes to `UNION SELECT`. A MySQL
+///    *executable* comment `/*!12345 … */` keeps its payload (the delimiters and any version
+///    digits become spaces), so `/*!50000UNION*/SELECT` normalizes to `UNION SELECT` too.
+/// 2. **Whitespace** — every run of ASCII whitespace collapses to one space, and the result is
+///    trimmed, so padding like `AND    1=1` folds to `AND 1=1`.
+///
+/// Splitting a keyword *inside* a token (`un/**/ion`) is left broken on purpose: MySQL does not
+/// rejoin it either, so `un ion` is correctly not the `union` keyword. Decoding works on raw
+/// bytes and finishes with [`String::from_utf8_lossy`], mirroring [`percent_decode_once`].
+fn strip_sql_comments_collapse_ws(input: &str) -> String {
+	let b = input.as_bytes();
+	let mut out: Vec<u8> = Vec::with_capacity(b.len());
+	let mut i = 0;
+	while i < b.len() {
+		if b[i] == b'/' && b.get(i + 1) == Some(&b'*') {
+			if b.get(i + 2) == Some(&b'!') {
+				// MySQL executable comment: drop `/*!` and any version digits, keep the payload.
+				i += 3;
+				while i < b.len() && b[i].is_ascii_digit() {
+					i += 1;
+				}
+				out.push(b' ');
+			} else {
+				// Ordinary block comment: elide the whole `/* … */` to one separator space.
+				i += 2;
+				while i + 1 < b.len() && !(b[i] == b'*' && b[i + 1] == b'/') {
+					i += 1;
+				}
+				i = (i + 2).min(b.len());
+				out.push(b' ');
+			}
+			continue;
+		}
+		// Closing delimiter of an executable comment whose opener was already elided.
+		if b[i] == b'*' && b.get(i + 1) == Some(&b'/') {
+			out.push(b' ');
+			i += 2;
+			continue;
+		}
+		out.push(b[i]);
+		i += 1;
+	}
+	// Collapse runs of ASCII whitespace to a single space, then trim the ends.
+	let text = String::from_utf8_lossy(&out);
+	let mut collapsed = String::with_capacity(text.len());
+	let mut in_ws = false;
+	for ch in text.chars() {
+		if ch.is_ascii_whitespace() {
+			if !in_ws {
+				collapsed.push(' ');
+				in_ws = true;
+			}
+		} else {
+			collapsed.push(ch);
+			in_ws = false;
+		}
+	}
+	collapsed.trim().to_owned()
+}
+
 /// The numeric value of a single hex digit, or `None` if `b` is not `[0-9A-Fa-f]`.
 const fn hex_val(b: u8) -> Option<u8> {
 	match b {
@@ -721,6 +810,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
 		Rule { id: "sqli_boolean_condition", category: WafCategory::Sqli, pattern: r#"(?i)(\band\b\s+['"]?\d+\s*[=<>]|\bor\b\s+['"]?\d+\s*[<>])\s*['"]?\d+"# },
 		Rule { id: "sqli_oob_exec", category: WafCategory::Sqli, pattern: r"(?i)\b(xp_cmdshell|xp_dirtree|load_file|utl_http|dbms_ldap)\b" },
+		// Quote-wrapped string tautology (OWASP-CRS 4.28.0 quote-evasion audit) — the classic
+		// `' OR 'a'='a` / `" AND "x"="x` auth-bypass the numeric `sqli_or_tautology` misses because
+		// the equality is between two *quoted strings*, not digits. Keyed on the quote →
+		// `or`/`and` → quote → `<value>` → quote → `=` → quote shape; the trailing `=` between
+		// quoted operands is the false-positive guard, so benign `'red' or 'blue'` phrasing (no
+		// quoted equality) stays clean.
+		// <https://www.linuxcompatible.org/story/owasp-crs-v4280-drops-with-critical-security-fixes-and-first-lts-track>
+		Rule { id: "sqli_string_tautology", category: WafCategory::Sqli, pattern: r#"(?i)['"]\s*\b(or|and)\b\s*['"][^'"]{0,64}['"]\s*=\s*['"]"# },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
@@ -729,6 +826,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
 		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
 		Rule { id: "xss_svg_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*svg\b" },
+		// HTML5 XSS vectors the small handler set above misses (OWASP-CRS 941 port). Newer event
+		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
+		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
+		Rule { id: "xss_html5_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(animation(start|end|iteration)|transitionend|pointer(over|down|enter|rawupdate)|beforetoggle|beforeprint|pageshow|hashchange|wheel)\s*=" },
+		// Injection-only attributes: an iframe `srcdoc` carrying inline markup, and a `formaction`
+		// that hijacks a form's submit target. Reflected into a response these are near-always an
+		// XSS vector; an operator legitimately reflecting them can disable this rule.
+		Rule { id: "xss_dangerous_attribute", category: WafCategory::Xss, pattern: r"(?i)\b(srcdoc|formaction)\s*=" },
 		// --- Path / directory traversal & file-inclusion wrappers ---
 		Rule { id: "traversal_dotdot", category: WafCategory::PathTraversal, pattern: r"(\.\./|\.\.\\)" },
 		Rule { id: "traversal_encoded", category: WafCategory::PathTraversal, pattern: r"(?i)%2e%2e(%2f|%5c|/|\\)" },
@@ -756,6 +861,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
+		// Shell fork-bomb resource-exhaustion payload (OWASP-CRS 4.25.0 LTS, PL2) — the classic
+		// `:(){ :|:& };:`. Keyed on the recursive self-pipe-into-background `:|:&` rather than the
+		// `(){` function-definition head, so it is a distinct signal from `anomaly_shellshock`'s
+		// `() {` (a fork bomb trips both, honestly — the recursion and the function def are two
+		// separate anomalies). The colon-pipe-colon-ampersand sequence does not occur in benign
+		// HTTP, so no extra guard is needed. <https://www.linuxcompatible.org/story/owasp-crs-4250-lts-and-339-released/>
+		Rule { id: "cmdi_fork_bomb", category: WafCategory::CommandInjection, pattern: r":\s*\|\s*:\s*&" },
 		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
 		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
@@ -776,11 +888,55 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_template", category: WafCategory::CodeInjection, pattern: r"\{\{\s*\d+\s*[*]\s*\d+\s*\}\}" },
+		// Server-side template-injection arithmetic probes across more engines than the `${}`/`{{}}`
+		// pair above — the `N*N` polyglot tplmap uses to fingerprint an SSTI-to-RCE sink: ERB/EJS/ASP
+		// `<%= 7*7 %>`, Ruby/Pug/Slim `#{7*7}`, Razor `@(7*7)`, and Thymeleaf `*{7*7}`. Requiring
+		// digit-times-digit *inside* the engine delimiters keeps false positives near zero (a CSS
+		// `#{$var}` interpolation or an email `@(handle)` carries no `\d+\*\d+`).
+		Rule { id: "code_ssti_erb", category: WafCategory::CodeInjection, pattern: r"<%[=\-]?\s*\d+\s*[*]\s*\d+\s*[-]?%>" },
+		Rule { id: "code_ssti_hash_delim", category: WafCategory::CodeInjection, pattern: r"#\{\s*\d+\s*[*]\s*\d+\s*\}" },
+		Rule { id: "code_ssti_razor", category: WafCategory::CodeInjection, pattern: r"@\(\s*\d+\s*[*]\s*\d+\s*\)" },
+		Rule { id: "code_ssti_thymeleaf", category: WafCategory::CodeInjection, pattern: r"\*\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"rO0AB[A-Za-z0-9+/=]{2,}" },
+		// Double-extension upload filename (the file-upload RCE vector behind CVE-2026-33691): a
+		// benign-looking media/document/archive extension immediately followed by a *trailing*
+		// server-script extension — `avatar.jpg.php`, `report.pdf.jsp`, `notes.txt.phtml`. The
+		// `\s*` between the two dots is whitespace-tolerant to catch the padding evasion. Requiring
+		// the script extension to trail a recognized benign extension is the false-positive guard:
+		// ordinary two-part names like `archive.tar.gz`, `photo.jpg.webp`, or `data.csv.zip` never
+		// end in an executable extension. <https://www.linuxcompatible.org/story/owasp-crs-4250-lts-and-339-released/>
+		Rule { id: "code_double_extension_upload", category: WafCategory::CodeInjection, pattern: r"(?i)\.(jpe?g|png|gif|bmp|webp|pdf|txt|docx?|xlsx?|csv|zip|gz|rar|html?)\s*\.(php[0-9]?|phtml|phar|jspx?|aspx?|cgi|pl|py|sh|exe|bat|cmd)\b" },
+		// PHP code injection (OWASP-CRS 933xxx port): an injected `<?php` / `<?=` open tag, a PHP
+		// superglobal reference (`$_GET`/`$_POST`/`$_REQUEST`/…) smuggled into input, and the
+		// PHP-specific command-exec / info-leak functions. Kept to PHP-unambiguous tokens
+		// (the open tag requires `php`/`=` so an XML `<?` processing instruction stays clean;
+		// the funcs are PHP-only names, not the generic `system`/`eval` shared with other langs)
+		// so false positives stay low. <https://coreruleset.org/>
+		Rule { id: "code_php_open_tag", category: WafCategory::CodeInjection, pattern: r"(?i)<\?(php|=)" },
+		Rule { id: "code_php_superglobal", category: WafCategory::CodeInjection, pattern: r"(?i)\$_(get|post|request|server|cookie|session|env|files)\b" },
+		Rule { id: "code_php_dangerous_call", category: WafCategory::CodeInjection, pattern: r"(?i)\b(phpinfo|shell_exec|passthru|proc_open|pcntl_exec|base64_decode)\s*\(" },
+		// Java / JVM code execution (OWASP-CRS 944xxx port): the `Runtime.getRuntime().exec(...)`
+		// idiom and `new ProcessBuilder(...)`, the two canonical JVM process-spawn gadgets that
+		// deserialization and OGNL/SpEL payloads reach for. Anchored on the fully-qualified Java
+		// idioms (not a bare `.exec(`, which JS regexes also use) to keep false positives low.
+		Rule { id: "code_java_runtime_exec", category: WafCategory::CodeInjection, pattern: r"(?i)(runtime\s*\.\s*getruntime\s*\(\s*\)|new\s+processbuilder\b)" },
+		// Node.js command execution (OWASP-CRS 934/node port): pulling in `child_process` or
+		// calling its exec/spawn family — the standard Node RCE sink behind prototype-pollution
+		// and template-injection chains. Keyed on the module require plus the `child_process.<fn>`
+		// call form, both Node-specific, so ordinary prose stays clean.
+		Rule { id: "code_node_child_process", category: WafCategory::CodeInjection, pattern: r#"(?i)(require\s*\(\s*['"]child_process['"]|child_process\s*\.\s*(exec|execsync|spawn|spawnsync|fork))"# },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
 		Rule { id: "nosqli_json_operator", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(ne|gt|gte|lt|lte|in|nin|regex|exists|where|expr|or|nor|and|not)"\s*:"# },
+		// ORM lookup-operator injection (OWASP-CRS 4.28.0) — Django/SQLAlchemy double-underscore
+		// query lookups used for blind data extraction: `?user__password__startswith=a`, and the
+		// `__contains`/`__regex`/`__gt` comparison family. The ORM analog of the Mongo `[$ne]` rule:
+		// a `__`-prefixed lookup keyword immediately before the `=` marks a query key exploiting the
+		// ORM's filter DSL rather than an ordinary field. The `__` prefix plus the anchored `=` is
+		// the false-positive guard — a benign `field=value` never carries a `__lookup=` suffix.
+		// <https://www.linuxcompatible.org/story/owasp-crs-v4280-drops-with-critical-security-fixes-and-first-lts-track>
+		Rule { id: "nosqli_orm_lookup", category: WafCategory::NoSqlInjection, pattern: r"(?i)__(i?startswith|i?endswith|i?contains|iexact|i?regex|isnull|gte?|lte?)\s*=" },
 		// --- LDAP injection (search-filter break-out; value inspection, no client IP) ---
 		Rule { id: "ldapi_filter_break", category: WafCategory::LdapInjection, pattern: r"\)\s*\(\s*[|&!]" },
 		Rule { id: "ldapi_wildcard_break", category: WafCategory::LdapInjection, pattern: r"[*]\s*\)\s*\(" },
@@ -851,6 +1007,32 @@ mod tests {
 		let waf = Waf::starter();
 		let m = waf.inspect_str("name=x' OR 1=1 --", "target").unwrap();
 		assert_eq!(m.category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn sqli_string_tautology_is_blocked() {
+		// The quote-wrapped string tautology the numeric `sqli_or_tautology` misses (OWASP-CRS
+		// 4.28.0 quote-evasion): `' OR 'a'='a`, `" AND "x"="x`, spacing-tolerant.
+		let waf = Waf::starter();
+		for payload in ["name=admin' OR 'a'='a", r#"u=x" AND "1"="1"#, "p=' or '1' = '1"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip a SQLi rule"));
+			assert_eq!(m.rule_id, "sqli_string_tautology", "{payload}");
+			assert_eq!(m.category, WafCategory::Sqli);
+		}
+	}
+
+	#[test]
+	fn sqli_string_tautology_keeps_false_positives_low() {
+		// Quoted prose with `or`/`and` but no quoted-equality stays clean — the trailing `='` is
+		// the guard.
+		let waf = Waf::starter();
+		for uri in [
+			"/search?q=red+or+blue",
+			"/filter?tags=cats+and+dogs",
+			"/quotes?text=to+be+or+not+to+be",
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]
@@ -928,6 +1110,28 @@ mod tests {
 	}
 
 	#[test]
+	fn html5_xss_vectors_match() {
+		// The OWASP-CRS 941 HTML5 additions: newer auto-firing event handlers and the
+		// injection-only `srcdoc` / `formaction` attributes all attribute to the Xss class.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("x=<xss onanimationstart=alert(1)>", "query").unwrap().rule_id, "xss_html5_event_handler");
+		assert_eq!(waf.inspect_str("x=<a onpointerover=alert(1)>", "query").unwrap().rule_id, "xss_html5_event_handler");
+		assert_eq!(waf.inspect_str("x=<details ontoggle=alert(1)>", "query").unwrap().category, WafCategory::Xss);
+		assert_eq!(waf.inspect_str("x=<z srcdoc=PHNjcmlwdD4>", "query").unwrap().rule_id, "xss_dangerous_attribute");
+		assert_eq!(waf.inspect_str("x=<button formaction=javascript:alert(1)>", "query").unwrap().category, WafCategory::Xss);
+	}
+
+	#[test]
+	fn html5_xss_rules_keep_false_positives_low() {
+		// Params that merely start with `on`/contain `action` but are not event handlers or the
+		// dangerous attributes stay clean.
+		let waf = Waf::starter();
+		for uri in ["/settings?onboarding=done", "/form?action=save", "/docs/pointer-events-css", "/page?transition=fade"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn file_inclusion_wrappers_match() {
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect_str("page=php://filter/convert.base64-encode/resource=x", "target").unwrap().category, WafCategory::PathTraversal);
@@ -949,6 +1153,38 @@ mod tests {
 		let mut p = parts("GET", "/");
 		p.headers.insert("user-agent", "() { :; }; echo vuln".parse().unwrap());
 		assert_eq!(blocked(&waf.inspect(&p)).rule_id, "anomaly_shellshock");
+	}
+
+	#[test]
+	fn fork_bomb_signature_matches() {
+		// The classic `:(){ :|:& };:` fork bomb and its whitespace-spread variant both trip the
+		// dedicated command-injection signature on the recursive `:|:&` self-pipe. `cmdi_fork_bomb`
+		// sits earlier in the ruleset than `anomaly_shellshock`, so a full fork bomb (which also
+		// carries `(){`) reports the fork-bomb id in first-match mode.
+		let waf = Waf::starter();
+		for payload in [":(){ :|:& };:", ":(){ : | : & };:"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the fork-bomb rule"));
+			assert_eq!(m.rule_id, "cmdi_fork_bomb", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+		// The recursion is also visible to the collect-all path alongside shellshock's function
+		// head, since a fork bomb is genuinely both anomalies. (Carried in a header to avoid the
+		// `{}|` characters that `http::Uri` parsing rejects.)
+		let mut p = parts("GET", "/");
+		p.headers.insert("x-payload", ":(){ :|:& };:".parse().unwrap());
+		let all = waf.inspect_all(&p);
+		assert!(all.iter().any(|m| m.rule_id == "cmdi_fork_bomb"), "fork-bomb recursion should be reported");
+		assert!(all.iter().any(|m| m.rule_id == "anomaly_shellshock"), "shellshock function head should also be reported");
+	}
+
+	#[test]
+	fn fork_bomb_rule_keeps_false_positives_low() {
+		// Benign strings carrying colons or pipes but not the colon-pipe-colon-ampersand recursion
+		// stay clean: a time range, an alternation filter, a piped shell-doc URL.
+		let waf = Waf::starter();
+		for uri in ["/calendar?slot=09:00|10:00", "/logs?level=info|warn|error", "/docs/using-the-pipe-operator"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]
@@ -989,6 +1225,38 @@ mod tests {
 			"/directory/listing",           // "dir" as a path word, no separator
 			"/go/http-status-codes",        // "http" without a decimal-IP host
 			"/search?q=cats+and+dogs",      // "and" without a numeric comparison
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn double_extension_upload_rule_matches() {
+		// The CVE-2026-33691 double-extension upload vector: a script extension trailing a
+		// benign-looking one, including the whitespace-padded form, attributes to CodeInjection.
+		let waf = Waf::starter();
+		for (q, why) in [
+			("file=avatar.jpg.php", "image cover, php payload"),
+			("upload=report.pdf.jsp", "pdf cover, jsp payload"),
+			("name=notes.txt.phtml", "text cover, phtml payload"),
+			("f=doc.docx%20.php", "whitespace-padded double extension"),
+			("f=page.html.cgi", "html cover, cgi payload"),
+		] {
+			let m = waf.inspect_str(q, "query").unwrap_or_else(|| panic!("{q} ({why}) should trip the double-extension rule"));
+			assert_eq!(m.rule_id, "code_double_extension_upload", "{q} ({why})");
+			assert_eq!(m.category, WafCategory::CodeInjection);
+		}
+	}
+
+	#[test]
+	fn double_extension_rule_keeps_false_positives_low() {
+		// Ordinary two-part filenames whose trailing extension is not executable stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/dl/archive.tar.gz",
+			"/img/photo.jpg.webp",
+			"/data/export.csv.zip",
+			"/assets/logo.min.svg",
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
@@ -1150,6 +1418,40 @@ mod tests {
 		// A legitimately percent-encoded space in a title is decoded but matches nothing.
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/search?q=hello%20world")), Verdict::Allow);
+	}
+
+	#[test]
+	fn strip_sql_comments_collapse_ws_transforms() {
+		// Ordinary block comments become a separator space; MySQL executable comments keep their
+		// payload; whitespace runs collapse; a plain string is unchanged.
+		assert_eq!(strip_sql_comments_collapse_ws("UNION/**/SELECT"), "UNION SELECT");
+		assert_eq!(strip_sql_comments_collapse_ws("id=1/*x*/AND/*y*/1=1"), "id=1 AND 1=1");
+		assert_eq!(strip_sql_comments_collapse_ws("/*!50000UNION*/SELECT"), "UNION SELECT");
+		assert_eq!(strip_sql_comments_collapse_ws("AND    1=1"), "AND 1=1");
+		assert_eq!(strip_sql_comments_collapse_ws("un/**/ion"), "un ion"); // keyword split stays broken
+		assert_eq!(strip_sql_comments_collapse_ws("plain value"), "plain value");
+	}
+
+	#[test]
+	fn comment_padded_sqli_is_caught_after_normalization() {
+		// The whitespace/comment-padding evasion (CVE-2026-33691 / CRS 933111): `/**/` and excess
+		// whitespace split the `union … select` keyword pair so it evades the raw form, but the
+		// comment-stripped / whitespace-collapsed pass folds it back and the SQLi rule fires.
+		let waf = Waf::starter();
+		for payload in ["1 UNION/**/SELECT password", "1 UNION/*!50000*/SELECT password", "1 union   select null"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after normalization"));
+			assert_eq!(m.category, WafCategory::Sqli, "{payload}");
+		}
+	}
+
+	#[test]
+	fn comment_normalization_keeps_false_positives_low() {
+		// A benign request that merely contains a `/* */` comment or double spaces but no attack
+		// keyword stays clean after normalization.
+		let waf = Waf::starter();
+		for uri in ["/snippets?css=.a%20/*%20note%20*/%20.b", "/docs/c-comment-syntax", "/search?q=hello%20%20world"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]
@@ -1483,10 +1785,70 @@ mod tests {
 	}
 
 	#[test]
+	fn ssti_engine_probes_match() {
+		// The extended SSTI arithmetic probes each fingerprint their engine and attribute to
+		// CodeInjection: ERB/EJS, Ruby/Pug, Razor, Thymeleaf.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("v=<%= 7*7 %>", "query").unwrap().rule_id, "code_ssti_erb");
+		assert_eq!(waf.inspect_str("v=#{7*7}", "query").unwrap().rule_id, "code_ssti_hash_delim");
+		assert_eq!(waf.inspect_str("v=@(7*7)", "query").unwrap().rule_id, "code_ssti_razor");
+		assert_eq!(waf.inspect_str("v=*{7*7}", "query").unwrap().rule_id, "code_ssti_thymeleaf");
+	}
+
+	#[test]
+	fn ssti_engine_probes_keep_false_positives_low() {
+		// Engine delimiters without a `digit*digit` arithmetic probe stay clean: a CSS/Sass
+		// interpolation, an @-handle, a plain hash-braced variable.
+		let waf = Waf::starter();
+		for uri in ["/style?tpl=color:%23{$brand}", "/u/@(alice)", "/i18n?msg=%23{greeting}"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn code_injection_rules_keep_false_positives_low() {
 		// Benign requests mentioning braces/dollars or the word "code" must still pass.
 		let waf = Waf::starter();
 		for uri in ["/articles/json-${schema}-guide", "/pricing?total=7", "/docs/php-serialization-explained", "/blog/clean-code-tips"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn php_code_injection_rules_match() {
+		// OWASP-CRS 933xxx PHP port: open tag, superglobal, and a PHP-specific dangerous call.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("t=<?php system($_GET[c]);?>", "query").unwrap().category, WafCategory::CodeInjection);
+		assert_eq!(waf.inspect_str("v=<?= 1 + 1 ?>", "query").unwrap().rule_id, "code_php_open_tag");
+		assert_eq!(waf.inspect_str("x=$_REQUEST[cmd]", "query").unwrap().rule_id, "code_php_superglobal");
+		assert_eq!(waf.inspect_str("q=phpinfo()", "query").unwrap().rule_id, "code_php_dangerous_call");
+		assert_eq!(waf.inspect_str("d=shell_exec ('ls')", "query").unwrap().rule_id, "code_php_dangerous_call");
+	}
+
+	#[test]
+	fn java_and_node_code_execution_rules_match() {
+		// OWASP-CRS 944/node port: the JVM process-spawn gadgets and the Node child_process sink.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("p=Runtime.getRuntime().exec('id')", "query").unwrap().rule_id, "code_java_runtime_exec");
+		assert_eq!(waf.inspect_str("p=new ProcessBuilder('sh','-c','id')", "query").unwrap().rule_id, "code_java_runtime_exec");
+		assert_eq!(waf.inspect_str("m=require('child_process').exec('id')", "query").unwrap().rule_id, "code_node_child_process");
+		assert_eq!(waf.inspect_str("m=child_process.spawnSync('id')", "query").unwrap().rule_id, "code_node_child_process");
+	}
+
+	#[test]
+	fn php_java_node_rules_keep_false_positives_low() {
+		// Prose and identifiers that brush near the new tokens but are not the attack forms stay
+		// clean: an XML processing instruction, a docs page mentioning the runtime, a variable
+		// named like a superglobal without the `$_` prefix, and a benign "child processes" page.
+		let waf = Waf::starter();
+		// A real `<?xml` processing instruction must not trip the PHP open-tag rule.
+		assert!(waf.inspect_str(r#"<?xml version="1.0"?>"#, "query").is_none(), "<?xml PI should not false-positive");
+		for uri in [
+			"/docs/java-runtime-environment",      // "runtime" as a word, no getRuntime() call
+			"/settings?get_posts=10",              // `get_posts`, not a `$_` superglobal
+			"/blog/understanding-child-processes", // "child process" prose, no require/call
+			"/api/base64-encoding-guide",          // mentions base64 without the decode call
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
@@ -1503,10 +1865,40 @@ mod tests {
 	}
 
 	#[test]
-	fn nosql_injection_rules_keep_false_positives_low() {
-		// Benign requests mentioning prices, JSON, or array params must still pass.
+	fn orm_lookup_injection_rule_matches() {
+		// Django/SQLAlchemy ORM double-underscore lookups (OWASP-CRS 4.28.0) used for blind
+		// extraction all attribute to the NoSqlInjection class via the `nosqli_orm_lookup` rule.
 		let waf = Waf::starter();
-		for uri in ["/products?price[min]=10&price[max]=99", "/api/users?sort=name", "/blog/mongodb-vs-postgres", "/cart?items[0]=42"] {
+		for (q, why) in [
+			("user__password__startswith=a", "blind prefix extraction"),
+			("email__icontains=@evil", "case-insensitive substring probe"),
+			("name__regex=^admin", "regex lookup"),
+			("age__gte=18", "comparison lookup"),
+			("token__isnull=false", "isnull lookup"),
+			("slug__iendswith=.php", "case-insensitive suffix probe"),
+		] {
+			let m = waf.inspect_str(q, "query").unwrap_or_else(|| panic!("{q} ({why}) should trip the ORM lookup rule"));
+			assert_eq!(m.rule_id, "nosqli_orm_lookup", "{q} ({why})");
+			assert_eq!(m.category, WafCategory::NoSqlInjection);
+		}
+	}
+
+	#[test]
+	fn nosql_injection_rules_keep_false_positives_low() {
+		// Benign requests mentioning prices, JSON, or array params must still pass. The ORM
+		// lookup rule needs a `__lookup=` suffix, so ordinary double-underscore names
+		// (`dunder__name`, a param that merely *contains* a lookup word without the `__` prefix)
+		// stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/products?price[min]=10&price[max]=99",
+			"/api/users?sort=name",
+			"/blog/mongodb-vs-postgres",
+			"/cart?items[0]=42",
+			"/search?contains=widget",       // "contains" as a plain key, no `__` prefix
+			"/py/__init__=1",                // dunder that is not an ORM lookup keyword
+			"/opt?newsletter_optin=true",    // single-underscore opt-in, not `__in=`
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

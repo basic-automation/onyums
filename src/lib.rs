@@ -5,7 +5,7 @@
 //! Onyums is a simple axum wrapper for serving tor onion services.
 //!
 //! # Example
-//! ```rust
+//! ```rust,no_run
 //! use onyums::{serve, routing::get, Router};
 //!
 //! #[tokio::main]
@@ -15,6 +15,8 @@
 //!     serve(app, "my_onion").await.unwrap();
 //! }
 //! ```
+//! `no_run`: `serve` binds the live Tor network and runs until stopped, so the
+//! example is compiled and type-checked but never executed under `cargo test`.
 
 use std::{net::SocketAddr, sync::Mutex};
 
@@ -56,11 +58,13 @@ use onyums_skin::CircuitId;
 pub use {arti_client, tor_cell, tor_cert, tor_hscrypto, tor_hsservice, tor_llcrypto, tor_proto, tor_rtcompat};
 
 mod circuit_gate;
+mod client_auth;
 mod port_router;
 mod raw_tcp;
 mod provided_cert;
 mod tls_policy;
 mod vanity;
+pub use client_auth::{provision_client, ClientAuthKeypair, ClientAuthKeypairError};
 pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeFuture, StreamHandler};
 pub use raw_tcp::RawTcpHandler;
 pub use provided_cert::ProvidedCert;
@@ -612,6 +616,21 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn status(&self) -> ServiceStatus {
 		project_service_status(self.service.status().state())
+	}
+
+	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
+	/// bootstrap → reachable → degraded lifecycle rather than poll
+	/// [`status`](Self::status) (onyums ROADMAP Phase 4).
+	///
+	/// Projects arti's `status_events()` through the same stable, exhaustive
+	/// [`ServiceStatus`] mapping as [`status`](Self::status), so downstreams match
+	/// without a wildcard and without breaking when arti adds a state. Backed by a
+	/// watch channel: the stream yields the current status immediately, then one item
+	/// per change (intermediate transitions between polls may be coalesced). The
+	/// stream is independent of this handle — it stays live for as long as the
+	/// underlying service does.
+	pub fn status_events(&self) -> impl Stream<Item = ServiceStatus> + use<> {
+		self.service.status_events().map(|status| project_service_status(status.state()))
 	}
 
 	/// Resolve once the service is believed to be fully reachable — its

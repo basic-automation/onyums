@@ -11,8 +11,8 @@ The posture is *secure and complete by default*: the hard, Tor-specific machiner
 
 - **One-liner serve** — `serve(app, "nickname")` is the full secure stack; the builder (`OnionService::builder()`) tunes or relaxes it.
 - **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF, plus an Under Attack Mode toggle and observable security events; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
-- **Restricted discovery (v3 client authorization)** — `.authorized_clients(...)` publishes a descriptor only the listed clients can decrypt, so an unlisted client cannot even discover the service; see [Restricted discovery](#restricted-discovery--v3-client-authorization).
-- **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()`, a synchronous `status()` snapshot (typed `ServiceStatus`), the typed `.onion` address, and `shutdown()`.
+- **Restricted discovery (v3 client authorization)** — `.authorized_clients(...)` publishes a descriptor only the listed clients can decrypt, so an unlisted client cannot even discover the service; `provision_client(...)` mints a new client's x25519 keypair and renders Tor's canonical `.auth` / `.auth_private` files. See [Restricted discovery](#restricted-discovery--v3-client-authorization).
+- **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()`, a synchronous `status()` snapshot (typed `ServiceStatus`), a `status_events()` transition stream, the typed `.onion` address, and `shutdown()`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
 - **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, bring-your-own-key migration from a Tor `hs_ed25519_secret_key` file, and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
@@ -151,6 +151,38 @@ async fn main() {
 ```
 
 This is an explicit opt-*down* in reachability (from "anyone with the address" to "only these clients"). Restricted discovery is a DoS-resistance mechanism, **not** a substitute for authentication: removing a client does not immediately revoke an already-connected one.
+
+### Provisioning a new client
+
+The example above *imports* an already-known key. To onboard a brand-new client you first have to **generate** its x25519 keypair. `provision_client` does the whole ceremony in one call — generate the keypair, authorize its public half into the allowlist, and hand you back the keypair so you can give the client its secret:
+
+```rust
+use onyums::{provision_client, ClientAuthKeypair, OnionAddress, RestrictedDiscovery};
+
+let mut allowlist = RestrictedDiscovery::new();
+
+// Generate + authorize a fresh client in one step.
+let alice = provision_client(&mut allowlist, "alice");
+
+// Operator side: write the server-side `authorized_clients/alice.auth` files.
+for (file, body) in allowlist.to_auth_files() {
+	// std::fs::write(auth_dir.join(&file), body) ...
+	let _ = (file, body);
+}
+
+// Client side: give Alice the `.auth_private` line for her Tor `ClientOnionAuthDir`.
+let address = OnionAddress::normalized("examplev3address.onion");
+let auth_private = alice.auth_private_line(&address);
+// -> "examplev3address:descriptor:x25519:<BASE32-secret>"
+
+// The keypair round-trips back out of that line (e.g. to re-derive the public key).
+let (_addr, recovered) = ClientAuthKeypair::from_auth_private_line(&auth_private).unwrap();
+assert_eq!(recovered.public_key(), alice.public_key());
+```
+
+The keypair is minted with arti's own `tor-llcrypto` curve25519 (no extra crypto dependency), and the `.auth` / `.auth_private` renderings match Tor's canonical file formats — so a generated key drops straight into either a native-arti or a C-tor deployment. `ClientAuthKeypair` holds a secret, so its `Debug` is redacted.
+
+Watching a service come up is a stream, not just a snapshot: `handle.status_events()` yields each `ServiceStatus` transition (bootstrapping → reachable → degraded) so you can react to health changes without polling `status()`.
 
 ****
 

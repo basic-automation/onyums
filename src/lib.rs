@@ -550,6 +550,89 @@ impl ServiceStatus {
 	pub const fn is_reachable(self) -> bool {
 		matches!(self, Self::Reachable | Self::DegradedReachable)
 	}
+
+	/// Whether the service is running reachable but *degraded* — up, with a current
+	/// descriptor, but fewer or less-satisfactory introduction points than desired.
+	///
+	/// A subset of [`is_reachable`](Self::is_reachable): a degraded service still
+	/// serves clients, but an operator may want to alarm on it.
+	#[must_use]
+	pub const fn is_degraded(self) -> bool {
+		matches!(self, Self::DegradedReachable)
+	}
+
+	/// Whether the service hit a problem onyums could not recover from
+	/// ([`Broken`](Self::Broken)) — distinct from the transient
+	/// [`Unreachable`](Self::Unreachable), which is expected to recover on its own.
+	#[must_use]
+	pub const fn is_broken(self) -> bool {
+		matches!(self, Self::Broken)
+	}
+
+	/// Whether this is a *settled* status the service will not leave on its own:
+	/// [`Shutdown`](Self::Shutdown) (stopped) or [`Broken`](Self::Broken) (unrecoverable).
+	///
+	/// The complement of the states a service passes through or recovers from —
+	/// [`Bootstrapping`](Self::Bootstrapping), [`Unreachable`](Self::Unreachable), and the
+	/// reachable states — so a caller watching the lifecycle knows when further waiting
+	/// is pointless. See [`OnionServiceHandle::wait_until_settled`], which resolves once
+	/// the service is either reachable or terminal.
+	#[must_use]
+	pub const fn is_terminal(self) -> bool {
+		matches!(self, Self::Shutdown | Self::Broken)
+	}
+
+	/// A short, stable, lowercase operator-facing label for this status — suitable for a
+	/// health line or a `/up`-style check. Never changes for a given variant, so it is
+	/// safe to match on downstream.
+	#[must_use]
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Shutdown => "shutdown",
+			Self::Bootstrapping => "bootstrapping",
+			Self::Reachable => "reachable",
+			Self::DegradedReachable => "degraded",
+			Self::Unreachable => "unreachable",
+			Self::Broken => "broken",
+		}
+	}
+
+	/// Operational severity rank — `0` is healthiest ([`Reachable`](Self::Reachable)),
+	/// higher is worse. Ranks a reachable service healthiest, a degraded-but-reachable
+	/// one next, then the not-yet/again-reachable transients
+	/// ([`Bootstrapping`](Self::Bootstrapping) before [`Unreachable`](Self::Unreachable)),
+	/// then the terminal [`Broken`](Self::Broken) and [`Shutdown`](Self::Shutdown). Total
+	/// and distinct across variants; backs [`worst_of`](Self::worst_of).
+	const fn severity(self) -> u8 {
+		match self {
+			Self::Reachable => 0,
+			Self::DegradedReachable => 1,
+			Self::Bootstrapping => 2,
+			Self::Unreachable => 3,
+			Self::Broken => 4,
+			Self::Shutdown => 5,
+		}
+	}
+
+	/// The worst (least healthy) status across several services — the aggregate health
+	/// of, say, N onion services sharing one Tor client (see
+	/// [`OnionServiceBuilder::tor_client`]). Returns `None` for an empty iterator.
+	///
+	/// Folds by [`severity`](Self::severity), so a single unhealthy service in a fleet is
+	/// never masked by its healthy siblings: `worst_of([Reachable, Broken])` is
+	/// [`Broken`](Self::Broken).
+	#[must_use]
+	pub fn worst_of(statuses: impl IntoIterator<Item = Self>) -> Option<Self> {
+		statuses.into_iter().max_by_key(|status| status.severity())
+	}
+}
+
+impl std::fmt::Display for ServiceStatus {
+	/// Writes the stable [`label`](Self::label), so `ServiceStatus` drops straight into a
+	/// log line or a health response.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.label())
+	}
 }
 
 /// Project arti's `#[non_exhaustive]` onion-service [`State`](tor_hsservice::status::State)
@@ -574,6 +657,25 @@ fn project_service_status(state: tor_hsservice::status::State) -> ServiceStatus 
 	}
 }
 
+/// Drive a [`ServiceStatus`] stream until the first item satisfying `pred`, returning
+/// that status — or `None` if the stream ends first (the underlying service was
+/// dropped before the condition was met).
+///
+/// Extracted from [`OnionServiceHandle::ready`] and its timeout/settle siblings so the
+/// wait logic is unit-testable offline over a constructed stream, with no live Tor
+/// service (the projection that feeds it is already covered by
+/// `service_status_projects_every_arti_state`). Takes the stream by value and pins it
+/// internally, so callers hand `status_events()` straight in without an `Unpin` bound.
+async fn await_status(events: impl Stream<Item = ServiceStatus>, mut pred: impl FnMut(ServiceStatus) -> bool) -> Option<ServiceStatus> {
+	futures::pin_mut!(events);
+	while let Some(status) = events.next().await {
+		if pred(status) {
+			return Some(status);
+		}
+	}
+	None
+}
+
 /// A running onion service plus its controls.
 ///
 /// Returned by [`OnionServiceBuilder::serve`]. The accept loop runs on a spawned
@@ -587,8 +689,9 @@ pub struct OnionServiceHandle {
 	address: OnionAddress,
 	service: Arc<RunningOnionService>,
 	// Kept alive so the onion service's background machinery (intro points,
-	// descriptor publishing) keeps running for the lifetime of the handle.
-	_client: Arc<TorClient<TokioNativeTlsRuntime>>,
+	// descriptor publishing) keeps running for the lifetime of the handle; also handed
+	// out by `tor_client()` for launching sibling services on the same bootstrap.
+	client: Arc<TorClient<TokioNativeTlsRuntime>>,
 	cancel: CancellationToken,
 	task: Mutex<Option<JoinHandle<()>>>,
 	// Set only for an ephemeral service (see `OnionServiceBuilder::ephemeral`): the
@@ -604,6 +707,41 @@ impl OnionServiceHandle {
 		&self.address
 	}
 
+	/// This service's Tor client, for launching sibling services on the same bootstrap
+	/// (onyums ROADMAP Phase 4 — multiple services on one shared client).
+	///
+	/// Bootstrap is the slow part of coming up; hand this `Arc` to another
+	/// [`OnionServiceBuilder::tor_client`] to bring up more services without a second
+	/// bootstrap. Equivalent to sharing an [`OnionService::shared_client`] up front, but
+	/// reachable from an already-running handle.
+	///
+	/// ```rust,no_run
+	/// # async fn f() -> anyhow::Result<()> {
+	/// use axum::{routing::get, Router};
+	/// use onyums::OnionService;
+	///
+	/// let blog = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "blog" })))
+	///     .nickname("blog")
+	///     .serve()
+	///     .await?;
+	/// // Launch a sibling on the same bootstrap, then health-check both.
+	/// let wiki = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "wiki" })))
+	///     .nickname("wiki")
+	///     .tor_client(blog.tor_client())
+	///     .serve()
+	///     .await?;
+	/// let up = onyums::ServiceStatus::worst_of([blog.status(), wiki.status()]);
+	/// println!("fleet: {up:?}, blog ready: {}", blog.is_ready());
+	/// # Ok(())
+	/// # }
+	/// ```
+	#[must_use]
+	pub fn tor_client(&self) -> Arc<TorClient<TokioNativeTlsRuntime>> {
+		self.client.clone()
+	}
+
 	/// The service's current high-level [`ServiceStatus`] — a synchronous snapshot
 	/// of its reachability, projected from arti's live status (onyums ROADMAP
 	/// Phase 4).
@@ -616,6 +754,18 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn status(&self) -> ServiceStatus {
 		project_service_status(self.service.status().state())
+	}
+
+	/// Whether the service is reachable *right now* — a cheap, non-blocking readiness
+	/// check for a health handler (a `/up`-style endpoint), where [`ready`](Self::ready)
+	/// would block.
+	///
+	/// Shorthand for `self.status().is_reachable()`; see
+	/// [`ServiceStatus::is_reachable`] for the one-directional semantics (`false` does
+	/// not prove unreachability).
+	#[must_use]
+	pub fn is_ready(&self) -> bool {
+		self.status().is_reachable()
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -640,15 +790,49 @@ impl OnionServiceHandle {
 	/// actually reach the service, unlike the old global which was populated the
 	/// instant the address was known (long before the descriptor was up).
 	pub async fn ready(&self) {
-		if self.service.status().state().is_fully_reachable() {
+		if self.status().is_reachable() {
 			return;
 		}
-		let mut events = self.service.status_events();
-		while let Some(status) = events.next().await {
-			if status.state().is_fully_reachable() {
-				return;
-			}
+		// Watch the *projected* status stream — the same `ServiceStatus` mapping as
+		// `status()`/`status_events()` — rather than re-deriving arti's
+		// `is_fully_reachable` against the raw state, so readiness has one definition
+		// (onyums ROADMAP Phase 4: fold `ready()` onto the status stream).
+		let _ = await_status(self.status_events(), ServiceStatus::is_reachable).await;
+	}
+
+	/// Like [`ready`](Self::ready), but give up after `timeout`: resolve `true` if the
+	/// service became reachable within the deadline, `false` if the deadline elapsed
+	/// first (or the service was torn down before it reached a reachable state).
+	///
+	/// Use this at startup so a service that never publishes a usable descriptor — a
+	/// broken bootstrap, a hostile network — surfaces as a bounded timeout instead of
+	/// hanging [`ready`](Self::ready) forever. On `false` the caller can read
+	/// [`status`](Self::status) to distinguish still-[`Bootstrapping`](ServiceStatus::Bootstrapping)
+	/// from [`Broken`](ServiceStatus::Broken).
+	pub async fn ready_timeout(&self, timeout: std::time::Duration) -> bool {
+		if self.status().is_reachable() {
+			return true;
 		}
+		tokio::time::timeout(timeout, await_status(self.status_events(), ServiceStatus::is_reachable)).await.ok().flatten().is_some()
+	}
+
+	/// Resolve once the service reaches a *settled* [`ServiceStatus`] and return it:
+	/// either reachable, or a terminal failure ([`Broken`](ServiceStatus::Broken) /
+	/// [`Shutdown`](ServiceStatus::Shutdown)) it will not leave on its own (onyums
+	/// ROADMAP Phase 4).
+	///
+	/// Unlike [`ready`](Self::ready) — which completes *only* on reachability, and so
+	/// blocks indefinitely on a service that broke during bootstrap — this distinguishes
+	/// "came up" from "gave up": test [`ServiceStatus::is_reachable`] on the returned
+	/// status. Resolves immediately when the service is already settled, and reports
+	/// [`Shutdown`](ServiceStatus::Shutdown) if the status stream ends first (the service
+	/// was torn down).
+	pub async fn wait_until_settled(&self) -> ServiceStatus {
+		let current = self.status();
+		if current.is_reachable() || current.is_terminal() {
+			return current;
+		}
+		await_status(self.status_events(), |s| s.is_reachable() || s.is_terminal()).await.unwrap_or(ServiceStatus::Shutdown)
 	}
 
 	/// Stop accepting new connections and await the accept loop's exit.
@@ -784,6 +968,22 @@ fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: 
 	Ok(Arc::new(policy))
 }
 
+/// Reject the one incompatible identity combination before any launch: a caller-shared
+/// Tor client ([`OnionServiceBuilder::tor_client`]) together with
+/// [`ephemeral`](OnionServiceBuilder::ephemeral).
+///
+/// A shared client is bootstrapped against a fixed keystore/state directory, so onyums
+/// cannot point it at the per-launch throwaway directory `ephemeral` relies on for a
+/// disposable identity. Every other pairing is valid (a fresh persistent client, a
+/// fresh ephemeral client, or a shared persistent client). Extracted from
+/// [`OnionServiceBuilder::serve`] so the rule is unit-testable with no live Tor network.
+fn validate_client_choice(ephemeral: bool, has_shared_client: bool) -> Result<()> {
+	if ephemeral && has_shared_client {
+		bail!("ephemeral() conflicts with tor_client(): a shared Tor client has a fixed keystore and cannot provide a throwaway per-launch identity; use one or the other");
+	}
+	Ok(())
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -800,6 +1000,10 @@ pub struct OnionServiceBuilder {
 	restricted_discovery: Option<RestrictedDiscovery>,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 	ephemeral: bool,
+	// A caller-supplied, already-bootstrapped Tor client to launch this service on,
+	// instead of bootstrapping a fresh one (Phase 4 multi-service — bootstrap once,
+	// launch N). `None` keeps today's behaviour: `serve` bootstraps its own client.
+	tor_client: Option<Arc<TorClient<TokioNativeTlsRuntime>>>,
 }
 
 impl OnionServiceBuilder {
@@ -970,6 +1174,50 @@ impl OnionServiceBuilder {
 		self
 	}
 
+	/// Launch this service on a caller-supplied, already-bootstrapped Tor client
+	/// instead of bootstrapping a fresh one (onyums ROADMAP Phase 4 — multiple services
+	/// on one shared client).
+	///
+	/// Tor bootstrap (fetching the consensus, building circuits) is the slow part of
+	/// coming up; a single [`TorClient`] can host any number of onion services, each
+	/// keyed by its own nickname in the client's keystore. Bootstrap once with
+	/// [`OnionService::shared_client`] (or your own re-exported [`arti_client`] client),
+	/// then hand the same `Arc` to several builders so N services share one bootstrap
+	/// and one network footprint:
+	///
+	/// ```rust,no_run
+	/// # async fn f() -> anyhow::Result<()> {
+	/// use axum::{routing::get, Router};
+	/// use onyums::OnionService;
+	///
+	/// let client = OnionService::shared_client().await?;
+	/// let blog = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "blog" })))
+	///     .nickname("blog")
+	///     .tor_client(client.clone())
+	///     .serve()
+	///     .await?;
+	/// let wiki = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "wiki" })))
+	///     .nickname("wiki")
+	///     .tor_client(client)
+	///     .serve()
+	///     .await?;
+	/// # let _ = (blog, wiki);
+	/// # Ok(())
+	/// # }
+	/// ```
+	///
+	/// Conflicts with [`ephemeral`](Self::ephemeral): a shared client owns a fixed
+	/// keystore/state directory, so it cannot also provide the per-launch throwaway
+	/// identity `ephemeral` promises — setting both is an error surfaced from
+	/// [`Self::serve`] (offline, before any launch).
+	#[must_use]
+	pub fn tor_client(mut self, client: Arc<TorClient<TokioNativeTlsRuntime>>) -> Self {
+		self.tor_client = Some(client);
+		self
+	}
+
 	/// Launch the onion service and return a handle once the address is known.
 	///
 	/// The Tor client is bootstrapped and the service launched before this
@@ -1016,12 +1264,20 @@ impl OnionServiceBuilder {
 		// service publicly discoverable — today's default behaviour.
 		let svc_cfg = build_onion_service_config(&nickname, self.restricted_discovery.as_ref())?;
 
-		// Resolve the identity-mode directories (Phase 1). For an ephemeral service the
-		// state dir is a unique throwaway under temp; keep its path so the handle can
-		// remove it on drop. The persistent default keeps the fixed onyums tree.
-		let (state_dir, cache_dir) = storage_dirs(self.ephemeral);
-		let ephemeral_state_dir = self.ephemeral.then(|| std::path::PathBuf::from(&state_dir));
-		let client = setup_tor_client(&state_dir, &cache_dir).await?;
+		// Resolve the Tor client (Phase 1 identity mode + Phase 4 multi-service). A
+		// caller-shared client (bootstrap once, launch N) is used as-is; otherwise
+		// bootstrap a fresh one against the identity-mode directories — for an ephemeral
+		// service a unique throwaway under temp whose path the handle removes on drop,
+		// else the fixed persistent onyums tree. A shared client cannot be ephemeral
+		// (fixed keystore), rejected here before any launch.
+		validate_client_choice(self.ephemeral, self.tor_client.is_some())?;
+		let (client, ephemeral_state_dir) = if let Some(shared) = self.tor_client {
+			(shared, None)
+		} else {
+			let (state_dir, cache_dir) = storage_dirs(self.ephemeral);
+			let ephemeral_state_dir = self.ephemeral.then(|| std::path::PathBuf::from(&state_dir));
+			(setup_tor_client(&state_dir, &cache_dir).await?, ephemeral_state_dir)
+		};
 		let (service, address, request_stream) = initialize_onion_service(&client, svc_cfg)?;
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
@@ -1047,7 +1303,7 @@ impl OnionServiceBuilder {
 			}
 		});
 
-		Ok(OnionServiceHandle { address, service, _client: client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir })
+		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir })
 	}
 }
 
@@ -1062,6 +1318,24 @@ impl OnionService {
 	#[must_use]
 	pub fn builder() -> OnionServiceBuilder {
 		OnionServiceBuilder::default()
+	}
+
+	/// Bootstrap a Tor client to share across several onion services (onyums ROADMAP
+	/// Phase 4 — multiple services on one shared client).
+	///
+	/// Bootstrap is the slow part of coming up; do it once and hand the returned `Arc`
+	/// to each builder via [`OnionServiceBuilder::tor_client`] so N services share one
+	/// bootstrap and one network footprint. Uses the same persistent onyums state/cache
+	/// tree as a default single-service launch, so every service keyed on this client
+	/// gets a stable address across restarts. For a bespoke configuration, build a client
+	/// from the re-exported [`arti_client`] stack instead and pass it the same way.
+	///
+	/// # Errors
+	/// Returns an error if the Tor client fails to build or bootstrap, or if called
+	/// outside a tokio runtime.
+	pub async fn shared_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
+		let (state_dir, cache_dir) = storage_dirs(false);
+		setup_tor_client(&state_dir, &cache_dir).await
 	}
 }
 
@@ -1513,6 +1787,16 @@ mod tests {
 		assert_eq!(builder.raw_handlers[0].0, 9735);
 	}
 
+	#[test]
+	fn validate_client_choice_only_rejects_ephemeral_shared_client() {
+		// A shared Tor client has a fixed keystore, so it cannot also be ephemeral.
+		assert!(validate_client_choice(true, true).is_err(), "ephemeral + shared client must conflict");
+		// Every other pairing is valid: fresh persistent, fresh ephemeral, shared persistent.
+		assert!(validate_client_choice(false, false).is_ok());
+		assert!(validate_client_choice(true, false).is_ok());
+		assert!(validate_client_choice(false, true).is_ok());
+	}
+
 	#[tokio::test]
 	async fn builder_route_port_reserved_errors_before_bootstrap() {
 		// Router and nickname are both set, so validation reaches the port router —
@@ -1838,6 +2122,138 @@ mod tests {
 		assert!(ServiceStatus::Reachable.is_reachable());
 		assert!(ServiceStatus::DegradedReachable.is_reachable());
 		assert!(!ServiceStatus::Bootstrapping.is_reachable());
+	}
+
+	#[test]
+	fn service_status_predicates_partition_the_lifecycle() {
+		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
+
+		// `is_degraded` is exactly `DegradedReachable`, and it implies reachability.
+		assert!(DegradedReachable.is_degraded());
+		assert!(DegradedReachable.is_reachable());
+		for s in [Shutdown, Bootstrapping, Reachable, Unreachable, Broken] {
+			assert!(!s.is_degraded(), "{s:?} must not read as degraded");
+		}
+
+		// `is_broken` is exactly `Broken` — never the transient `Unreachable`.
+		assert!(Broken.is_broken());
+		assert!(!Unreachable.is_broken());
+
+		// `is_terminal` is exactly the settled states, and is disjoint from reachability:
+		// a service is never both reachable and terminal.
+		assert!(Shutdown.is_terminal());
+		assert!(Broken.is_terminal());
+		for s in [Bootstrapping, Reachable, DegradedReachable, Unreachable] {
+			assert!(!s.is_terminal(), "{s:?} must not read as terminal");
+		}
+		for s in [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken] {
+			assert!(!(s.is_reachable() && s.is_terminal()), "{s:?} cannot be both reachable and terminal");
+		}
+	}
+
+	#[test]
+	fn service_status_label_and_display_are_stable_and_distinct() {
+		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
+
+		let all = [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken];
+		// `Display` writes the stable `label`.
+		for s in all {
+			assert_eq!(s.to_string(), s.label());
+			assert!(!s.label().is_empty());
+		}
+		// Labels are pinned (a downstream health check may match on them) and distinct.
+		assert_eq!(Reachable.label(), "reachable");
+		assert_eq!(DegradedReachable.label(), "degraded");
+		assert_eq!(Broken.label(), "broken");
+		let labels: std::collections::HashSet<&str> = all.iter().map(|s| s.label()).collect();
+		assert_eq!(labels.len(), all.len(), "every status needs a distinct label");
+	}
+
+	#[test]
+	fn worst_of_surfaces_the_least_healthy_service_in_a_fleet() {
+		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
+
+		// Empty fleet has no aggregate health.
+		assert_eq!(ServiceStatus::worst_of([]), None);
+		// All-reachable stays reachable; a single element is itself.
+		assert_eq!(ServiceStatus::worst_of([Reachable, Reachable]), Some(Reachable));
+		assert_eq!(ServiceStatus::worst_of([Bootstrapping]), Some(Bootstrapping));
+		// One degraded among reachable surfaces the degradation.
+		assert_eq!(ServiceStatus::worst_of([Reachable, DegradedReachable, Reachable]), Some(DegradedReachable));
+		// A broken (or shut-down) service is never masked by healthy siblings; Shutdown
+		// ranks worst of all.
+		assert_eq!(ServiceStatus::worst_of([Reachable, Broken, DegradedReachable]), Some(Broken));
+		assert_eq!(ServiceStatus::worst_of([Broken, Shutdown, Reachable]), Some(Shutdown));
+		// Bootstrapping (coming up) is treated as less severe than a transient Unreachable.
+		assert_eq!(ServiceStatus::worst_of([Bootstrapping, Unreachable]), Some(Unreachable));
+
+		// The severity ranking is total and distinct — no two states share a rank, so the
+		// fold is deterministic.
+		let all = [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken];
+		let ranks: std::collections::HashSet<u8> = all.iter().map(|s| s.severity()).collect();
+		assert_eq!(ranks.len(), all.len(), "every status needs a distinct severity rank");
+	}
+
+	#[tokio::test]
+	async fn await_status_resolves_on_the_first_match() {
+		use ServiceStatus::{Bootstrapping, DegradedReachable, Reachable, Unreachable};
+
+		// Resolves on the first reachable item, returning *which* reachable status it saw.
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Reachable]);
+		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, Some(Reachable));
+
+		// The very first item already matching is returned immediately (mirrors a service
+		// that is reachable the moment the caller subscribes).
+		let stream = futures::stream::iter([DegradedReachable, Reachable]);
+		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, Some(DegradedReachable));
+	}
+
+	#[tokio::test]
+	async fn await_status_returns_none_when_the_stream_ends_unmatched() {
+		use ServiceStatus::{Bootstrapping, Shutdown, Unreachable};
+
+		// A stream that ends without ever reaching a reachable state (service torn down
+		// mid-bootstrap) resolves to `None` rather than hanging — this is why
+		// `ready_timeout` reports `false` on a dropped service.
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Shutdown]);
+		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, None);
+
+		let empty = futures::stream::iter(Vec::<ServiceStatus>::new());
+		assert_eq!(await_status(empty, ServiceStatus::is_reachable).await, None);
+	}
+
+	#[tokio::test]
+	async fn await_status_settles_on_reachable_or_terminal() {
+		use ServiceStatus::{Bootstrapping, Broken, Reachable, Unreachable};
+
+		// The `wait_until_settled` predicate: a service that *broke* during bootstrap
+		// settles on `Broken`, so a caller distinguishes "gave up" from "came up" instead
+		// of waiting on reachability that will never arrive.
+		let settled = |s: ServiceStatus| s.is_reachable() || s.is_terminal();
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Broken]);
+		assert_eq!(await_status(stream, settled).await, Some(Broken));
+
+		// Reachability settles too — the ordinary success path.
+		let stream = futures::stream::iter([Bootstrapping, Reachable]);
+		assert_eq!(await_status(stream, settled).await, Some(Reachable));
+
+		// Only-ever-transient churn never settles → `None` (which `wait_until_settled`
+		// maps to `Shutdown` for a torn-down stream).
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Bootstrapping]);
+		assert_eq!(await_status(stream, settled).await, None);
+	}
+
+	#[tokio::test]
+	async fn await_status_under_timeout_gives_up_on_a_stalled_stream() {
+		// The exact composition `ready_timeout` relies on: a status stream that never
+		// yields a matching item must elapse rather than block forever. `pending` never
+		// resolves, so a short real deadline reliably elapses (no timing race — the
+		// future genuinely cannot complete).
+		let stalled = futures::stream::pending::<ServiceStatus>();
+		let outcome = tokio::time::timeout(std::time::Duration::from_millis(20), await_status(stalled, ServiceStatus::is_reachable)).await;
+		assert!(outcome.is_err(), "a stalled stream must time out");
+		// And the `ready_timeout` fold of that result reads as not-ready.
+		assert!(outcome.ok().flatten().is_none());
 	}
 
 	#[test]

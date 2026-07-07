@@ -628,6 +628,25 @@ fn project_service_status(state: tor_hsservice::status::State) -> ServiceStatus 
 	}
 }
 
+/// Drive a [`ServiceStatus`] stream until the first item satisfying `pred`, returning
+/// that status — or `None` if the stream ends first (the underlying service was
+/// dropped before the condition was met).
+///
+/// Extracted from [`OnionServiceHandle::ready`] and its timeout/settle siblings so the
+/// wait logic is unit-testable offline over a constructed stream, with no live Tor
+/// service (the projection that feeds it is already covered by
+/// `service_status_projects_every_arti_state`). Takes the stream by value and pins it
+/// internally, so callers hand `status_events()` straight in without an `Unpin` bound.
+async fn await_status(events: impl Stream<Item = ServiceStatus>, mut pred: impl FnMut(ServiceStatus) -> bool) -> Option<ServiceStatus> {
+	futures::pin_mut!(events);
+	while let Some(status) = events.next().await {
+		if pred(status) {
+			return Some(status);
+		}
+	}
+	None
+}
+
 /// A running onion service plus its controls.
 ///
 /// Returned by [`OnionServiceBuilder::serve`]. The accept loop runs on a spawned
@@ -694,15 +713,30 @@ impl OnionServiceHandle {
 	/// actually reach the service, unlike the old global which was populated the
 	/// instant the address was known (long before the descriptor was up).
 	pub async fn ready(&self) {
-		if self.service.status().state().is_fully_reachable() {
+		if self.status().is_reachable() {
 			return;
 		}
-		let mut events = self.service.status_events();
-		while let Some(status) = events.next().await {
-			if status.state().is_fully_reachable() {
-				return;
-			}
+		// Watch the *projected* status stream — the same `ServiceStatus` mapping as
+		// `status()`/`status_events()` — rather than re-deriving arti's
+		// `is_fully_reachable` against the raw state, so readiness has one definition
+		// (onyums ROADMAP Phase 4: fold `ready()` onto the status stream).
+		let _ = await_status(self.status_events(), ServiceStatus::is_reachable).await;
+	}
+
+	/// Like [`ready`](Self::ready), but give up after `timeout`: resolve `true` if the
+	/// service became reachable within the deadline, `false` if the deadline elapsed
+	/// first (or the service was torn down before it reached a reachable state).
+	///
+	/// Use this at startup so a service that never publishes a usable descriptor — a
+	/// broken bootstrap, a hostile network — surfaces as a bounded timeout instead of
+	/// hanging [`ready`](Self::ready) forever. On `false` the caller can read
+	/// [`status`](Self::status) to distinguish still-[`Bootstrapping`](ServiceStatus::Bootstrapping)
+	/// from [`Broken`](ServiceStatus::Broken).
+	pub async fn ready_timeout(&self, timeout: std::time::Duration) -> bool {
+		if self.status().is_reachable() {
+			return true;
 		}
+		tokio::time::timeout(timeout, await_status(self.status_events(), ServiceStatus::is_reachable)).await.ok().flatten().is_some()
 	}
 
 	/// Stop accepting new connections and await the accept loop's exit.
@@ -1937,6 +1971,47 @@ mod tests {
 		assert_eq!(Broken.label(), "broken");
 		let labels: std::collections::HashSet<&str> = all.iter().map(|s| s.label()).collect();
 		assert_eq!(labels.len(), all.len(), "every status needs a distinct label");
+	}
+
+	#[tokio::test]
+	async fn await_status_resolves_on_the_first_match() {
+		use ServiceStatus::{Bootstrapping, DegradedReachable, Reachable, Unreachable};
+
+		// Resolves on the first reachable item, returning *which* reachable status it saw.
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Reachable]);
+		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, Some(Reachable));
+
+		// The very first item already matching is returned immediately (mirrors a service
+		// that is reachable the moment the caller subscribes).
+		let stream = futures::stream::iter([DegradedReachable, Reachable]);
+		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, Some(DegradedReachable));
+	}
+
+	#[tokio::test]
+	async fn await_status_returns_none_when_the_stream_ends_unmatched() {
+		use ServiceStatus::{Bootstrapping, Shutdown, Unreachable};
+
+		// A stream that ends without ever reaching a reachable state (service torn down
+		// mid-bootstrap) resolves to `None` rather than hanging — this is why
+		// `ready_timeout` reports `false` on a dropped service.
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Shutdown]);
+		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, None);
+
+		let empty = futures::stream::iter(Vec::<ServiceStatus>::new());
+		assert_eq!(await_status(empty, ServiceStatus::is_reachable).await, None);
+	}
+
+	#[tokio::test]
+	async fn await_status_under_timeout_gives_up_on_a_stalled_stream() {
+		// The exact composition `ready_timeout` relies on: a status stream that never
+		// yields a matching item must elapse rather than block forever. `pending` never
+		// resolves, so a short real deadline reliably elapses (no timing race — the
+		// future genuinely cannot complete).
+		let stalled = futures::stream::pending::<ServiceStatus>();
+		let outcome = tokio::time::timeout(std::time::Duration::from_millis(20), await_status(stalled, ServiceStatus::is_reachable)).await;
+		assert!(outcome.is_err(), "a stalled stream must time out");
+		// And the `ready_timeout` fold of that result reads as not-ready.
+		assert!(outcome.ok().flatten().is_none());
 	}
 
 	#[test]

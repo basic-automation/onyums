@@ -12,7 +12,8 @@ The posture is *secure and complete by default*: the hard, Tor-specific machiner
 - **One-liner serve** — `serve(app, "nickname")` is the full secure stack; the builder (`OnionService::builder()`) tunes or relaxes it.
 - **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF, plus an Under Attack Mode toggle and observable security events; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
 - **Restricted discovery (v3 client authorization)** — `.authorized_clients(...)` publishes a descriptor only the listed clients can decrypt, so an unlisted client cannot even discover the service; `provision_client(...)` mints a new client's x25519 keypair and renders Tor's canonical `.auth` / `.auth_private` files. See [Restricted discovery](#restricted-discovery--v3-client-authorization).
-- **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()`, a synchronous `status()` snapshot (typed `ServiceStatus`), a `status_events()` transition stream, the typed `.onion` address, and `shutdown()`.
+- **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()` (and bounded `ready_timeout()`), `wait_until_settled()` (resolves on reachable *or* a terminal failure, so a broken bootstrap never hangs), a synchronous `status()` snapshot and non-blocking `is_ready()`, a `status_events()` transition stream, the typed `.onion` address, and `shutdown()`.
+- **Multiple services on one bootstrap** — bootstrap once with `OnionService::shared_client()` (or reuse a running handle's `tor_client()`), pass it to several builders via `.tor_client(...)`, and aggregate fleet health with `ServiceStatus::worst_of([...])`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
 - **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, bring-your-own-key migration from a Tor `hs_ed25519_secret_key` file, and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
@@ -57,7 +58,7 @@ async fn main() {
 	println!("Onion Address: {}", handle.onion_address());
 
 	// Poll the current health without blocking (still bootstrapping? degraded? broken?):
-	if handle.status().is_reachable() {
+	if handle.is_ready() {
 		println!("service is reachable");
 	}
 
@@ -69,7 +70,65 @@ async fn main() {
 `status()` returns a stable `ServiceStatus` — `Shutdown` / `Bootstrapping` /
 `Reachable` / `DegradedReachable` / `Unreachable` / `Broken` — onyums' own
 projection of arti's onion-service state, so you can surface health at any moment
-instead of only awaiting first reachability with `ready()`.
+instead of only awaiting first reachability with `ready()`. Each variant carries
+predicates (`is_reachable()`, `is_degraded()`, `is_broken()`, `is_terminal()`) and
+a stable `Display` label for a `/up`-style health line.
+
+For startup that must not hang, `ready_timeout(dur)` returns `false` if the
+service is not reachable within the deadline, and `wait_until_settled()` resolves
+the moment the service is either reachable **or** terminally `Broken`/`Shutdown`
+— so a bootstrap that fails surfaces as a settled status instead of an infinite
+wait:
+
+```rust
+use std::time::Duration;
+
+if handle.ready_timeout(Duration::from_secs(90)).await {
+	println!("reachable");
+} else {
+	// didn't come up in time — inspect why
+	println!("not ready: {}", handle.status()); // e.g. "bootstrapping" or "broken"
+}
+```
+
+### Multiple services on one bootstrap
+
+Tor bootstrap is the slow part of coming up; a single client can host any number
+of onion services, each keyed by its own nickname. Bootstrap once and share it,
+then fold the fleet's health into a single worst-case signal:
+
+```rust
+use onyums::{OnionService, ServiceStatus, routing::get, Router};
+
+#[tokio::main]
+async fn main() {
+	let client = OnionService::shared_client().await.unwrap();
+
+	let blog = OnionService::builder()
+		.router(Router::new().route("/", get(|| async { "blog" })))
+		.nickname("blog")
+		.tor_client(client.clone())
+		.serve()
+		.await
+		.unwrap();
+	let wiki = OnionService::builder()
+		.router(Router::new().route("/", get(|| async { "wiki" })))
+		.nickname("wiki")
+		.tor_client(client) // or blog.tor_client() from a running handle
+		.serve()
+		.await
+		.unwrap();
+
+	// Aggregate health — one broken service is never masked by healthy siblings.
+	if let Some(worst) = ServiceStatus::worst_of([blog.status(), wiki.status()]) {
+		println!("fleet: {worst}");
+	}
+}
+```
+
+`.ephemeral()` conflicts with `.tor_client(...)` — a shared client has a fixed
+keystore and cannot supply a throwaway per-launch identity — and that pairing is
+rejected offline, before any launch.
 
 ****
 

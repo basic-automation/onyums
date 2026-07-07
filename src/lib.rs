@@ -689,8 +689,9 @@ pub struct OnionServiceHandle {
 	address: OnionAddress,
 	service: Arc<RunningOnionService>,
 	// Kept alive so the onion service's background machinery (intro points,
-	// descriptor publishing) keeps running for the lifetime of the handle.
-	_client: Arc<TorClient<TokioNativeTlsRuntime>>,
+	// descriptor publishing) keeps running for the lifetime of the handle; also handed
+	// out by `tor_client()` for launching sibling services on the same bootstrap.
+	client: Arc<TorClient<TokioNativeTlsRuntime>>,
 	cancel: CancellationToken,
 	task: Mutex<Option<JoinHandle<()>>>,
 	// Set only for an ephemeral service (see `OnionServiceBuilder::ephemeral`): the
@@ -706,6 +707,41 @@ impl OnionServiceHandle {
 		&self.address
 	}
 
+	/// This service's Tor client, for launching sibling services on the same bootstrap
+	/// (onyums ROADMAP Phase 4 — multiple services on one shared client).
+	///
+	/// Bootstrap is the slow part of coming up; hand this `Arc` to another
+	/// [`OnionServiceBuilder::tor_client`] to bring up more services without a second
+	/// bootstrap. Equivalent to sharing an [`OnionService::shared_client`] up front, but
+	/// reachable from an already-running handle.
+	///
+	/// ```rust,no_run
+	/// # async fn f() -> anyhow::Result<()> {
+	/// use axum::{routing::get, Router};
+	/// use onyums::OnionService;
+	///
+	/// let blog = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "blog" })))
+	///     .nickname("blog")
+	///     .serve()
+	///     .await?;
+	/// // Launch a sibling on the same bootstrap, then health-check both.
+	/// let wiki = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "wiki" })))
+	///     .nickname("wiki")
+	///     .tor_client(blog.tor_client())
+	///     .serve()
+	///     .await?;
+	/// let up = onyums::ServiceStatus::worst_of([blog.status(), wiki.status()]);
+	/// println!("fleet: {up:?}, blog ready: {}", blog.is_ready());
+	/// # Ok(())
+	/// # }
+	/// ```
+	#[must_use]
+	pub fn tor_client(&self) -> Arc<TorClient<TokioNativeTlsRuntime>> {
+		self.client.clone()
+	}
+
 	/// The service's current high-level [`ServiceStatus`] — a synchronous snapshot
 	/// of its reachability, projected from arti's live status (onyums ROADMAP
 	/// Phase 4).
@@ -718,6 +754,18 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn status(&self) -> ServiceStatus {
 		project_service_status(self.service.status().state())
+	}
+
+	/// Whether the service is reachable *right now* — a cheap, non-blocking readiness
+	/// check for a health handler (a `/up`-style endpoint), where [`ready`](Self::ready)
+	/// would block.
+	///
+	/// Shorthand for `self.status().is_reachable()`; see
+	/// [`ServiceStatus::is_reachable`] for the one-directional semantics (`false` does
+	/// not prove unreachability).
+	#[must_use]
+	pub fn is_ready(&self) -> bool {
+		self.status().is_reachable()
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -1255,7 +1303,7 @@ impl OnionServiceBuilder {
 			}
 		});
 
-		Ok(OnionServiceHandle { address, service, _client: client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir })
+		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir })
 	}
 }
 

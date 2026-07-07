@@ -739,6 +739,25 @@ impl OnionServiceHandle {
 		tokio::time::timeout(timeout, await_status(self.status_events(), ServiceStatus::is_reachable)).await.ok().flatten().is_some()
 	}
 
+	/// Resolve once the service reaches a *settled* [`ServiceStatus`] and return it:
+	/// either reachable, or a terminal failure ([`Broken`](ServiceStatus::Broken) /
+	/// [`Shutdown`](ServiceStatus::Shutdown)) it will not leave on its own (onyums
+	/// ROADMAP Phase 4).
+	///
+	/// Unlike [`ready`](Self::ready) — which completes *only* on reachability, and so
+	/// blocks indefinitely on a service that broke during bootstrap — this distinguishes
+	/// "came up" from "gave up": test [`ServiceStatus::is_reachable`] on the returned
+	/// status. Resolves immediately when the service is already settled, and reports
+	/// [`Shutdown`](ServiceStatus::Shutdown) if the status stream ends first (the service
+	/// was torn down).
+	pub async fn wait_until_settled(&self) -> ServiceStatus {
+		let current = self.status();
+		if current.is_reachable() || current.is_terminal() {
+			return current;
+		}
+		await_status(self.status_events(), |s| s.is_reachable() || s.is_terminal()).await.unwrap_or(ServiceStatus::Shutdown)
+	}
+
 	/// Stop accepting new connections and await the accept loop's exit.
 	///
 	/// Cancels the spawned accept loop via its [`CancellationToken`] and joins
@@ -1999,6 +2018,27 @@ mod tests {
 
 		let empty = futures::stream::iter(Vec::<ServiceStatus>::new());
 		assert_eq!(await_status(empty, ServiceStatus::is_reachable).await, None);
+	}
+
+	#[tokio::test]
+	async fn await_status_settles_on_reachable_or_terminal() {
+		use ServiceStatus::{Bootstrapping, Broken, Reachable, Unreachable};
+
+		// The `wait_until_settled` predicate: a service that *broke* during bootstrap
+		// settles on `Broken`, so a caller distinguishes "gave up" from "came up" instead
+		// of waiting on reachability that will never arrive.
+		let settled = |s: ServiceStatus| s.is_reachable() || s.is_terminal();
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Broken]);
+		assert_eq!(await_status(stream, settled).await, Some(Broken));
+
+		// Reachability settles too — the ordinary success path.
+		let stream = futures::stream::iter([Bootstrapping, Reachable]);
+		assert_eq!(await_status(stream, settled).await, Some(Reachable));
+
+		// Only-ever-transient churn never settles → `None` (which `wait_until_settled`
+		// maps to `Shutdown` for a torn-down stream).
+		let stream = futures::stream::iter([Bootstrapping, Unreachable, Bootstrapping]);
+		assert_eq!(await_status(stream, settled).await, None);
 	}
 
 	#[tokio::test]

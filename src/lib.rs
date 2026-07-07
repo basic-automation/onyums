@@ -550,6 +550,60 @@ impl ServiceStatus {
 	pub const fn is_reachable(self) -> bool {
 		matches!(self, Self::Reachable | Self::DegradedReachable)
 	}
+
+	/// Whether the service is running reachable but *degraded* — up, with a current
+	/// descriptor, but fewer or less-satisfactory introduction points than desired.
+	///
+	/// A subset of [`is_reachable`](Self::is_reachable): a degraded service still
+	/// serves clients, but an operator may want to alarm on it.
+	#[must_use]
+	pub const fn is_degraded(self) -> bool {
+		matches!(self, Self::DegradedReachable)
+	}
+
+	/// Whether the service hit a problem onyums could not recover from
+	/// ([`Broken`](Self::Broken)) — distinct from the transient
+	/// [`Unreachable`](Self::Unreachable), which is expected to recover on its own.
+	#[must_use]
+	pub const fn is_broken(self) -> bool {
+		matches!(self, Self::Broken)
+	}
+
+	/// Whether this is a *settled* status the service will not leave on its own:
+	/// [`Shutdown`](Self::Shutdown) (stopped) or [`Broken`](Self::Broken) (unrecoverable).
+	///
+	/// The complement of the states a service passes through or recovers from —
+	/// [`Bootstrapping`](Self::Bootstrapping), [`Unreachable`](Self::Unreachable), and the
+	/// reachable states — so a caller watching the lifecycle knows when further waiting
+	/// is pointless. See [`OnionServiceHandle::wait_until_settled`], which resolves once
+	/// the service is either reachable or terminal.
+	#[must_use]
+	pub const fn is_terminal(self) -> bool {
+		matches!(self, Self::Shutdown | Self::Broken)
+	}
+
+	/// A short, stable, lowercase operator-facing label for this status — suitable for a
+	/// health line or a `/up`-style check. Never changes for a given variant, so it is
+	/// safe to match on downstream.
+	#[must_use]
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Shutdown => "shutdown",
+			Self::Bootstrapping => "bootstrapping",
+			Self::Reachable => "reachable",
+			Self::DegradedReachable => "degraded",
+			Self::Unreachable => "unreachable",
+			Self::Broken => "broken",
+		}
+	}
+}
+
+impl std::fmt::Display for ServiceStatus {
+	/// Writes the stable [`label`](Self::label), so `ServiceStatus` drops straight into a
+	/// log line or a health response.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.write_str(self.label())
+	}
 }
 
 /// Project arti's `#[non_exhaustive]` onion-service [`State`](tor_hsservice::status::State)
@@ -1838,6 +1892,51 @@ mod tests {
 		assert!(ServiceStatus::Reachable.is_reachable());
 		assert!(ServiceStatus::DegradedReachable.is_reachable());
 		assert!(!ServiceStatus::Bootstrapping.is_reachable());
+	}
+
+	#[test]
+	fn service_status_predicates_partition_the_lifecycle() {
+		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
+
+		// `is_degraded` is exactly `DegradedReachable`, and it implies reachability.
+		assert!(DegradedReachable.is_degraded());
+		assert!(DegradedReachable.is_reachable());
+		for s in [Shutdown, Bootstrapping, Reachable, Unreachable, Broken] {
+			assert!(!s.is_degraded(), "{s:?} must not read as degraded");
+		}
+
+		// `is_broken` is exactly `Broken` — never the transient `Unreachable`.
+		assert!(Broken.is_broken());
+		assert!(!Unreachable.is_broken());
+
+		// `is_terminal` is exactly the settled states, and is disjoint from reachability:
+		// a service is never both reachable and terminal.
+		assert!(Shutdown.is_terminal());
+		assert!(Broken.is_terminal());
+		for s in [Bootstrapping, Reachable, DegradedReachable, Unreachable] {
+			assert!(!s.is_terminal(), "{s:?} must not read as terminal");
+		}
+		for s in [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken] {
+			assert!(!(s.is_reachable() && s.is_terminal()), "{s:?} cannot be both reachable and terminal");
+		}
+	}
+
+	#[test]
+	fn service_status_label_and_display_are_stable_and_distinct() {
+		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
+
+		let all = [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken];
+		// `Display` writes the stable `label`.
+		for s in all {
+			assert_eq!(s.to_string(), s.label());
+			assert!(!s.label().is_empty());
+		}
+		// Labels are pinned (a downstream health check may match on them) and distinct.
+		assert_eq!(Reachable.label(), "reachable");
+		assert_eq!(DegradedReachable.label(), "degraded");
+		assert_eq!(Broken.label(), "broken");
+		let labels: std::collections::HashSet<&str> = all.iter().map(|s| s.label()).collect();
+		assert_eq!(labels.len(), all.len(), "every status needs a distinct label");
 	}
 
 	#[test]

@@ -891,6 +891,22 @@ fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: 
 	Ok(Arc::new(policy))
 }
 
+/// Reject the one incompatible identity combination before any launch: a caller-shared
+/// Tor client ([`OnionServiceBuilder::tor_client`]) together with
+/// [`ephemeral`](OnionServiceBuilder::ephemeral).
+///
+/// A shared client is bootstrapped against a fixed keystore/state directory, so onyums
+/// cannot point it at the per-launch throwaway directory `ephemeral` relies on for a
+/// disposable identity. Every other pairing is valid (a fresh persistent client, a
+/// fresh ephemeral client, or a shared persistent client). Extracted from
+/// [`OnionServiceBuilder::serve`] so the rule is unit-testable with no live Tor network.
+fn validate_client_choice(ephemeral: bool, has_shared_client: bool) -> Result<()> {
+	if ephemeral && has_shared_client {
+		bail!("ephemeral() conflicts with tor_client(): a shared Tor client has a fixed keystore and cannot provide a throwaway per-launch identity; use one or the other");
+	}
+	Ok(())
+}
+
 /// Builder for an [`OnionServiceHandle`] — the full secure stack, tuned where you
 /// need it.
 ///
@@ -907,6 +923,10 @@ pub struct OnionServiceBuilder {
 	restricted_discovery: Option<RestrictedDiscovery>,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 	ephemeral: bool,
+	// A caller-supplied, already-bootstrapped Tor client to launch this service on,
+	// instead of bootstrapping a fresh one (Phase 4 multi-service — bootstrap once,
+	// launch N). `None` keeps today's behaviour: `serve` bootstraps its own client.
+	tor_client: Option<Arc<TorClient<TokioNativeTlsRuntime>>>,
 }
 
 impl OnionServiceBuilder {
@@ -1077,6 +1097,50 @@ impl OnionServiceBuilder {
 		self
 	}
 
+	/// Launch this service on a caller-supplied, already-bootstrapped Tor client
+	/// instead of bootstrapping a fresh one (onyums ROADMAP Phase 4 — multiple services
+	/// on one shared client).
+	///
+	/// Tor bootstrap (fetching the consensus, building circuits) is the slow part of
+	/// coming up; a single [`TorClient`] can host any number of onion services, each
+	/// keyed by its own nickname in the client's keystore. Bootstrap once with
+	/// [`OnionService::shared_client`] (or your own re-exported [`arti_client`] client),
+	/// then hand the same `Arc` to several builders so N services share one bootstrap
+	/// and one network footprint:
+	///
+	/// ```rust,no_run
+	/// # async fn f() -> anyhow::Result<()> {
+	/// use axum::{routing::get, Router};
+	/// use onyums::OnionService;
+	///
+	/// let client = OnionService::shared_client().await?;
+	/// let blog = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "blog" })))
+	///     .nickname("blog")
+	///     .tor_client(client.clone())
+	///     .serve()
+	///     .await?;
+	/// let wiki = OnionService::builder()
+	///     .router(Router::new().route("/", get(|| async { "wiki" })))
+	///     .nickname("wiki")
+	///     .tor_client(client)
+	///     .serve()
+	///     .await?;
+	/// # let _ = (blog, wiki);
+	/// # Ok(())
+	/// # }
+	/// ```
+	///
+	/// Conflicts with [`ephemeral`](Self::ephemeral): a shared client owns a fixed
+	/// keystore/state directory, so it cannot also provide the per-launch throwaway
+	/// identity `ephemeral` promises — setting both is an error surfaced from
+	/// [`Self::serve`] (offline, before any launch).
+	#[must_use]
+	pub fn tor_client(mut self, client: Arc<TorClient<TokioNativeTlsRuntime>>) -> Self {
+		self.tor_client = Some(client);
+		self
+	}
+
 	/// Launch the onion service and return a handle once the address is known.
 	///
 	/// The Tor client is bootstrapped and the service launched before this
@@ -1123,12 +1187,20 @@ impl OnionServiceBuilder {
 		// service publicly discoverable — today's default behaviour.
 		let svc_cfg = build_onion_service_config(&nickname, self.restricted_discovery.as_ref())?;
 
-		// Resolve the identity-mode directories (Phase 1). For an ephemeral service the
-		// state dir is a unique throwaway under temp; keep its path so the handle can
-		// remove it on drop. The persistent default keeps the fixed onyums tree.
-		let (state_dir, cache_dir) = storage_dirs(self.ephemeral);
-		let ephemeral_state_dir = self.ephemeral.then(|| std::path::PathBuf::from(&state_dir));
-		let client = setup_tor_client(&state_dir, &cache_dir).await?;
+		// Resolve the Tor client (Phase 1 identity mode + Phase 4 multi-service). A
+		// caller-shared client (bootstrap once, launch N) is used as-is; otherwise
+		// bootstrap a fresh one against the identity-mode directories — for an ephemeral
+		// service a unique throwaway under temp whose path the handle removes on drop,
+		// else the fixed persistent onyums tree. A shared client cannot be ephemeral
+		// (fixed keystore), rejected here before any launch.
+		validate_client_choice(self.ephemeral, self.tor_client.is_some())?;
+		let (client, ephemeral_state_dir) = if let Some(shared) = self.tor_client {
+			(shared, None)
+		} else {
+			let (state_dir, cache_dir) = storage_dirs(self.ephemeral);
+			let ephemeral_state_dir = self.ephemeral.then(|| std::path::PathBuf::from(&state_dir));
+			(setup_tor_client(&state_dir, &cache_dir).await?, ephemeral_state_dir)
+		};
 		let (service, address, request_stream) = initialize_onion_service(&client, svc_cfg)?;
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
@@ -1169,6 +1241,24 @@ impl OnionService {
 	#[must_use]
 	pub fn builder() -> OnionServiceBuilder {
 		OnionServiceBuilder::default()
+	}
+
+	/// Bootstrap a Tor client to share across several onion services (onyums ROADMAP
+	/// Phase 4 — multiple services on one shared client).
+	///
+	/// Bootstrap is the slow part of coming up; do it once and hand the returned `Arc`
+	/// to each builder via [`OnionServiceBuilder::tor_client`] so N services share one
+	/// bootstrap and one network footprint. Uses the same persistent onyums state/cache
+	/// tree as a default single-service launch, so every service keyed on this client
+	/// gets a stable address across restarts. For a bespoke configuration, build a client
+	/// from the re-exported [`arti_client`] stack instead and pass it the same way.
+	///
+	/// # Errors
+	/// Returns an error if the Tor client fails to build or bootstrap, or if called
+	/// outside a tokio runtime.
+	pub async fn shared_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
+		let (state_dir, cache_dir) = storage_dirs(false);
+		setup_tor_client(&state_dir, &cache_dir).await
 	}
 }
 
@@ -1618,6 +1708,16 @@ mod tests {
 		let builder = OnionServiceBuilder::default().route_port(9735, RawTcpHandler::new("127.0.0.1:9735"));
 		assert_eq!(builder.raw_handlers.len(), 1);
 		assert_eq!(builder.raw_handlers[0].0, 9735);
+	}
+
+	#[test]
+	fn validate_client_choice_only_rejects_ephemeral_shared_client() {
+		// A shared Tor client has a fixed keystore, so it cannot also be ephemeral.
+		assert!(validate_client_choice(true, true).is_err(), "ephemeral + shared client must conflict");
+		// Every other pairing is valid: fresh persistent, fresh ephemeral, shared persistent.
+		assert!(validate_client_choice(false, false).is_ok());
+		assert!(validate_client_choice(true, false).is_ok());
+		assert!(validate_client_choice(false, true).is_ok());
 	}
 
 	#[tokio::test]

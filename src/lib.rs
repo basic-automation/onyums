@@ -596,6 +596,35 @@ impl ServiceStatus {
 			Self::Broken => "broken",
 		}
 	}
+
+	/// Operational severity rank — `0` is healthiest ([`Reachable`](Self::Reachable)),
+	/// higher is worse. Ranks a reachable service healthiest, a degraded-but-reachable
+	/// one next, then the not-yet/again-reachable transients
+	/// ([`Bootstrapping`](Self::Bootstrapping) before [`Unreachable`](Self::Unreachable)),
+	/// then the terminal [`Broken`](Self::Broken) and [`Shutdown`](Self::Shutdown). Total
+	/// and distinct across variants; backs [`worst_of`](Self::worst_of).
+	const fn severity(self) -> u8 {
+		match self {
+			Self::Reachable => 0,
+			Self::DegradedReachable => 1,
+			Self::Bootstrapping => 2,
+			Self::Unreachable => 3,
+			Self::Broken => 4,
+			Self::Shutdown => 5,
+		}
+	}
+
+	/// The worst (least healthy) status across several services — the aggregate health
+	/// of, say, N onion services sharing one Tor client (see
+	/// [`OnionServiceBuilder::tor_client`]). Returns `None` for an empty iterator.
+	///
+	/// Folds by [`severity`](Self::severity), so a single unhealthy service in a fleet is
+	/// never masked by its healthy siblings: `worst_of([Reachable, Broken])` is
+	/// [`Broken`](Self::Broken).
+	#[must_use]
+	pub fn worst_of(statuses: impl IntoIterator<Item = Self>) -> Option<Self> {
+		statuses.into_iter().max_by_key(|status| status.severity())
+	}
 }
 
 impl std::fmt::Display for ServiceStatus {
@@ -2090,6 +2119,31 @@ mod tests {
 		assert_eq!(Broken.label(), "broken");
 		let labels: std::collections::HashSet<&str> = all.iter().map(|s| s.label()).collect();
 		assert_eq!(labels.len(), all.len(), "every status needs a distinct label");
+	}
+
+	#[test]
+	fn worst_of_surfaces_the_least_healthy_service_in_a_fleet() {
+		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
+
+		// Empty fleet has no aggregate health.
+		assert_eq!(ServiceStatus::worst_of([]), None);
+		// All-reachable stays reachable; a single element is itself.
+		assert_eq!(ServiceStatus::worst_of([Reachable, Reachable]), Some(Reachable));
+		assert_eq!(ServiceStatus::worst_of([Bootstrapping]), Some(Bootstrapping));
+		// One degraded among reachable surfaces the degradation.
+		assert_eq!(ServiceStatus::worst_of([Reachable, DegradedReachable, Reachable]), Some(DegradedReachable));
+		// A broken (or shut-down) service is never masked by healthy siblings; Shutdown
+		// ranks worst of all.
+		assert_eq!(ServiceStatus::worst_of([Reachable, Broken, DegradedReachable]), Some(Broken));
+		assert_eq!(ServiceStatus::worst_of([Broken, Shutdown, Reachable]), Some(Shutdown));
+		// Bootstrapping (coming up) is treated as less severe than a transient Unreachable.
+		assert_eq!(ServiceStatus::worst_of([Bootstrapping, Unreachable]), Some(Unreachable));
+
+		// The severity ranking is total and distinct — no two states share a rank, so the
+		// fold is deterministic.
+		let all = [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken];
+		let ranks: std::collections::HashSet<u8> = all.iter().map(|s| s.severity()).collect();
+		assert_eq!(ranks.len(), all.len(), "every status needs a distinct severity rank");
 	}
 
 	#[tokio::test]

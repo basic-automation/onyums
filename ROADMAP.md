@@ -10,6 +10,15 @@
 - [x] Kill the global `ONION_NAME` singleton — per-service handle returned from the builder
 - [x] Fix the per-request thread+runtime hack — serve on the existing tokio runtime via a `tower`/`hyper` service
 - [x] First-class readiness + graceful shutdown — `OnionServiceHandle` with `ready()` / `onion_address()` / `shutdown()`; `serve(app, nickname)` is a thin wrapper over the builder
+- [ ] Split src/lib.rs — it's ~108 KB and overloaded with public API types, Tor bootstrap, service lifecycle, status projection, Skin integration, TLS layering, port-router assembly, and builder logic. Break into focused modules: builder.rs, handle.rs, tor_client.rs, service_config.rs, serve_loop.rs, status.rs, http_stack.rs, identity.rs.
+- [ ] Preserve upstream error contexts — setup_tor_client and launch_onion_service use map_err(|_| ...) which discards the original error. Replace with map_err(|e| anyhow!("...: {e}")) or with_context(...). Critical for operators debugging Tor bootstrap failures.
+- [ ] Add CI — no .github/workflows exists. Add: cargo fmt --check, cargo clippy --all-targets --all-features -D warnings, cargo test --workspace, cargo audit/cargo deny, MSRV check, docs build.
+- [ ] Add live Tor integration tests — current tests are offline-only mocks via tower. The roadmap itself flags raw-TCP serve, multi-service, and status-event emission as needing "real Tor runs." Add an --ignored or CI-gated live test tier.
+- [ ] Add concurrency/backpressure limits — code spawns a task per rendezvous circuit and per stream without explicit limits. Add configurable semaphores: max circuits, max streams per circuit, max total streams, max body size before WAF inspection, per-handler timeouts.
+- [ ] Replace synchronous Drop cleanup — ephemeral state cleanup uses std::fs::remove_dir_all in Drop, which blocks the async runtime. Prefer explicit async shutdown() or spawn_blocking.
+- [ ] Add #![forbid(unsafe_code)] if achievable, or document why not — axum/axum-extra advertise this.
+- [ ] Unify dependency tree — #![allow(clippy::multiple_crate_versions)] suggests hyper/tokio/arti version mismatches; reduce compiled binary weight.
+
 
 ## Phase 1 — Stable identity by default — `0.5`
 
@@ -34,6 +43,22 @@
 - [x] Skin integration: Under Attack Mode toggle on the builder — force every new circuit through the gate
 - [ ] Skin integration: feed Skin's adaptive-difficulty signal from onyums-observed circuit/request rate (intro-layer PoW effort is not surfaced by Arti)
 - [x] Surface Skin's security events (challenge / WAF / rate-limit / teardown) into the Phase 4 observability stream — circuit-layer events via `.circuit_events(sink)`; HTTP-gate events via `Skin::builder().events(sink)` + `.skin(...)`
+- [ ] Upgrade Arti from pinned 0.43.0 — the project's own roadmap calls the upgrade "a security win" due to medium-severity onion-service DoS fixes in newer versions.
+- [ ] Add SECURITY.md — no vulnerability disclosure policy exists. Add supported versions, disclosure contact, expected response timelines.
+- [ ] Add cargo audit/cargo deny to CI — non-negotiable for a security-critical crate.
+- [ ] Zeroize secret material — ClientAuthKeypair stores [u8; 32], exposes secret_bytes(), redacts Debug, but has no visible zeroization on drop. Use zeroize/secrecy crates.
+- [ ] Enforce filesystem permissions for keystore — default is ./tor/onyums/state with no explicit permission hardening. Document and enforce 0700/0600; fail closed on world-readable key files.
+- [ ] Document restricted-discovery limits prominently — the README correctly says it's DoS resistance, not authentication (removing a client doesn't revoke an already-connected one). Make this warning prominent near .authorized_clients() and show how to layer app auth.
+- [ ] Label the WAF as best-effort/non-authoritative — a "starter signature ruleset" regex WAF is trivially bypassed. Don't let "abuse defense on by default" imply it's a substitute for a secure app.
+- [ ] Add raw-port security controls — RawTcpHandler bypasses the HTTP Skin/WAF entirely. Add per-port allowlists, connection limits, auth hooks, and explicit warnings when exposing SSH/admin services.
+- [ ] Fix Under-Attack "Challenge" for raw TCP — CircuitAction::Challenge maps to "accept" for raw streams because there's no HTTP challenge page. For raw ports, Challenge should become Reject unless the handler implements protocol-specific challenges.
+- [ ] Treat CircuitId as short-lived only — it's synthetic (Arti doesn't expose a durable circuit identifier); attackers can rotate circuits. Bind longer-lived controls to clearance tokens, client certs, or restricted-discovery keys.
+- [ ] Add signal trapping for ephemeral cleanup — OOM/SIGKILL causes temp keystore dirs to linger indefinitely. Bind to SIGINT/SIGTERM via tokio::signal for guaranteed cleanup.
+- [ ] Document "double TLS" semantics — Tor encrypts the circuit, but Onyums adds inner TLS so traffic from local Tor exit logic to Axum remains encrypted against local memory snooping. This is a real security property — articulate it.
+- [ ] Intro-layer Proof-of-Work is NOT done — blocked on experimental Arti hs-pow-full. Skin PoW is HTTP-layer only; don't imply Tor introduction-point flood protection exists.
+- [ ] Live BYO-key launch not done — only offline parse/derive exists. Mark it explicitly as offline-only in README.
+- [ ] Single-onion-service mode blocked upstream on Arti 0.43.
+- [ ] Monitoring/metrics incomplete — per-service metrics (active circuits, intro-point health, PoW effort, descriptor republish times) and a stable ServiceProblem "why is it broken" projection are still TODO. Add Prometheus/OpenTelemetry exporters.
 
 ## Phase 3 — TLS-first transport & protocol versatility — `0.7`
 
@@ -79,6 +104,8 @@ No-JS-first, self-contained (no external daemon), every feature designed against
 - [ ] `onyums new` / `onyums generate` — scaffolding CLI (`cargo-generate` + `clap`)
 - [ ] Dev error pages + `/up` health check
 - [ ] Test harness without live Tor — `tower::ServiceExt::oneshot` request-level tests + factory/fixture conventions
+- [ ] CLI / daemon / Docker image — it's library-only. Ship a thin onyums-cli binary so non-Rust users can front existing services as onion services.
+- [ ] "automation" features — if the goal is genuinely automation, build a separate onyums-automation project with: declarative inventory, Tor/onion-address host identities, SSH-over-onion transport, idempotent task modules, secret backend integration, playbook format, drift detection, and dry-run/diff/apply. Or build an Ansible connection plugin for onion addresses instead of replacing Ansible.
 
 Non-goals: no inbound mail server; no heavy asset pipeline; no JS-*required* reactive layer; no ActiveRecord-style metaprogrammed model layer.
 
@@ -88,3 +115,21 @@ Non-goals: no inbound mail server; no heavy asset pipeline; no JS-*required* rea
 - [ ] Evaluate upgrading the arti stack — onyums pins `arti-client`/`tor-*` **0.43**, but the Arti release line is now **2.5.0** (2026-06-03, <https://blog.torproject.org/arti_2_5_0_released/>), with multiple breaking `TorClient` API changes across the 2.x line (2.4.0, <https://blog.torproject.org/arti_2_4_0_released/>). **2.5.0 fixes two medium-severity onion-service DoS issues — TROVE-2026-024 and TROVE-2026-027 (<https://alternativeto.net/news/2026/7/arti-2-5-brings-stable-counter-galois-onion-default-congestion-control-and-security-fixes/>)** — directly relevant to onyums' Phase 2 DoS posture, so a bump is a security win, not just churn. It also **raises the MSRV to Rust 1.91** (Oct 2025) and stabilizes Counter Galois Onion + default congestion control (transport-level, no onyums API change). Restricted discovery was stabilized in Arti **1.7.0** (2025-11, <https://blog.torproject.org/arti_1_7_0_released/>) and stays behind the `restricted-discovery` cargo feature until issue #1795 closes; C-tor→arti restricted-discovery key migration landed in **1.8.0** (<https://blog.torproject.org/arti_1_8_0_released/>). A stack bump also lands onion-service/PoW fixes relevant to Phase 2 but will require reworking the `TorClient` call sites for the 2.x breaking changes and confirming the CI toolchain is ≥1.91. Gate the bump on the workspace still building green on stable.
 - [x] Document the secure defaults and opt-downs loudly (README covers the Skin / TLS / `route_port` opt-downs)
 - [ ] In-process/loopback test mode so integration tests don't need the live Tor network (`test_serve` currently hits the real network) — *slice landed:* the composed application-facing stack (`build_serve_router`: gate + HSTS + app) is now `oneshot`-testable offline; *next slice:* a mock `RendRequest`/`StreamRequest` stream to drive `serve_circuits` without Tor
+- [ ] README -> Add a "What this is / what this is NOT" section — make the first sentence unambiguous: "Onyums is a Rust library for serving Axum applications as Tor onion services. It is not a host provisioning/config-management tool." This kills the category confusion at the source.
+- [ ] README -> Add an installation section — currently none. Add: cargo add onyums, tokio requirement, MSRV, and the critical selling point that no external Tor daemon is required because Arti is embedded.
+- [ ] Fix Cargo metadata — keywords include "SOCKS" and category is web-programming::http-client. This is a server. Correct to web-programming::http-server / network-programming and fix keywords.
+- [ ] Sync crates.io with GitHub — crates.io shows v0.2.3 while GitHub latest is v0.3.1. Publish the current release and keep them in lockstep.
+- [ ] README -> Add an architecture diagram showing: Tor circuit → rendezvous loop → CircuitPolicy gate → TLS termination → Skin (PoW/WAF/rate-limit) → Axum router.
+- [ ] README -> Add a comparison table against real alternatives: arti-axum, tor-hsrproxy, raw Arti, C-tor + nginx/Caddy.
+- [ ] README -> Add a status matrix — distinguish: implemented and tested offline / implemented but needs live Tor verification / planned / blocked upstream.
+- [ ] README -> Sharpen TLS security wording — "secure and complete by default" overstates; self-signed TLS provides encryption and secure-context mechanics but not browser-trusted authentication. Document: onion address authenticates the service; self-signed TLS ≠ WebPKI trust; use Tls::Provided with CA-signed .onion certs (HARICA) for public services.
+- [ ] State MSRV — Cargo.toml uses edition 2024; document the minimum Rust version and enforce in CI.
+- [ ] Add a Quick Start / Installation section: `cargo new my-onion-app && cd my-onion-app` `cargo add onyums` Include a complete main.rs.
+- [ ] Explain external dependencies explicitly: No external Tor daemon needed (Arti is embedded — this is a selling point being left on the table), First run downloads Tor consensus data, Filesystem paths created (./tor/onyums/state), Outbound network access required
+- [ ] Add deployment examples: systemd unit, Dockerfile, minimal container image, persistent volume guidance for keystore, backup/restore of onion identity keys.
+- [ ] Add an operator "first successful run" guide: expected bootstrap time, how to print the onion address, how to wait for readiness, how to test from Tor Browser, what to do with self-signed TLS warnings, how to switch to Tls::Provided.
+- [ ] Add troubleshooting: Tor bootstrap fails, descriptor never reachable, cert warning, restricted discovery client can't connect, raw TCP backend unreachable, port registration rejected, state directory permission problems.
+- [ ] Ship a CLI binary — if broader adoption is the goal, provide onyums serve, onyums status, onyums provision-client, onyums rotate-identity so non-Rust users can front existing services.
+
+
+

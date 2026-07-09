@@ -1,5 +1,8 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions, clippy::module_name_repetitions)]
+// onyums contains no `unsafe` of its own — forbid it outright (axum/axum-extra advertise
+// the same), so any future `unsafe` is a hard compile error, not a silent regression.
+#![forbid(unsafe_code)]
 
 //! # Onyums
 //! Onyums is a simple axum wrapper for serving tor onion services.
@@ -44,6 +47,7 @@ use tower_service::Service;
 use tracing::{event, span, Level};
 extern crate rcgen;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use axum::*;
 pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, SecurityEvent, SecurityEventSink, Skin};
@@ -277,9 +281,9 @@ fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig
 async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	event!(Level::INFO, "Creating Tor client...");
 	let config = tor_client_config(state_dir, cache_dir)?;
-	let runtime = TokioNativeTlsRuntime::current().map_err(|_| anyhow::anyhow!("Failed to get current tokio runtime."))?;
+	let runtime = TokioNativeTlsRuntime::current().map_err(|e| anyhow::anyhow!("Failed to get current tokio runtime: {e}"))?;
 	let client = TorClient::with_runtime(runtime);
-	client.config(config).create_bootstrapped().await.map_err(|_| anyhow::anyhow!("Failed to create bootstrapped Tor client."))
+	client.config(config).create_bootstrapped().await.map_err(|e| anyhow::anyhow!("Failed to create bootstrapped Tor client: {e}"))
 }
 
 /// The unique prefix every ephemeral state directory carries (see [`storage_dirs`]).
@@ -308,6 +312,25 @@ fn remove_ephemeral_state_dir(dir: &std::path::Path) {
 		Ok(()) => event!(Level::INFO, "removed ephemeral state dir {dir:?}"),
 		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
 		Err(e) => event!(Level::WARN, "failed to remove ephemeral state dir {dir:?}: {e}"),
+	}
+}
+
+/// Remove an ephemeral state dir *off* the async runtime (onyums ROADMAP Phase 0 —
+/// replace synchronous `Drop` cleanup).
+///
+/// [`remove_ephemeral_state_dir`] calls the blocking [`std::fs::remove_dir_all`]; running
+/// it directly in [`OnionServiceHandle::drop`] stalls a tokio worker. When a runtime is
+/// in scope this offloads the removal to the blocking pool and returns the
+/// `spawn_blocking` handle, so an async caller ([`OnionServiceHandle::shutdown`]) can
+/// await completion while [`Drop`] drops the handle and lets the task finish detached.
+/// With no runtime there is nothing to stall, so the removal runs inline and the
+/// function returns `None`.
+fn spawn_ephemeral_cleanup(dir: std::path::PathBuf) -> Option<JoinHandle<()>> {
+	if let Ok(handle) = tokio::runtime::Handle::try_current() {
+		Some(handle.spawn_blocking(move || remove_ephemeral_state_dir(&dir)))
+	} else {
+		remove_ephemeral_state_dir(&dir);
+		None
 	}
 }
 
@@ -357,7 +380,7 @@ fn apply_restricted_discovery(cfg: &mut OnionServiceConfigBuilder, allowlist: &R
 /// Returns an error if the nickname fails to parse, the restricted-discovery allowlist
 /// is invalid (see [`apply_restricted_discovery`]), or the config fails to build.
 fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedDiscovery>) -> Result<OnionServiceConfig> {
-	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
+	let nickname = nickname.parse::<HsNickname>().map_err(|e| anyhow::anyhow!("Failed to parse nickname: {e}"))?;
 	let mut cfg = OnionServiceConfigBuilder::default();
 	cfg.nickname(nickname);
 	if let Some(allowlist) = allowlist {
@@ -374,7 +397,7 @@ fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedDisco
 fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
 	event!(Level::INFO, "Launching onion service...");
 	client.launch_onion_service(svc_cfg)
-		.map_err(|_| anyhow::anyhow!("Failed to launch onion service."))?
+		.map_err(|e| anyhow::anyhow!("Failed to launch onion service: {e}"))?
 		.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
 }
 
@@ -389,10 +412,107 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 	Ok(address)
 }
 
+/// A point-in-time snapshot of a service's cumulative circuit/stream counters.
+///
+/// Returned by [`OnionServiceHandle::metrics`] (onyums ROADMAP Phase 4 — per-service
+/// metrics). Every field is a monotonic total since the service launched (a counter, not
+/// a gauge), so two snapshots subtract to a rate or a delta — feed them to a
+/// Prometheus/OpenTelemetry exporter, or print a health line. `circuits_offered` counts
+/// every offer; `circuits_accepted + circuits_rejected` can be slightly less, the
+/// difference being circuits arti failed to accept for transport reasons (neither a
+/// policy decision nor served).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServiceMetrics {
+	/// Rendezvous circuits offered to the service — one per arti `RendRequest`.
+	pub circuits_offered: u64,
+	/// Circuits accepted into service after the circuit-level policy gate.
+	pub circuits_accepted: u64,
+	/// Circuits the circuit-level policy rejected (or tore down) at the offer.
+	pub circuits_rejected: u64,
+	/// Streams handed to a handler after passing the per-stream policy gate.
+	pub streams_served: u64,
+	/// Streams the per-stream policy rejected while leaving the circuit alive.
+	pub streams_rejected: u64,
+	/// Streams whose policy action tore down the whole circuit.
+	pub streams_shutdown: u64,
+}
+
+impl ServiceMetrics {
+	/// The per-counter activity between an `earlier` snapshot and this one: `self`
+	/// minus `earlier`, field by field, saturating at `0`.
+	///
+	/// The counters are monotonic, so over a real interval `self >= earlier` and the
+	/// result is the number of circuits/streams in each category during it — divide by
+	/// the elapsed time for a rate. Saturating (rather than panicking on underflow) means
+	/// accidentally swapping the operands yields zeros, not a crash.
+	#[must_use]
+	pub const fn since(&self, earlier: Self) -> Self {
+		Self {
+			circuits_offered: self.circuits_offered.saturating_sub(earlier.circuits_offered),
+			circuits_accepted: self.circuits_accepted.saturating_sub(earlier.circuits_accepted),
+			circuits_rejected: self.circuits_rejected.saturating_sub(earlier.circuits_rejected),
+			streams_served: self.streams_served.saturating_sub(earlier.streams_served),
+			streams_rejected: self.streams_rejected.saturating_sub(earlier.streams_rejected),
+			streams_shutdown: self.streams_shutdown.saturating_sub(earlier.streams_shutdown),
+		}
+	}
+}
+
+/// Shared atomic counters backing [`ServiceMetrics`]: incremented from the rendezvous
+/// loop and snapshotted by [`OnionServiceHandle::metrics`].
+///
+/// `Relaxed` ordering throughout — each counter is an independent monotonic total, not a
+/// lock guarding other state, so no cross-counter ordering is needed.
+#[derive(Debug, Default)]
+struct CircuitMetrics {
+	circuits_offered: AtomicU64,
+	circuits_accepted: AtomicU64,
+	circuits_rejected: AtomicU64,
+	streams_served: AtomicU64,
+	streams_rejected: AtomicU64,
+	streams_shutdown: AtomicU64,
+}
+
+impl CircuitMetrics {
+	fn record_circuit_offered(&self) {
+		self.circuits_offered.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn record_circuit_accepted(&self) {
+		self.circuits_accepted.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn record_circuit_rejected(&self) {
+		self.circuits_rejected.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Record the outcome of the per-stream policy gate against the matching counter, so
+	/// the loop increments through one tested mapping rather than three scattered calls.
+	fn record_stream(&self, disposition: circuit_gate::StreamDisposition) {
+		let counter = match disposition {
+			circuit_gate::StreamDisposition::Serve => &self.streams_served,
+			circuit_gate::StreamDisposition::Reject => &self.streams_rejected,
+			circuit_gate::StreamDisposition::Shutdown => &self.streams_shutdown,
+		};
+		counter.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn snapshot(&self) -> ServiceMetrics {
+		ServiceMetrics {
+			circuits_offered: self.circuits_offered.load(Ordering::Relaxed),
+			circuits_accepted: self.circuits_accepted.load(Ordering::Relaxed),
+			circuits_rejected: self.circuits_rejected.load(Ordering::Relaxed),
+			streams_served: self.streams_served.load(Ordering::Relaxed),
+			streams_rejected: self.streams_rejected.load(Ordering::Relaxed),
+			streams_shutdown: self.streams_shutdown.load(Ordering::Relaxed),
+		}
+	}
+}
+
 /// The shared, per-service context threaded through the rendezvous loop down to
 /// every served stream: the application router, the TLS acceptor, the service
-/// address, the plaintext-enforcement policy, and the port → handler routing
-/// table.
+/// address, the plaintext-enforcement policy, the port → handler routing table, and
+/// the shared metrics counters.
 ///
 /// Bundled into one cheaply-`Clone` value (the `Router`/`TlsAcceptor`/`Arc` clones
 /// are all shallow) so the loop's helpers take a handful of arguments instead of a
@@ -405,6 +525,7 @@ struct ServeContext {
 	address: OnionAddress,
 	plaintext: tls_policy::PlaintextPolicy,
 	port_router: Arc<PortRouter>,
+	metrics: Arc<CircuitMetrics>,
 }
 
 /// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
@@ -426,10 +547,12 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 		let circuit_span = span!(Level::INFO, "onyums - new_circuit");
 		let _circuit_guard = circuit_span.enter();
 		let id = allocator.next_id();
+		ctx.metrics.record_circuit_offered();
 
 		// Consult the policy at the circuit boundary before accepting.
 		if circuit_gate::circuit_disposition(policy.on_new_circuit(&id)) == CircuitDisposition::Drop {
 			event!(Level::INFO, "Circuit {} rejected by policy on offer.", id.0);
+			ctx.metrics.record_circuit_rejected();
 			if let Err(err) = rend_request.reject().await {
 				event!(Level::INFO, "Failed to reject circuit {}: {err}", id.0);
 			}
@@ -446,6 +569,7 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 				continue;
 			}
 		};
+		ctx.metrics.record_circuit_accepted();
 
 		let ctx = ctx.clone();
 		let policy = policy.clone();
@@ -472,7 +596,9 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 		};
 		let target = circuit_gate::stream_target(port);
 
-		match circuit_gate::stream_disposition(policy.on_new_stream(&id, &target)) {
+		let disposition = circuit_gate::stream_disposition(policy.on_new_stream(&id, &target), port);
+		ctx.metrics.record_stream(disposition);
+		match disposition {
 			StreamDisposition::Serve => {
 				let ctx = ctx.clone();
 				tokio::spawn(async move {
@@ -657,6 +783,193 @@ fn project_service_status(state: tor_hsservice::status::State) -> ServiceStatus 
 	}
 }
 
+/// The stable *category* of a [`ServiceProblem`], with the owned diagnostic detail
+/// stripped.
+///
+/// A `Copy` discriminant a downstream can match on exhaustively and store cheaply, the
+/// way [`ServiceStatus`] is matched (onyums ROADMAP Phase 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceProblemKind {
+	/// A fatal runtime error — see [`ServiceProblem::Runtime`].
+	Runtime,
+	/// A descriptor-upload failure — see [`ServiceProblem::DescriptorUpload`].
+	DescriptorUpload,
+	/// An introduction-point failure — see [`ServiceProblem::IntroductionPoint`].
+	IntroductionPoint,
+	/// An unmodelled subsystem — see [`ServiceProblem::Other`].
+	Other,
+}
+
+impl ServiceProblemKind {
+	/// A short, stable, lowercase label for this category — safe to match on downstream
+	/// (a health line or an alert rule) because it never changes for a given variant.
+	#[must_use]
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Runtime => "runtime",
+			Self::DescriptorUpload => "descriptor-upload",
+			Self::IntroductionPoint => "introduction-point",
+			Self::Other => "other",
+		}
+	}
+}
+
+/// The reason a service is running degraded, unreachable, or broken — onyums' stable
+/// projection of arti's `#[non_exhaustive]` [`Problem`](tor_hsservice::status::Problem).
+///
+/// This is the "why" behind a non-[`Reachable`](ServiceStatus::Reachable)
+/// [`ServiceStatus`] (onyums ROADMAP Phase 4 — observability).
+///
+/// arti's `Problem` is `#[non_exhaustive]` and — unlike its `State` — carries **no
+/// `Display`** (only `Debug`) in the pinned 0.43 source, so it cannot be surfaced to
+/// operators cleanly as-is. This is onyums' typed projection, the same pattern as
+/// [`ServiceStatus`]: downstreams match on the stable [`kind`](Self::kind) without a
+/// wildcard, and read the operator-facing diagnostic through [`detail`](Self::detail)
+/// or [`Display`](std::fmt::Display). Read the current value from a running service via
+/// [`OnionServiceHandle::problem`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceProblem {
+	/// A fatal runtime error the service could not recover from — the reason behind a
+	/// [`Broken`](ServiceStatus::Broken) status. Carries arti's `Debug` diagnostic.
+	Runtime(String),
+	/// One or more onion-service descriptor uploads failed, so clients may be unable to
+	/// find the service until a later upload succeeds.
+	DescriptorUpload(String),
+	/// One or more introduction points could not be established — the usual reason a
+	/// service reads [`Unreachable`](ServiceStatus::Unreachable) or
+	/// [`DegradedReachable`](ServiceStatus::DegradedReachable).
+	IntroductionPoint(String),
+	/// A problem in a subsystem onyums does not model explicitly: arti's `PoW` manager
+	/// (only compiled with the experimental `hs-pow-full` feature), or a category a
+	/// newer arti adds to its `#[non_exhaustive]` `Problem`. The diagnostic still
+	/// carries arti's `Debug` rendering, so the cause is never silently dropped.
+	Other(String),
+}
+
+impl ServiceProblem {
+	/// The stable [`ServiceProblemKind`] of this problem — safe to match on downstream,
+	/// unlike the owned diagnostic [`detail`](Self::detail) string.
+	#[must_use]
+	pub const fn kind(&self) -> ServiceProblemKind {
+		match self {
+			Self::Runtime(_) => ServiceProblemKind::Runtime,
+			Self::DescriptorUpload(_) => ServiceProblemKind::DescriptorUpload,
+			Self::IntroductionPoint(_) => ServiceProblemKind::IntroductionPoint,
+			Self::Other(_) => ServiceProblemKind::Other,
+		}
+	}
+
+	/// The operator-facing diagnostic detail — arti's `Debug` rendering of the
+	/// underlying problem, since arti's `Problem` exposes no `Display`.
+	#[must_use]
+	pub fn detail(&self) -> &str {
+		match self {
+			Self::Runtime(d) | Self::DescriptorUpload(d) | Self::IntroductionPoint(d) | Self::Other(d) => d,
+		}
+	}
+
+	/// A short, stable, lowercase label for this problem's category — the
+	/// [`kind`](Self::kind)'s [`label`](ServiceProblemKind::label).
+	#[must_use]
+	pub const fn label(&self) -> &'static str {
+		self.kind().label()
+	}
+
+	/// Whether this is a *fatal* problem the service will not recover from on its own — a
+	/// [`Runtime`](Self::Runtime) error, which drives arti to
+	/// [`Broken`](ServiceStatus::Broken) — as opposed to the transient descriptor-upload
+	/// and introduction-point problems arti retries.
+	#[must_use]
+	pub const fn is_fatal(&self) -> bool {
+		matches!(self, Self::Runtime(_))
+	}
+}
+
+impl std::fmt::Display for ServiceProblem {
+	/// Writes `"<label>: <detail>"` — the stable category plus arti's diagnostic — so a
+	/// `ServiceProblem` drops straight into a log line or a degraded-health response.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}: {}", self.label(), self.detail())
+	}
+}
+
+/// Project arti's `#[non_exhaustive]` [`Problem`](tor_hsservice::status::Problem) onto
+/// onyums' stable [`ServiceProblem`], capturing arti's `Debug` rendering as the
+/// operator-facing [`detail`](ServiceProblem::detail) (arti exposes no `Display` on
+/// `Problem` or its inner errors). Keys only on the variant, so it is unit-testable
+/// offline over a constructed `Problem` with no live Tor network. A subsystem onyums
+/// does not model — the feature-gated `PoW` manager, or any category a newer arti adds —
+/// maps to [`ServiceProblem::Other`] rather than being dropped.
+fn project_service_problem(problem: &tor_hsservice::status::Problem) -> ServiceProblem {
+	use tor_hsservice::status::Problem;
+	match problem {
+		Problem::Runtime(e) => ServiceProblem::Runtime(format!("{e:?}")),
+		Problem::DescriptorUpload(errs) => ServiceProblem::DescriptorUpload(format!("{errs:?}")),
+		Problem::Ipt(errs) => ServiceProblem::IntroductionPoint(format!("{errs:?}")),
+		// `Problem` is `#[non_exhaustive]`; the PoW variant (feature-gated off) and any
+		// future arti category fall here rather than being silently dropped.
+		_ => ServiceProblem::Other(format!("{problem:?}")),
+	}
+}
+
+/// A consistent point-in-time health snapshot of an onion service (onyums ROADMAP
+/// Phase 4 — observability).
+///
+/// Bundles the [`ServiceStatus`] and, when the service is not fully healthy, the
+/// [`ServiceProblem`] explaining why. Read via [`OnionServiceHandle::health`]. The value is derived from a **single** read
+/// of arti's status, so the `status` and `problem` are always mutually consistent —
+/// unlike calling [`status`](OnionServiceHandle::status) and
+/// [`problem`](OnionServiceHandle::problem) separately, which reads arti twice and can
+/// straddle a state transition (e.g. read `Reachable` then a just-arrived problem).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceHealth {
+	status: ServiceStatus,
+	problem: Option<ServiceProblem>,
+}
+
+impl ServiceHealth {
+	/// The reachability [`ServiceStatus`] at the moment of the snapshot.
+	#[must_use]
+	pub const fn status(&self) -> ServiceStatus {
+		self.status
+	}
+
+	/// The active [`ServiceProblem`] explaining a non-healthy status, or `None` when the
+	/// service reported no problem at the moment of the snapshot.
+	#[must_use]
+	pub const fn problem(&self) -> Option<&ServiceProblem> {
+		self.problem.as_ref()
+	}
+
+	/// Whether the service was believed reachable — the snapshot's
+	/// [`ServiceStatus::is_reachable`].
+	#[must_use]
+	pub const fn is_reachable(&self) -> bool {
+		self.status.is_reachable()
+	}
+
+	/// Whether the service was *fully* healthy: reachable **and** reporting no active
+	/// problem. Stricter than [`is_reachable`](Self::is_reachable), which is still true
+	/// for a [`DegradedReachable`](ServiceStatus::DegradedReachable) service carrying a
+	/// problem — this is the "all green" check for a `/up`-style endpoint.
+	#[must_use]
+	pub const fn is_healthy(&self) -> bool {
+		self.status.is_reachable() && self.problem.is_none()
+	}
+}
+
+impl std::fmt::Display for ServiceHealth {
+	/// Writes the [`ServiceStatus`] label, and — when a problem is present — the
+	/// [`ServiceProblem`] after an em dash, e.g. `"unreachable — introduction-point: []"`
+	/// or just `"reachable"`.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match &self.problem {
+			Some(problem) => write!(f, "{} — {problem}", self.status),
+			None => std::fmt::Display::fmt(&self.status, f),
+		}
+	}
+}
+
 /// Drive a [`ServiceStatus`] stream until the first item satisfying `pred`, returning
 /// that status — or `None` if the stream ends first (the underlying service was
 /// dropped before the condition was met).
@@ -694,10 +1007,14 @@ pub struct OnionServiceHandle {
 	client: Arc<TorClient<TokioNativeTlsRuntime>>,
 	cancel: CancellationToken,
 	task: Mutex<Option<JoinHandle<()>>>,
+	// Shared with the accept loop's `ServeContext`; the loop increments, `metrics()`
+	// snapshots (onyums ROADMAP Phase 4 — per-service metrics).
+	metrics: Arc<CircuitMetrics>,
 	// Set only for an ephemeral service (see `OnionServiceBuilder::ephemeral`): the
 	// throwaway temp state dir, removed when the handle drops so the disposable
-	// identity key does not linger on disk.
-	ephemeral_state_dir: Option<std::path::PathBuf>,
+	// identity key does not linger on disk. `Mutex<Option<..>>` so `shutdown` can
+	// `take()` and await the removal while `Drop` only cleans up what shutdown left.
+	ephemeral_state_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl OnionServiceHandle {
@@ -766,6 +1083,54 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn is_ready(&self) -> bool {
 		self.status().is_reachable()
+	}
+
+	/// The reason the service is currently degraded, unreachable, or broken — its
+	/// [`ServiceProblem`] — or `None` when there is no active problem (onyums ROADMAP
+	/// Phase 4 — observability).
+	///
+	/// Pairs with [`status`](Self::status): `status()` reports *what* the reachability
+	/// is, `problem()` reports *why* when it is not fully healthy. A
+	/// [`Reachable`](ServiceStatus::Reachable) service normally reports `None`; a
+	/// [`Broken`](ServiceStatus::Broken) or [`Unreachable`](ServiceStatus::Unreachable)
+	/// one carries the arti-observed cause — a failed descriptor upload, dead
+	/// introduction points, or a fatal runtime error. Projected from arti's
+	/// `#[non_exhaustive]` `current_problem()` through the stable [`ServiceProblem`]
+	/// mapping, so the category is matchable downstream and the diagnostic is readable
+	/// even though arti's own `Problem` exposes no `Display`.
+	#[must_use]
+	pub fn problem(&self) -> Option<ServiceProblem> {
+		self.service.status().current_problem().map(project_service_problem)
+	}
+
+	/// A consistent [`ServiceHealth`] snapshot — the [`status`](Self::status) and the
+	/// [`problem`](Self::problem) read together from a single arti status, so they never
+	/// straddle a state transition (onyums ROADMAP Phase 4 — observability).
+	///
+	/// Prefer this to reading `status()` and `problem()` separately when you want a
+	/// coherent "what and why" for a health line: those are two independent reads of
+	/// arti's live status and can disagree across a transition, whereas `health()`
+	/// projects both from the same read.
+	#[must_use]
+	pub fn health(&self) -> ServiceHealth {
+		let raw = self.service.status();
+		ServiceHealth {
+			status: project_service_status(raw.state()),
+			problem: raw.current_problem().map(project_service_problem),
+		}
+	}
+
+	/// A snapshot of this service's cumulative circuit/stream counters — a
+	/// [`ServiceMetrics`] (onyums ROADMAP Phase 4 — per-service metrics).
+	///
+	/// Counters are monotonic totals since launch, incremented by the accept loop:
+	/// circuits offered / accepted / rejected at the circuit-policy gate, and streams
+	/// served / rejected / circuit-torn-down at the per-stream gate. Snapshot twice and
+	/// subtract for a rate, or expose the raw totals to a Prometheus/OpenTelemetry
+	/// exporter. Cheap and non-blocking — a plain atomic read per counter.
+	#[must_use]
+	pub fn metrics(&self) -> ServiceMetrics {
+		self.metrics.snapshot()
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -840,11 +1205,24 @@ impl OnionServiceHandle {
 	/// Cancels the spawned accept loop via its [`CancellationToken`] and joins
 	/// the task. Idempotent: a second call is a no-op. Full teardown of the Tor
 	/// client and onion service happens when the handle is dropped.
+	///
+	/// For an ephemeral service this also removes the throwaway keystore — offloaded to
+	/// the blocking pool and awaited here, so a graceful shutdown is a *complete* stop
+	/// (the disposable identity is gone before this returns) without the synchronous
+	/// `remove_dir_all` that would otherwise stall a runtime worker in [`Drop`].
 	pub async fn shutdown(&self) {
 		self.cancel.cancel();
 		let task = self.task.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
 		if let Some(task) = task {
 			let _ = task.await;
+		}
+		// Claim the ephemeral cleanup so `Drop` won't repeat it, and await the off-thread
+		// removal so shutdown() fully completes the teardown.
+		let dir = self.ephemeral_state_dir.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(dir) = dir
+			&& let Some(handle) = spawn_ephemeral_cleanup(dir)
+		{
+			let _ = handle.await;
 		}
 	}
 
@@ -865,9 +1243,12 @@ impl Drop for OnionServiceHandle {
 		// Dropping the handle tears down the onion service and its client; for an
 		// ephemeral service, also remove the throwaway keystore so the disposable
 		// identity key does not outlive the service on disk. Best-effort and guarded
-		// (see `remove_ephemeral_state_dir`).
-		if let Some(dir) = &self.ephemeral_state_dir {
-			remove_ephemeral_state_dir(dir);
+		// (see `remove_ephemeral_state_dir`). Only cleans up what `shutdown` didn't
+		// already claim; offloads the blocking removal to the runtime's blocking pool so
+		// dropping a handle inside async code never stalls a worker on `remove_dir_all`.
+		let dir = self.ephemeral_state_dir.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(dir) = dir {
+			let _ = spawn_ephemeral_cleanup(dir);
 		}
 	}
 }
@@ -1282,8 +1663,10 @@ impl OnionServiceBuilder {
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
 		// Bundle everything the loop threads down to each served stream into one
-		// cheaply-cloned context (see [`ServeContext`]).
-		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router };
+		// cheaply-cloned context (see [`ServeContext`]). The metrics counters are shared
+		// with the handle so `metrics()` reads what the loop increments.
+		let metrics = Arc::new(CircuitMetrics::default());
+		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics) };
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
@@ -1303,7 +1686,7 @@ impl OnionServiceBuilder {
 			}
 		});
 
-		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir })
+		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir: Mutex::new(ephemeral_state_dir), metrics })
 	}
 }
 
@@ -1371,7 +1754,7 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 /// Handles a TLS connection on port 443.
 async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, circuit_id: CircuitId) -> Result<()> {
 	event!(Level::INFO, "Accepting the incoming stream and wrapping it in a TLS stream...");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 
 	// Surface the host-assigned per-circuit id to the application (and the Skin HTTP
 	// gate) via the axum connect-info, replacing the long-hardcoded `None`.
@@ -1406,7 +1789,7 @@ async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsA
 /// Handles a plain HTTP request on port 80 by redirecting to HTTPS.
 async fn handle_http_redirect(stream_request: StreamRequest, requested_host: String) -> Result<()> {
 	event!(Level::INFO, "Accepting plain HTTP request on port 80 and redirecting to HTTPS.");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 
 	let stream = TokioIo::new(onion_service_stream);
 
@@ -1552,7 +1935,7 @@ async fn handle_stream_request(stream_request: StreamRequest, ctx: ServeContext,
 /// [`OnionStream`] and handed to the handler, which owns it for the connection.
 async fn handle_raw_stream(stream_request: StreamRequest, handler: Arc<dyn StreamHandler>, port: u16) -> Result<()> {
 	event!(Level::INFO, "Accepting a raw stream on port {port} for a registered handler...");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 	handler.serve(Box::pin(onion_service_stream)).await
 }
 
@@ -1878,6 +2261,45 @@ mod tests {
 	}
 
 	#[test]
+	fn spawn_ephemeral_cleanup_runs_inline_without_a_runtime() {
+		// Outside any tokio runtime there is nothing to stall: the removal runs inline and
+		// the helper reports `None` (nothing to await).
+		let (state, _cache) = storage_dirs(true);
+		let dir = std::path::PathBuf::from(&state);
+		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
+		assert!(dir.exists());
+		let handle = spawn_ephemeral_cleanup(dir.clone());
+		assert!(handle.is_none(), "with no runtime the removal is inline, not spawned");
+		assert!(!dir.exists(), "the ephemeral dir must be gone after an inline cleanup");
+	}
+
+	#[tokio::test]
+	async fn spawn_ephemeral_cleanup_offloads_to_the_blocking_pool_in_a_runtime() {
+		// Inside a runtime the blocking `remove_dir_all` is offloaded (so it never stalls a
+		// worker) and the returned handle resolves once the dir is gone — the path
+		// `shutdown()` awaits.
+		let (state, _cache) = storage_dirs(true);
+		let dir = std::path::PathBuf::from(&state);
+		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
+		std::fs::write(dir.join("keystore").join("hs_ed25519_secret_key"), b"fake").expect("write fake key");
+		assert!(dir.exists());
+		let handle = spawn_ephemeral_cleanup(dir.clone()).expect("a live runtime offloads the removal to a task");
+		handle.await.expect("the offloaded cleanup task must not panic");
+		assert!(!dir.exists(), "the ephemeral dir must be gone after the offloaded cleanup");
+	}
+
+	#[test]
+	fn spawn_ephemeral_cleanup_still_refuses_non_ephemeral_paths_inline() {
+		// The offload path must not weaken the safety belt: a non-ephemeral dir is left
+		// untouched even when cleaned up inline.
+		let guard = std::env::temp_dir().join(format!("onyums-not-ephemeral-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+		std::fs::create_dir_all(&guard).expect("create non-ephemeral dir");
+		assert!(spawn_ephemeral_cleanup(guard.clone()).is_none());
+		assert!(guard.exists(), "a non-ephemeral dir must survive the cleanup helper");
+		std::fs::remove_dir_all(&guard).ok();
+	}
+
+	#[test]
 	fn builder_defaults_to_persistent_identity() {
 		// Stable identity by default (Phase 1): the ephemeral opt-down is off unless
 		// explicitly named.
@@ -2002,6 +2424,19 @@ mod tests {
 		assert!(err.to_string().contains("nickname"), "unexpected error: {err}");
 	}
 
+	#[test]
+	fn service_nickname_parse_error_preserves_the_arti_cause() {
+		// The service nickname takes the same context-preserving `map_err` as the other
+		// Tor-bootstrap sites: a bad nickname surfaces *why* (arti's underlying parse
+		// error) appended to onyums' context, not a bare "Failed to parse nickname."
+		let err = build_onion_service_config("bad service nickname", None).expect_err("a nickname with spaces must be rejected");
+		let msg = err.to_string();
+		assert!(msg.starts_with("Failed to parse nickname: "), "missing onyums context: {msg}");
+		// The underlying arti `InvalidNickname` Display must be carried, not dropped —
+		// the whole point of replacing `map_err(|_| ...)` with `map_err(|e| ...: {e})`.
+		assert!(msg.len() > "Failed to parse nickname: ".len(), "arti cause was dropped: {msg}");
+	}
+
 	#[tokio::test]
 	async fn builder_empty_allowlist_errors_before_bootstrap() {
 		// Router and nickname are set, so validation reaches the config assembly, which
@@ -2108,6 +2543,144 @@ mod tests {
 		assert_eq!(project_service_status(State::DegradedUnreachable), ServiceStatus::Unreachable);
 		assert_eq!(project_service_status(State::Recovering), ServiceStatus::Unreachable);
 		assert_eq!(project_service_status(State::Broken), ServiceStatus::Broken);
+	}
+
+	#[test]
+	fn service_problem_projects_arti_problem_categories() {
+		use tor_hsservice::status::Problem;
+		// Empty vecs exercise the category mapping without constructing arti's internal
+		// error types — the projection keys only on the `Problem` variant. If arti adds
+		// or renames a `Problem` category the `_` arm keeps this compiling but the new
+		// case reads as `Other`, the conservative default.
+		assert_eq!(project_service_problem(&Problem::Ipt(Vec::new())).kind(), ServiceProblemKind::IntroductionPoint);
+		assert_eq!(project_service_problem(&Problem::DescriptorUpload(Vec::new())).kind(), ServiceProblemKind::DescriptorUpload);
+		// The diagnostic detail is arti's `Debug` rendering, captured (not dropped) even
+		// though arti's `Problem` has no `Display`; an empty intro-point error list
+		// renders as an empty debug vec.
+		assert_eq!(project_service_problem(&Problem::Ipt(Vec::new())).detail(), "[]");
+	}
+
+	#[test]
+	fn service_problem_surface_is_stable_and_distinct() {
+		use ServiceProblem::{DescriptorUpload, IntroductionPoint, Other, Runtime};
+		let all = [
+			Runtime("boom".into()),
+			DescriptorUpload("upload failed".into()),
+			IntroductionPoint("no ipts".into()),
+			Other("mystery".into()),
+		];
+		// `detail()` round-trips the diagnostic; `Display` is exactly `"<label>: <detail>"`.
+		for p in &all {
+			assert!(!p.label().is_empty());
+			assert_eq!(p.to_string(), format!("{}: {}", p.label(), p.detail()));
+			// The category label is the kind's label.
+			assert_eq!(p.label(), p.kind().label());
+		}
+		assert_eq!(Runtime("boom".into()).detail(), "boom");
+
+		// Labels are distinct across the four categories (a downstream may match on them).
+		let labels: std::collections::HashSet<_> = all.iter().map(ServiceProblem::label).collect();
+		assert_eq!(labels.len(), all.len(), "labels must be distinct");
+
+		// Only a runtime error is fatal; the retriable problems are not.
+		assert!(Runtime("x".into()).is_fatal());
+		for p in [DescriptorUpload("x".into()), IntroductionPoint("x".into()), Other("x".into())] {
+			assert!(!p.is_fatal(), "{p:?} must not read as fatal");
+		}
+	}
+
+	#[test]
+	fn service_health_bundles_status_and_problem_consistently() {
+		use ServiceStatus::{Broken, DegradedReachable, Reachable, Unreachable};
+
+		// Fully healthy: reachable, no problem — Display is just the status label.
+		let healthy = ServiceHealth { status: Reachable, problem: None };
+		assert_eq!(healthy.status(), Reachable);
+		assert!(healthy.is_reachable());
+		assert!(healthy.is_healthy());
+		assert!(healthy.problem().is_none());
+		assert_eq!(healthy.to_string(), "reachable");
+
+		// Reachable but degraded and carrying a problem: reachable, yet not fully healthy.
+		let degraded = ServiceHealth { status: DegradedReachable, problem: Some(ServiceProblem::IntroductionPoint("[]".into())) };
+		assert!(degraded.is_reachable());
+		assert!(!degraded.is_healthy(), "a reachable service carrying a problem is not fully healthy");
+		assert_eq!(degraded.problem().map(ServiceProblem::kind), Some(ServiceProblemKind::IntroductionPoint));
+
+		// Broken with a fatal problem: neither reachable nor healthy; Display shows the why.
+		let broken = ServiceHealth { status: Broken, problem: Some(ServiceProblem::Runtime("boom".into())) };
+		assert!(!broken.is_reachable());
+		assert!(!broken.is_healthy());
+		assert!(broken.problem().is_some_and(ServiceProblem::is_fatal));
+		assert_eq!(broken.to_string(), "broken — runtime: boom");
+
+		// A non-reachable status with no reported problem still renders as just the status.
+		let quiet = ServiceHealth { status: Unreachable, problem: None };
+		assert_eq!(quiet.to_string(), "unreachable");
+		assert!(!quiet.is_healthy());
+	}
+
+	#[test]
+	fn circuit_metrics_snapshot_reflects_recorded_events() {
+		use circuit_gate::StreamDisposition;
+		let m = CircuitMetrics::default();
+		assert_eq!(m.snapshot(), ServiceMetrics::default(), "a fresh counter set is all zeros");
+
+		m.record_circuit_offered();
+		m.record_circuit_offered();
+		m.record_circuit_accepted();
+		m.record_circuit_rejected();
+		m.record_stream(StreamDisposition::Serve);
+		m.record_stream(StreamDisposition::Serve);
+		m.record_stream(StreamDisposition::Reject);
+		m.record_stream(StreamDisposition::Shutdown);
+
+		let snap = m.snapshot();
+		assert_eq!(snap.circuits_offered, 2);
+		assert_eq!(snap.circuits_accepted, 1);
+		assert_eq!(snap.circuits_rejected, 1);
+		assert_eq!(snap.streams_served, 2);
+		assert_eq!(snap.streams_rejected, 1);
+		assert_eq!(snap.streams_shutdown, 1);
+	}
+
+	#[test]
+	fn record_stream_maps_each_disposition_to_its_own_counter() {
+		use circuit_gate::StreamDisposition::{Reject, Serve, Shutdown};
+
+		// Each disposition bumps exactly one distinct stream counter and never a circuit
+		// counter. `pick` returns the per-disposition target counter; a helper records one
+		// event and asserts only that counter (and no circuit counter) moved.
+		let served = |s: ServiceMetrics| s.streams_served;
+		let rejected = |s: ServiceMetrics| s.streams_rejected;
+		let shutdown = |s: ServiceMetrics| s.streams_shutdown;
+		let check = |disposition: circuit_gate::StreamDisposition, pick: &dyn Fn(ServiceMetrics) -> u64| {
+			let m = CircuitMetrics::default();
+			m.record_stream(disposition);
+			let snap = m.snapshot();
+			assert_eq!(pick(snap), 1, "{disposition:?} should bump its own counter");
+			assert_eq!(snap.streams_served + snap.streams_rejected + snap.streams_shutdown, 1, "exactly one stream counter moves");
+			assert_eq!(snap.circuits_offered + snap.circuits_accepted + snap.circuits_rejected, 0, "stream events never touch circuit counters");
+		};
+
+		check(Serve, &served);
+		check(Reject, &rejected);
+		check(Shutdown, &shutdown);
+	}
+
+	#[test]
+	fn service_metrics_since_is_a_saturating_per_field_delta() {
+		let earlier = ServiceMetrics { circuits_offered: 10, circuits_accepted: 7, circuits_rejected: 3, streams_served: 20, streams_rejected: 4, streams_shutdown: 1 };
+		let later = ServiceMetrics { circuits_offered: 15, circuits_accepted: 10, circuits_rejected: 5, streams_served: 26, streams_rejected: 4, streams_shutdown: 2 };
+
+		// The interval delta is the per-field difference.
+		let delta = later.since(earlier);
+		assert_eq!(delta, ServiceMetrics { circuits_offered: 5, circuits_accepted: 3, circuits_rejected: 2, streams_served: 6, streams_rejected: 0, streams_shutdown: 1 });
+
+		// Swapped operands saturate to zero rather than underflow-panicking.
+		assert_eq!(earlier.since(later), ServiceMetrics::default());
+		// A snapshot minus itself is no activity.
+		assert_eq!(later.since(later), ServiceMetrics::default());
 	}
 
 	#[test]

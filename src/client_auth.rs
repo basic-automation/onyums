@@ -23,6 +23,7 @@
 
 use rand::RngCore;
 use tor_llcrypto::pk::curve25519::{PublicKey, StaticSecret};
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{ClientAuthKey, OnionAddress, RestrictedDiscovery};
 
@@ -42,7 +43,8 @@ const BASE32_ALPHABET: &[u8; 32] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
 /// `ClientOnionAuthDir` as an [`auth_private_line`](Self::auth_private_line).
 ///
 /// Holds secret key material, so it does not derive [`Debug`] automatically — the
-/// manual impl redacts the secret.
+/// manual impl redacts the secret — and its secret half is zeroized on drop
+/// ([`ZeroizeOnDrop`]) so the disposable x25519 key does not linger in freed memory.
 #[derive(Clone)]
 pub struct ClientAuthKeypair {
 	/// The raw 32-byte x25519 secret. Never rendered by `Debug`.
@@ -220,6 +222,25 @@ pub fn provision_client(allowlist: &mut RestrictedDiscovery, nickname: impl Into
 impl std::fmt::Debug for ClientAuthKeypair {
 	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		f.debug_struct("ClientAuthKeypair").field("public", &self.public).field("secret", &"<redacted>").finish()
+	}
+}
+
+impl Zeroize for ClientAuthKeypair {
+	/// Wipe the x25519 secret in place. Called on drop, and callable directly to scrub a
+	/// keypair before it leaves scope. The public half is not secret and is left intact.
+	fn zeroize(&mut self) {
+		self.secret.zeroize();
+	}
+}
+
+// The stored secret is zeroed when the keypair is dropped, so the disposable x25519
+// client-auth key does not linger in freed memory (onyums ROADMAP Phase 2 — zeroize
+// secret material). The marker documents the guarantee; `Drop` performs it.
+impl ZeroizeOnDrop for ClientAuthKeypair {}
+
+impl Drop for ClientAuthKeypair {
+	fn drop(&mut self) {
+		self.zeroize();
 	}
 }
 
@@ -429,5 +450,19 @@ mod tests {
 		let shown = format!("{pair:?}");
 		assert!(shown.contains("<redacted>"));
 		assert!(!shown.contains(&pair.secret_base32()));
+	}
+
+	#[test]
+	fn zeroize_wipes_the_secret_material() {
+		// The `ZeroizeOnDrop` guarantee: `zeroize()` (the same call `Drop` makes) scrubs
+		// the stored x25519 secret in place. Exercised explicitly here since a real drop's
+		// wipe cannot be observed after the value is gone.
+		let mut pair = ClientAuthKeypair::from_secret_bytes(SECRET);
+		assert_ne!(pair.secret_bytes(), [0u8; 32], "precondition: the secret is non-zero");
+		let public_before = pair.public_key();
+		pair.zeroize();
+		assert_eq!(pair.secret_bytes(), [0u8; 32], "the secret must be wiped after zeroize");
+		// The public half is not secret and is intentionally left intact.
+		assert_eq!(pair.public_key(), public_before, "the public key must survive zeroize");
 	}
 }

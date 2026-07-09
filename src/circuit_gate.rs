@@ -66,7 +66,8 @@ pub const fn circuit_disposition(action: CircuitAction) -> CircuitDisposition {
 /// [`CircuitPolicy::on_new_stream`](onyums_skin::CircuitPolicy::on_new_stream).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum StreamDisposition {
-	/// Serve the stream (`Accept`/`Challenge` — the HTTP gate handles `Challenge`).
+	/// Serve the stream (`Accept`, or `Challenge` on a reserved HTTP port where the gate
+	/// can render the challenge).
 	Serve,
 	/// Reject this stream but keep the circuit (and its other streams) alive.
 	Reject,
@@ -74,13 +75,26 @@ pub enum StreamDisposition {
 	Shutdown,
 }
 
-/// Map a stream-level [`CircuitAction`] to a [`StreamDisposition`]. Unlike the
-/// circuit-level mapping, `Reject` (drop this one stream) and `Shutdown` (tear down the
-/// whole circuit) are distinct here.
+/// Map a stream-level [`CircuitAction`] to a [`StreamDisposition`], given the stream's
+/// destination `port`. Unlike the circuit-level mapping, `Reject` (drop this one stream)
+/// and `Shutdown` (tear down the whole circuit) are distinct here.
+///
+/// `Challenge` is port-sensitive: the challenge is presented by the HTTP Skin gate, which
+/// only runs on the reserved HTTP ports (80/443). On a raw port there is no challenge
+/// surface, so a `Challenge` **fails closed** to [`Reject`](StreamDisposition::Reject)
+/// rather than silently serving the stream ungated — the raw handler never implements the
+/// challenge itself (onyums ROADMAP: fix Under-Attack `Challenge` for raw TCP).
 #[must_use]
-pub const fn stream_disposition(action: CircuitAction) -> StreamDisposition {
+pub const fn stream_disposition(action: CircuitAction, port: u16) -> StreamDisposition {
 	match action {
-		CircuitAction::Accept | CircuitAction::Challenge => StreamDisposition::Serve,
+		CircuitAction::Accept => StreamDisposition::Serve,
+		CircuitAction::Challenge => {
+			if crate::port_router::is_reserved_http_port(port) {
+				StreamDisposition::Serve
+			} else {
+				StreamDisposition::Reject
+			}
+		}
 		CircuitAction::Reject => StreamDisposition::Reject,
 		CircuitAction::Shutdown => StreamDisposition::Shutdown,
 	}
@@ -131,10 +145,30 @@ mod tests {
 
 	#[test]
 	fn stream_disposition_distinguishes_reject_from_shutdown() {
-		assert_eq!(stream_disposition(CircuitAction::Accept), StreamDisposition::Serve);
-		assert_eq!(stream_disposition(CircuitAction::Challenge), StreamDisposition::Serve);
-		assert_eq!(stream_disposition(CircuitAction::Reject), StreamDisposition::Reject);
-		assert_eq!(stream_disposition(CircuitAction::Shutdown), StreamDisposition::Shutdown);
+		// On a reserved HTTP port (443) the gate can render a challenge, so Challenge serves.
+		assert_eq!(stream_disposition(CircuitAction::Accept, 443), StreamDisposition::Serve);
+		assert_eq!(stream_disposition(CircuitAction::Challenge, 443), StreamDisposition::Serve);
+		assert_eq!(stream_disposition(CircuitAction::Reject, 443), StreamDisposition::Reject);
+		assert_eq!(stream_disposition(CircuitAction::Shutdown, 443), StreamDisposition::Shutdown);
+	}
+
+	#[test]
+	fn challenge_fails_closed_on_a_raw_port() {
+		// A raw (non-80/443) port has no HTTP challenge surface, so Challenge must fail
+		// closed to Reject rather than serve the stream ungated.
+		assert_eq!(stream_disposition(CircuitAction::Challenge, 9000), StreamDisposition::Reject);
+		assert_eq!(stream_disposition(CircuitAction::Challenge, 22), StreamDisposition::Reject);
+		assert_eq!(stream_disposition(CircuitAction::Challenge, 0), StreamDisposition::Reject);
+		// Both reserved HTTP ports still serve a challenge (the gate presents it there).
+		assert_eq!(stream_disposition(CircuitAction::Challenge, 80), StreamDisposition::Serve);
+		assert_eq!(stream_disposition(CircuitAction::Challenge, 443), StreamDisposition::Serve);
+		// The non-Challenge actions are port-independent — Accept serves, Reject rejects,
+		// Shutdown tears down, on HTTP and raw ports alike.
+		for port in [80u16, 443, 9000, 0] {
+			assert_eq!(stream_disposition(CircuitAction::Accept, port), StreamDisposition::Serve);
+			assert_eq!(stream_disposition(CircuitAction::Reject, port), StreamDisposition::Reject);
+			assert_eq!(stream_disposition(CircuitAction::Shutdown, port), StreamDisposition::Shutdown);
+		}
 	}
 
 	#[test]

@@ -1,5 +1,8 @@
 #![warn(clippy::pedantic, clippy::nursery, clippy::all, clippy::cargo)]
 #![allow(clippy::multiple_crate_versions, clippy::module_name_repetitions)]
+// onyums contains no `unsafe` of its own — forbid it outright (axum/axum-extra advertise
+// the same), so any future `unsafe` is a hard compile error, not a silent regression.
+#![forbid(unsafe_code)]
 
 //! # Onyums
 //! Onyums is a simple axum wrapper for serving tor onion services.

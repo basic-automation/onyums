@@ -27,12 +27,18 @@ let gated: Router = app.layer(Skin::secure_default().into_layer());
 Built out: the gate core (PoW/tarpit challenge chain, `hmac`-signed clearance,
 `governor` rate limiting), the Tor dimension (`CircuitPolicy` + `AccountingCircuitPolicy`
 with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
-expression language + a curated OWASP-CRS-derived ruleset — SQLi/XSS/traversal/SSRF,
-server-side template injection across engines and PHP/Java/Node code execution,
-NoSQL/ORM lookup injection, restricted-file access, and a `ScannerDetection` class that
-hard-blocks self-identifying attack tools like sqlmap/nikto/ghauri/nuclei; input is
-normalized against percent-encoding *and* SQL comment / whitespace padding so
-`UNION/**/SELECT`-style evasions still trip — anomaly scoring, and
+expression language + a curated OWASP-CRS-derived ruleset — SQLi (incl. error-based
+`EXTRACTVALUE`/`UPDATEXML` and MySQL file/privilege functions) / XSS (incl. dangerous
+HTML tags and CSS `-moz-binding`/`behavior:url()` script-binding) / traversal / SSRF
+(incl. Alibaba & Oracle-OCI cloud-metadata endpoints), server-side template injection
+across engines and PHP/Java/Node code execution (Spring4Shell class-loader, JS
+prototype pollution, Java-deserialization markers), PowerShell download-cradle /
+encoded-command and `$IFS` whitespace-evasion RCE, NoSQL/ORM lookup injection,
+restricted-file access (incl. AI coding-assistant artifact dirs like `.claude/`/`.cursor/`),
+and a `ScannerDetection` class that hard-blocks self-identifying attack tools like
+sqlmap/nikto/ghauri/nuclei; input is normalized against percent-encoding *and* SQL
+comment / whitespace padding so `UNION/**/SELECT`-style evasions still trip — anomaly
+scoring, and
 operator-authored custom rules), observability (typed `SecurityEvent`s, metrics,
 request-shape baselining), and
 Phase-5 frontier work: JA4H fingerprinting, request-shape bot heuristics, an opt-in

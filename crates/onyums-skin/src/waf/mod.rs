@@ -877,6 +877,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `-w hidden` launcher flags that ride a base64 blob. Anchored on PowerShell-specific idioms so
 		// prose that merely says "invoke" or "hidden" stays clean. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
 		Rule { id: "cmdi_powershell", category: WafCategory::CommandInjection, pattern: r"(?i)(invoke-expression|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|net\.webclient|frombase64string|\biex\s*\(|-encodedcommand\b|-enc\b|-nop\b|-noprofile\b|-w\s+hidden|-windowstyle\s+hidden)" },
+		// Unix `$IFS` whitespace-evasion (OWASP-CRS rules 932130/932200): the internal-field-separator
+		// substitution attackers use to smuggle a space-free command past filters that key on literal
+		// whitespace — `cat${IFS}/etc/passwd`, `wget$IFS$9http://…`. Matches the `$IFS` / `${IFS}`
+		// token itself; the `\b` tail keeps `$IFSomething` and a benign `${IF}` conditional clean.
+		// The `${IFS}` sequence does not occur in ordinary HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_ifs_evasion", category: WafCategory::CommandInjection, pattern: r"\$\{?IFS\b" },
 		// Shell fork-bomb resource-exhaustion payload (OWASP-CRS 4.25.0 LTS, PL2) — the classic
 		// `:(){ :|:& };:`. Keyed on the recursive self-pipe-into-background `:|:&` rather than the
 		// `(){` function-definition head, so it is a distinct signal from `anomaly_shellshock`'s
@@ -1253,6 +1259,31 @@ mod tests {
 			"/api/webclient-usage",            // "webclient" word, no `Net.WebClient`
 			"/search?q=encoded+video",         // "encoded" word, no `-EncodedCommand`
 		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn ifs_evasion_rule_matches() {
+		// OWASP-CRS 932130/932200: the `$IFS` / `${IFS}` internal-field-separator substitution used to
+		// build a space-free command line.
+		let waf = Waf::starter();
+		// Payloads kept free of other triggers (no `/etc/passwd`, no leading separator) so first-match
+		// attributes them to the IFS rule specifically.
+		for payload in ["cat${IFS}secret.txt", "ls${IFS}-la${IFS}/tmp", "echo$IFS$9done"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the IFS rule"));
+			assert_eq!(m.rule_id, "cmdi_ifs_evasion", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn ifs_evasion_keeps_false_positives_low() {
+		// A `$IFS`-adjacent identifier and a benign `${IF}`-style token stay clean — the rule needs the
+		// exact `IFS` word.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("total=$IFSprofit", "query").is_none(), "$IFSprofit should not false-positive");
+		for uri in ["/docs/if-statements", "/api/config?tpl=${IF}-then"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

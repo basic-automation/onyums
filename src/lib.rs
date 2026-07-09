@@ -786,6 +786,64 @@ fn project_service_problem(problem: &tor_hsservice::status::Problem) -> ServiceP
 	}
 }
 
+/// A consistent point-in-time health snapshot of an onion service (onyums ROADMAP
+/// Phase 4 — observability).
+///
+/// Bundles the [`ServiceStatus`] and, when the service is not fully healthy, the
+/// [`ServiceProblem`] explaining why. Read via [`OnionServiceHandle::health`]. The value is derived from a **single** read
+/// of arti's status, so the `status` and `problem` are always mutually consistent —
+/// unlike calling [`status`](OnionServiceHandle::status) and
+/// [`problem`](OnionServiceHandle::problem) separately, which reads arti twice and can
+/// straddle a state transition (e.g. read `Reachable` then a just-arrived problem).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ServiceHealth {
+	status: ServiceStatus,
+	problem: Option<ServiceProblem>,
+}
+
+impl ServiceHealth {
+	/// The reachability [`ServiceStatus`] at the moment of the snapshot.
+	#[must_use]
+	pub const fn status(&self) -> ServiceStatus {
+		self.status
+	}
+
+	/// The active [`ServiceProblem`] explaining a non-healthy status, or `None` when the
+	/// service reported no problem at the moment of the snapshot.
+	#[must_use]
+	pub const fn problem(&self) -> Option<&ServiceProblem> {
+		self.problem.as_ref()
+	}
+
+	/// Whether the service was believed reachable — the snapshot's
+	/// [`ServiceStatus::is_reachable`].
+	#[must_use]
+	pub const fn is_reachable(&self) -> bool {
+		self.status.is_reachable()
+	}
+
+	/// Whether the service was *fully* healthy: reachable **and** reporting no active
+	/// problem. Stricter than [`is_reachable`](Self::is_reachable), which is still true
+	/// for a [`DegradedReachable`](ServiceStatus::DegradedReachable) service carrying a
+	/// problem — this is the "all green" check for a `/up`-style endpoint.
+	#[must_use]
+	pub const fn is_healthy(&self) -> bool {
+		self.status.is_reachable() && self.problem.is_none()
+	}
+}
+
+impl std::fmt::Display for ServiceHealth {
+	/// Writes the [`ServiceStatus`] label, and — when a problem is present — the
+	/// [`ServiceProblem`] after an em dash, e.g. `"unreachable — introduction-point: []"`
+	/// or just `"reachable"`.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match &self.problem {
+			Some(problem) => write!(f, "{} — {problem}", self.status),
+			None => std::fmt::Display::fmt(&self.status, f),
+		}
+	}
+}
+
 /// Drive a [`ServiceStatus`] stream until the first item satisfying `pred`, returning
 /// that status — or `None` if the stream ends first (the underlying service was
 /// dropped before the condition was met).
@@ -913,6 +971,23 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn problem(&self) -> Option<ServiceProblem> {
 		self.service.status().current_problem().map(project_service_problem)
+	}
+
+	/// A consistent [`ServiceHealth`] snapshot — the [`status`](Self::status) and the
+	/// [`problem`](Self::problem) read together from a single arti status, so they never
+	/// straddle a state transition (onyums ROADMAP Phase 4 — observability).
+	///
+	/// Prefer this to reading `status()` and `problem()` separately when you want a
+	/// coherent "what and why" for a health line: those are two independent reads of
+	/// arti's live status and can disagree across a transition, whereas `health()`
+	/// projects both from the same read.
+	#[must_use]
+	pub fn health(&self) -> ServiceHealth {
+		let raw = self.service.status();
+		ServiceHealth {
+			status: project_service_status(raw.state()),
+			problem: raw.current_problem().map(project_service_problem),
+		}
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -2299,6 +2374,37 @@ mod tests {
 		for p in [DescriptorUpload("x".into()), IntroductionPoint("x".into()), Other("x".into())] {
 			assert!(!p.is_fatal(), "{p:?} must not read as fatal");
 		}
+	}
+
+	#[test]
+	fn service_health_bundles_status_and_problem_consistently() {
+		use ServiceStatus::{Broken, DegradedReachable, Reachable, Unreachable};
+
+		// Fully healthy: reachable, no problem — Display is just the status label.
+		let healthy = ServiceHealth { status: Reachable, problem: None };
+		assert_eq!(healthy.status(), Reachable);
+		assert!(healthy.is_reachable());
+		assert!(healthy.is_healthy());
+		assert!(healthy.problem().is_none());
+		assert_eq!(healthy.to_string(), "reachable");
+
+		// Reachable but degraded and carrying a problem: reachable, yet not fully healthy.
+		let degraded = ServiceHealth { status: DegradedReachable, problem: Some(ServiceProblem::IntroductionPoint("[]".into())) };
+		assert!(degraded.is_reachable());
+		assert!(!degraded.is_healthy(), "a reachable service carrying a problem is not fully healthy");
+		assert_eq!(degraded.problem().map(ServiceProblem::kind), Some(ServiceProblemKind::IntroductionPoint));
+
+		// Broken with a fatal problem: neither reachable nor healthy; Display shows the why.
+		let broken = ServiceHealth { status: Broken, problem: Some(ServiceProblem::Runtime("boom".into())) };
+		assert!(!broken.is_reachable());
+		assert!(!broken.is_healthy());
+		assert!(broken.problem().is_some_and(ServiceProblem::is_fatal));
+		assert_eq!(broken.to_string(), "broken — runtime: boom");
+
+		// A non-reachable status with no reported problem still renders as just the status.
+		let quiet = ServiceHealth { status: Unreachable, problem: None };
+		assert_eq!(quiet.to_string(), "unreachable");
+		assert!(!quiet.is_healthy());
 	}
 
 	#[test]

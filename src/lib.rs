@@ -494,7 +494,7 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 		};
 		let target = circuit_gate::stream_target(port);
 
-		match circuit_gate::stream_disposition(policy.on_new_stream(&id, &target)) {
+		match circuit_gate::stream_disposition(policy.on_new_stream(&id, &target), port) {
 			StreamDisposition::Serve => {
 				let ctx = ctx.clone();
 				tokio::spawn(async move {

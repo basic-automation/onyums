@@ -95,6 +95,23 @@ impl std::fmt::Debug for PortDispatch<'_> {
 /// TLS-first decision (serve / upgrade / reject) always wins for them.
 pub const RESERVED_HTTP_PORTS: [u16; 2] = [80, 443];
 
+/// Whether `port` is one of the [`RESERVED_HTTP_PORTS`] (80/443) served by the built-in
+/// TLS-enforced HTTP handler — the only ports where the Skin HTTP gate can render a
+/// challenge page. A raw port has no such surface, so a circuit-policy `Challenge` there
+/// must fail closed rather than serve the stream ungated (see
+/// [`circuit_gate::stream_disposition`](crate::circuit_gate::stream_disposition)).
+#[must_use]
+pub const fn is_reserved_http_port(port: u16) -> bool {
+	let mut i = 0;
+	while i < RESERVED_HTTP_PORTS.len() {
+		if RESERVED_HTTP_PORTS[i] == port {
+			return true;
+		}
+		i += 1;
+	}
+	false
+}
+
 /// Maps a port to the handler that serves it: the built-in HTTP handler on the
 /// reserved ports 80/443, and caller-registered raw [`StreamHandler`]s on any
 /// other (otherwise-rejected) port.
@@ -232,6 +249,18 @@ mod tests {
 		// The built-in decision still wins for them regardless.
 		assert!(matches!(router.dispatch(443, PlaintextPolicy::Upgrade), PortDispatch::ServeHttp));
 		assert!(matches!(router.dispatch(80, PlaintextPolicy::Upgrade), PortDispatch::RedirectToHttps));
+	}
+
+	#[test]
+	fn is_reserved_http_port_matches_only_80_and_443() {
+		// The predicate the circuit gate uses to decide whether a Challenge has a surface
+		// to render on. Every reserved port reads true; representative raw ports read false.
+		for port in RESERVED_HTTP_PORTS {
+			assert!(is_reserved_http_port(port), "{port} should be a reserved HTTP port");
+		}
+		for port in [0u16, 22, 8080, 9000, 65535] {
+			assert!(!is_reserved_http_port(port), "{port} must not be a reserved HTTP port");
+		}
 	}
 
 	#[test]

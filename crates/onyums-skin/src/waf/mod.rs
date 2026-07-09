@@ -942,6 +942,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		// (Rust `\s` already covers the vertical-tab CRS spells out); the `\]?\[` limb catches the
 		// `obj[constructor][prototype]` bracket-chain the dotted form misses. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf>
 		Rule { id: "code_prototype_pollution", category: WafCategory::CodeInjection, pattern: r"(?i)(__proto__|constructor\s*(?:\.|\]?\[)\s*prototype)" },
+		// Spring4Shell class-loader manipulation (OWASP-CRS rule 944260, CVE-2022-22965): a data-binding
+		// payload walking `class.module.classLoader...` to rewrite the Tomcat access-log pattern into a
+		// webshell, plus the `springframework.context.support.FileSystemXmlApplicationContext` SpEL
+		// gadget. Keyed on the invariant `class.module.classloader` head rather than CRS's exact
+		// `.resources.context.parent.pipeline` tail (attackers vary the tail) — the head never occurs in
+		// benign HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_spring4shell", category: WafCategory::CodeInjection, pattern: r"(?i)(class\.module\.classloader|springframework\.context\.support\.filesystemxmlapplicationcontext)" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -1875,6 +1882,29 @@ mod tests {
 			"/docs/constructor-functions",  // "constructor" as a word, no `.prototype` chain
 			"/blog/prototype-design",       // "prototype" alone, no `constructor` head
 			"/api/build-a-prototype",       // ditto
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn spring4shell_rule_matches() {
+		// OWASP-CRS 944260 (CVE-2022-22965): the class-loader walk and the SpEL context gadget.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("class.module.classLoader.resources.context.parent.pipeline.first.pattern=x", "body").unwrap().rule_id, "code_spring4shell");
+		assert_eq!(waf.inspect_str("x=org.springframework.context.support.FileSystemXmlApplicationContext", "query").unwrap().rule_id, "code_spring4shell");
+		assert_eq!(waf.inspect_str("class.module.classLoader.DefaultAssertionStatus=1", "body").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn spring4shell_keeps_false_positives_low() {
+		// A Java-flavored path that names a class loader as prose, and a Spring docs page, both stay
+		// clean — the rule needs the exact `class.module.classloader` chain or the SpEL gadget FQN.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/java-classloader-guide",   // "classloader" word, no `class.module.` chain
+			"/blog/spring-framework-context",  // "spring" + "context" prose, no gadget FQN
+			"/api/module-class-registry",      // reordered tokens, not the attack chain
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

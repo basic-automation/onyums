@@ -826,6 +826,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
 		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
 		Rule { id: "xss_svg_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*svg\b" },
+		// Dangerous HTML tags past the script/iframe/svg trio (OWASP-CRS rule 941320 tag-handler port):
+		// plugin/resource loaders and layout-legacy elements that execute script or exfiltrate on their
+		// own — `<object>`/`<embed>`/`<applet>` (plugin content), `<base>` (base-href hijack redirects
+		// every relative URL), `<bgsound>`/`<marquee>`/`<layer>` (legacy auto-fire), `<frame>`/`<frameset>`
+		// (framing injection), `<isindex>`, and `<math>` (MathML XSS). Left `<form>`/`<meta>`/`<link>`/
+		// `<style>` out — they show up in benign rich-text often enough to raise false positives. An
+		// opening `<tag` in a request parameter is near-always an injection attempt. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_dangerous_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*(object|embed|applet|marquee|base|bgsound|layer|frame(set)?|isindex|math)\b" },
 		// HTML5 XSS vectors the small handler set above misses (OWASP-CRS 941 port). Newer event
 		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
 		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
@@ -1170,6 +1178,42 @@ mod tests {
 		// dangerous attributes stay clean.
 		let waf = Waf::starter();
 		for uri in ["/settings?onboarding=done", "/form?action=save", "/docs/pointer-events-css", "/page?transition=fade"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn dangerous_html_tags_match() {
+		// OWASP-CRS 941320 tag-handler port: plugin/resource loaders and legacy auto-fire tags beyond
+		// the existing script/iframe/svg rules all attribute to the Xss class.
+		let waf = Waf::starter();
+		// Payloads kept free of `javascript:`/`on*=` handlers so first-match attributes them to the
+		// tag rule rather than the (earlier) URI / event-handler rules — the tag itself is the signal.
+		for (payload, why) in [
+			("x=<object data=//evil/x.swf>", "object"),
+			("x=<embed src=//evil/x.swf>", "embed"),
+			("x=<applet code=Evil>", "applet"),
+			("x=<base href=//evil/>", "base-href hijack"),
+			("x=<bgsound src=//evil/x.wav>", "bgsound"),
+			("x=<marquee behavior=scroll>", "marquee"),
+			("x=<frameset cols=50%>", "frameset"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} ({why}) should trip a dangerous-tag rule"));
+			assert_eq!(m.rule_id, "xss_dangerous_tag", "{payload} ({why})");
+			assert_eq!(m.category, WafCategory::Xss);
+		}
+	}
+
+	#[test]
+	fn dangerous_html_tags_keep_false_positives_low() {
+		// Prose naming the tags as words, and the deliberately-excluded `<form>`/`<meta>` (left out to
+		// avoid rich-text false positives), stay clean at this rule.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/embed-a-video",       // "embed" as a word, no `<embed`
+			"/blog/object-oriented",     // "object" prose
+			"/shop/database-marquee",    // "marquee" as a word
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

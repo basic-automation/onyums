@@ -47,6 +47,7 @@ use tower_service::Service;
 use tracing::{event, span, Level};
 extern crate rcgen;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use axum::*;
 pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, SecurityEvent, SecurityEventSink, Skin};
@@ -411,10 +412,86 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 	Ok(address)
 }
 
+/// A point-in-time snapshot of a service's cumulative circuit/stream counters.
+///
+/// Returned by [`OnionServiceHandle::metrics`] (onyums ROADMAP Phase 4 — per-service
+/// metrics). Every field is a monotonic total since the service launched (a counter, not
+/// a gauge), so two snapshots subtract to a rate or a delta — feed them to a
+/// Prometheus/OpenTelemetry exporter, or print a health line. `circuits_offered` counts
+/// every offer; `circuits_accepted + circuits_rejected` can be slightly less, the
+/// difference being circuits arti failed to accept for transport reasons (neither a
+/// policy decision nor served).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ServiceMetrics {
+	/// Rendezvous circuits offered to the service — one per arti `RendRequest`.
+	pub circuits_offered: u64,
+	/// Circuits accepted into service after the circuit-level policy gate.
+	pub circuits_accepted: u64,
+	/// Circuits the circuit-level policy rejected (or tore down) at the offer.
+	pub circuits_rejected: u64,
+	/// Streams handed to a handler after passing the per-stream policy gate.
+	pub streams_served: u64,
+	/// Streams the per-stream policy rejected while leaving the circuit alive.
+	pub streams_rejected: u64,
+	/// Streams whose policy action tore down the whole circuit.
+	pub streams_shutdown: u64,
+}
+
+/// Shared atomic counters backing [`ServiceMetrics`]: incremented from the rendezvous
+/// loop and snapshotted by [`OnionServiceHandle::metrics`].
+///
+/// `Relaxed` ordering throughout — each counter is an independent monotonic total, not a
+/// lock guarding other state, so no cross-counter ordering is needed.
+#[derive(Debug, Default)]
+struct CircuitMetrics {
+	circuits_offered: AtomicU64,
+	circuits_accepted: AtomicU64,
+	circuits_rejected: AtomicU64,
+	streams_served: AtomicU64,
+	streams_rejected: AtomicU64,
+	streams_shutdown: AtomicU64,
+}
+
+impl CircuitMetrics {
+	fn record_circuit_offered(&self) {
+		self.circuits_offered.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn record_circuit_accepted(&self) {
+		self.circuits_accepted.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn record_circuit_rejected(&self) {
+		self.circuits_rejected.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// Record the outcome of the per-stream policy gate against the matching counter, so
+	/// the loop increments through one tested mapping rather than three scattered calls.
+	fn record_stream(&self, disposition: circuit_gate::StreamDisposition) {
+		let counter = match disposition {
+			circuit_gate::StreamDisposition::Serve => &self.streams_served,
+			circuit_gate::StreamDisposition::Reject => &self.streams_rejected,
+			circuit_gate::StreamDisposition::Shutdown => &self.streams_shutdown,
+		};
+		counter.fetch_add(1, Ordering::Relaxed);
+	}
+
+	fn snapshot(&self) -> ServiceMetrics {
+		ServiceMetrics {
+			circuits_offered: self.circuits_offered.load(Ordering::Relaxed),
+			circuits_accepted: self.circuits_accepted.load(Ordering::Relaxed),
+			circuits_rejected: self.circuits_rejected.load(Ordering::Relaxed),
+			streams_served: self.streams_served.load(Ordering::Relaxed),
+			streams_rejected: self.streams_rejected.load(Ordering::Relaxed),
+			streams_shutdown: self.streams_shutdown.load(Ordering::Relaxed),
+		}
+	}
+}
+
 /// The shared, per-service context threaded through the rendezvous loop down to
 /// every served stream: the application router, the TLS acceptor, the service
-/// address, the plaintext-enforcement policy, and the port → handler routing
-/// table.
+/// address, the plaintext-enforcement policy, the port → handler routing table, and
+/// the shared metrics counters.
 ///
 /// Bundled into one cheaply-`Clone` value (the `Router`/`TlsAcceptor`/`Arc` clones
 /// are all shallow) so the loop's helpers take a handful of arguments instead of a
@@ -427,6 +504,7 @@ struct ServeContext {
 	address: OnionAddress,
 	plaintext: tls_policy::PlaintextPolicy,
 	port_router: Arc<PortRouter>,
+	metrics: Arc<CircuitMetrics>,
 }
 
 /// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
@@ -448,10 +526,12 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 		let circuit_span = span!(Level::INFO, "onyums - new_circuit");
 		let _circuit_guard = circuit_span.enter();
 		let id = allocator.next_id();
+		ctx.metrics.record_circuit_offered();
 
 		// Consult the policy at the circuit boundary before accepting.
 		if circuit_gate::circuit_disposition(policy.on_new_circuit(&id)) == CircuitDisposition::Drop {
 			event!(Level::INFO, "Circuit {} rejected by policy on offer.", id.0);
+			ctx.metrics.record_circuit_rejected();
 			if let Err(err) = rend_request.reject().await {
 				event!(Level::INFO, "Failed to reject circuit {}: {err}", id.0);
 			}
@@ -468,6 +548,7 @@ async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Sen
 				continue;
 			}
 		};
+		ctx.metrics.record_circuit_accepted();
 
 		let ctx = ctx.clone();
 		let policy = policy.clone();
@@ -494,7 +575,9 @@ async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> +
 		};
 		let target = circuit_gate::stream_target(port);
 
-		match circuit_gate::stream_disposition(policy.on_new_stream(&id, &target), port) {
+		let disposition = circuit_gate::stream_disposition(policy.on_new_stream(&id, &target), port);
+		ctx.metrics.record_stream(disposition);
+		match disposition {
 			StreamDisposition::Serve => {
 				let ctx = ctx.clone();
 				tokio::spawn(async move {
@@ -903,6 +986,9 @@ pub struct OnionServiceHandle {
 	client: Arc<TorClient<TokioNativeTlsRuntime>>,
 	cancel: CancellationToken,
 	task: Mutex<Option<JoinHandle<()>>>,
+	// Shared with the accept loop's `ServeContext`; the loop increments, `metrics()`
+	// snapshots (onyums ROADMAP Phase 4 — per-service metrics).
+	metrics: Arc<CircuitMetrics>,
 	// Set only for an ephemeral service (see `OnionServiceBuilder::ephemeral`): the
 	// throwaway temp state dir, removed when the handle drops so the disposable
 	// identity key does not linger on disk. `Mutex<Option<..>>` so `shutdown` can
@@ -1011,6 +1097,19 @@ impl OnionServiceHandle {
 			status: project_service_status(raw.state()),
 			problem: raw.current_problem().map(project_service_problem),
 		}
+	}
+
+	/// A snapshot of this service's cumulative circuit/stream counters — a
+	/// [`ServiceMetrics`] (onyums ROADMAP Phase 4 — per-service metrics).
+	///
+	/// Counters are monotonic totals since launch, incremented by the accept loop:
+	/// circuits offered / accepted / rejected at the circuit-policy gate, and streams
+	/// served / rejected / circuit-torn-down at the per-stream gate. Snapshot twice and
+	/// subtract for a rate, or expose the raw totals to a Prometheus/OpenTelemetry
+	/// exporter. Cheap and non-blocking — a plain atomic read per counter.
+	#[must_use]
+	pub fn metrics(&self) -> ServiceMetrics {
+		self.metrics.snapshot()
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -1543,8 +1642,10 @@ impl OnionServiceBuilder {
 		let tls_acceptor = tls_acceptor(&address, &self.tls)?;
 
 		// Bundle everything the loop threads down to each served stream into one
-		// cheaply-cloned context (see [`ServeContext`]).
-		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router };
+		// cheaply-cloned context (see [`ServeContext`]). The metrics counters are shared
+		// with the handle so `metrics()` reads what the loop increments.
+		let metrics = Arc::new(CircuitMetrics::default());
+		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics) };
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
@@ -1564,7 +1665,7 @@ impl OnionServiceBuilder {
 			}
 		});
 
-		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir: Mutex::new(ephemeral_state_dir) })
+		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir: Mutex::new(ephemeral_state_dir), metrics })
 	}
 }
 
@@ -2496,6 +2597,54 @@ mod tests {
 		let quiet = ServiceHealth { status: Unreachable, problem: None };
 		assert_eq!(quiet.to_string(), "unreachable");
 		assert!(!quiet.is_healthy());
+	}
+
+	#[test]
+	fn circuit_metrics_snapshot_reflects_recorded_events() {
+		use circuit_gate::StreamDisposition;
+		let m = CircuitMetrics::default();
+		assert_eq!(m.snapshot(), ServiceMetrics::default(), "a fresh counter set is all zeros");
+
+		m.record_circuit_offered();
+		m.record_circuit_offered();
+		m.record_circuit_accepted();
+		m.record_circuit_rejected();
+		m.record_stream(StreamDisposition::Serve);
+		m.record_stream(StreamDisposition::Serve);
+		m.record_stream(StreamDisposition::Reject);
+		m.record_stream(StreamDisposition::Shutdown);
+
+		let snap = m.snapshot();
+		assert_eq!(snap.circuits_offered, 2);
+		assert_eq!(snap.circuits_accepted, 1);
+		assert_eq!(snap.circuits_rejected, 1);
+		assert_eq!(snap.streams_served, 2);
+		assert_eq!(snap.streams_rejected, 1);
+		assert_eq!(snap.streams_shutdown, 1);
+	}
+
+	#[test]
+	fn record_stream_maps_each_disposition_to_its_own_counter() {
+		use circuit_gate::StreamDisposition::{Reject, Serve, Shutdown};
+
+		// Each disposition bumps exactly one distinct stream counter and never a circuit
+		// counter. `pick` returns the per-disposition target counter; a helper records one
+		// event and asserts only that counter (and no circuit counter) moved.
+		let served = |s: ServiceMetrics| s.streams_served;
+		let rejected = |s: ServiceMetrics| s.streams_rejected;
+		let shutdown = |s: ServiceMetrics| s.streams_shutdown;
+		let check = |disposition: circuit_gate::StreamDisposition, pick: &dyn Fn(ServiceMetrics) -> u64| {
+			let m = CircuitMetrics::default();
+			m.record_stream(disposition);
+			let snap = m.snapshot();
+			assert_eq!(pick(snap), 1, "{disposition:?} should bump its own counter");
+			assert_eq!(snap.streams_served + snap.streams_rejected + snap.streams_shutdown, 1, "exactly one stream counter moves");
+			assert_eq!(snap.circuits_offered + snap.circuits_accepted + snap.circuits_rejected, 0, "stream events never touch circuit counters");
+		};
+
+		check(Serve, &served);
+		check(Reject, &rejected);
+		check(Shutdown, &shutdown);
 	}
 
 	#[test]

@@ -657,6 +657,135 @@ fn project_service_status(state: tor_hsservice::status::State) -> ServiceStatus 
 	}
 }
 
+/// The stable *category* of a [`ServiceProblem`], with the owned diagnostic detail
+/// stripped.
+///
+/// A `Copy` discriminant a downstream can match on exhaustively and store cheaply, the
+/// way [`ServiceStatus`] is matched (onyums ROADMAP Phase 4).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ServiceProblemKind {
+	/// A fatal runtime error — see [`ServiceProblem::Runtime`].
+	Runtime,
+	/// A descriptor-upload failure — see [`ServiceProblem::DescriptorUpload`].
+	DescriptorUpload,
+	/// An introduction-point failure — see [`ServiceProblem::IntroductionPoint`].
+	IntroductionPoint,
+	/// An unmodelled subsystem — see [`ServiceProblem::Other`].
+	Other,
+}
+
+impl ServiceProblemKind {
+	/// A short, stable, lowercase label for this category — safe to match on downstream
+	/// (a health line or an alert rule) because it never changes for a given variant.
+	#[must_use]
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Runtime => "runtime",
+			Self::DescriptorUpload => "descriptor-upload",
+			Self::IntroductionPoint => "introduction-point",
+			Self::Other => "other",
+		}
+	}
+}
+
+/// The reason a service is running degraded, unreachable, or broken — onyums' stable
+/// projection of arti's `#[non_exhaustive]` [`Problem`](tor_hsservice::status::Problem).
+///
+/// This is the "why" behind a non-[`Reachable`](ServiceStatus::Reachable)
+/// [`ServiceStatus`] (onyums ROADMAP Phase 4 — observability).
+///
+/// arti's `Problem` is `#[non_exhaustive]` and — unlike its `State` — carries **no
+/// `Display`** (only `Debug`) in the pinned 0.43 source, so it cannot be surfaced to
+/// operators cleanly as-is. This is onyums' typed projection, the same pattern as
+/// [`ServiceStatus`]: downstreams match on the stable [`kind`](Self::kind) without a
+/// wildcard, and read the operator-facing diagnostic through [`detail`](Self::detail)
+/// or [`Display`](std::fmt::Display). Read the current value from a running service via
+/// [`OnionServiceHandle::problem`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ServiceProblem {
+	/// A fatal runtime error the service could not recover from — the reason behind a
+	/// [`Broken`](ServiceStatus::Broken) status. Carries arti's `Debug` diagnostic.
+	Runtime(String),
+	/// One or more onion-service descriptor uploads failed, so clients may be unable to
+	/// find the service until a later upload succeeds.
+	DescriptorUpload(String),
+	/// One or more introduction points could not be established — the usual reason a
+	/// service reads [`Unreachable`](ServiceStatus::Unreachable) or
+	/// [`DegradedReachable`](ServiceStatus::DegradedReachable).
+	IntroductionPoint(String),
+	/// A problem in a subsystem onyums does not model explicitly: arti's `PoW` manager
+	/// (only compiled with the experimental `hs-pow-full` feature), or a category a
+	/// newer arti adds to its `#[non_exhaustive]` `Problem`. The diagnostic still
+	/// carries arti's `Debug` rendering, so the cause is never silently dropped.
+	Other(String),
+}
+
+impl ServiceProblem {
+	/// The stable [`ServiceProblemKind`] of this problem — safe to match on downstream,
+	/// unlike the owned diagnostic [`detail`](Self::detail) string.
+	#[must_use]
+	pub const fn kind(&self) -> ServiceProblemKind {
+		match self {
+			Self::Runtime(_) => ServiceProblemKind::Runtime,
+			Self::DescriptorUpload(_) => ServiceProblemKind::DescriptorUpload,
+			Self::IntroductionPoint(_) => ServiceProblemKind::IntroductionPoint,
+			Self::Other(_) => ServiceProblemKind::Other,
+		}
+	}
+
+	/// The operator-facing diagnostic detail — arti's `Debug` rendering of the
+	/// underlying problem, since arti's `Problem` exposes no `Display`.
+	#[must_use]
+	pub fn detail(&self) -> &str {
+		match self {
+			Self::Runtime(d) | Self::DescriptorUpload(d) | Self::IntroductionPoint(d) | Self::Other(d) => d,
+		}
+	}
+
+	/// A short, stable, lowercase label for this problem's category — the
+	/// [`kind`](Self::kind)'s [`label`](ServiceProblemKind::label).
+	#[must_use]
+	pub const fn label(&self) -> &'static str {
+		self.kind().label()
+	}
+
+	/// Whether this is a *fatal* problem the service will not recover from on its own — a
+	/// [`Runtime`](Self::Runtime) error, which drives arti to
+	/// [`Broken`](ServiceStatus::Broken) — as opposed to the transient descriptor-upload
+	/// and introduction-point problems arti retries.
+	#[must_use]
+	pub const fn is_fatal(&self) -> bool {
+		matches!(self, Self::Runtime(_))
+	}
+}
+
+impl std::fmt::Display for ServiceProblem {
+	/// Writes `"<label>: <detail>"` — the stable category plus arti's diagnostic — so a
+	/// `ServiceProblem` drops straight into a log line or a degraded-health response.
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(f, "{}: {}", self.label(), self.detail())
+	}
+}
+
+/// Project arti's `#[non_exhaustive]` [`Problem`](tor_hsservice::status::Problem) onto
+/// onyums' stable [`ServiceProblem`], capturing arti's `Debug` rendering as the
+/// operator-facing [`detail`](ServiceProblem::detail) (arti exposes no `Display` on
+/// `Problem` or its inner errors). Keys only on the variant, so it is unit-testable
+/// offline over a constructed `Problem` with no live Tor network. A subsystem onyums
+/// does not model — the feature-gated `PoW` manager, or any category a newer arti adds —
+/// maps to [`ServiceProblem::Other`] rather than being dropped.
+fn project_service_problem(problem: &tor_hsservice::status::Problem) -> ServiceProblem {
+	use tor_hsservice::status::Problem;
+	match problem {
+		Problem::Runtime(e) => ServiceProblem::Runtime(format!("{e:?}")),
+		Problem::DescriptorUpload(errs) => ServiceProblem::DescriptorUpload(format!("{errs:?}")),
+		Problem::Ipt(errs) => ServiceProblem::IntroductionPoint(format!("{errs:?}")),
+		// `Problem` is `#[non_exhaustive]`; the PoW variant (feature-gated off) and any
+		// future arti category fall here rather than being silently dropped.
+		_ => ServiceProblem::Other(format!("{problem:?}")),
+	}
+}
+
 /// Drive a [`ServiceStatus`] stream until the first item satisfying `pred`, returning
 /// that status — or `None` if the stream ends first (the underlying service was
 /// dropped before the condition was met).
@@ -766,6 +895,24 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn is_ready(&self) -> bool {
 		self.status().is_reachable()
+	}
+
+	/// The reason the service is currently degraded, unreachable, or broken — its
+	/// [`ServiceProblem`] — or `None` when there is no active problem (onyums ROADMAP
+	/// Phase 4 — observability).
+	///
+	/// Pairs with [`status`](Self::status): `status()` reports *what* the reachability
+	/// is, `problem()` reports *why* when it is not fully healthy. A
+	/// [`Reachable`](ServiceStatus::Reachable) service normally reports `None`; a
+	/// [`Broken`](ServiceStatus::Broken) or [`Unreachable`](ServiceStatus::Unreachable)
+	/// one carries the arti-observed cause — a failed descriptor upload, dead
+	/// introduction points, or a fatal runtime error. Projected from arti's
+	/// `#[non_exhaustive]` `current_problem()` through the stable [`ServiceProblem`]
+	/// mapping, so the category is matchable downstream and the diagnostic is readable
+	/// even though arti's own `Problem` exposes no `Display`.
+	#[must_use]
+	pub fn problem(&self) -> Option<ServiceProblem> {
+		self.service.status().current_problem().map(project_service_problem)
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -2108,6 +2255,50 @@ mod tests {
 		assert_eq!(project_service_status(State::DegradedUnreachable), ServiceStatus::Unreachable);
 		assert_eq!(project_service_status(State::Recovering), ServiceStatus::Unreachable);
 		assert_eq!(project_service_status(State::Broken), ServiceStatus::Broken);
+	}
+
+	#[test]
+	fn service_problem_projects_arti_problem_categories() {
+		use tor_hsservice::status::Problem;
+		// Empty vecs exercise the category mapping without constructing arti's internal
+		// error types — the projection keys only on the `Problem` variant. If arti adds
+		// or renames a `Problem` category the `_` arm keeps this compiling but the new
+		// case reads as `Other`, the conservative default.
+		assert_eq!(project_service_problem(&Problem::Ipt(Vec::new())).kind(), ServiceProblemKind::IntroductionPoint);
+		assert_eq!(project_service_problem(&Problem::DescriptorUpload(Vec::new())).kind(), ServiceProblemKind::DescriptorUpload);
+		// The diagnostic detail is arti's `Debug` rendering, captured (not dropped) even
+		// though arti's `Problem` has no `Display`; an empty intro-point error list
+		// renders as an empty debug vec.
+		assert_eq!(project_service_problem(&Problem::Ipt(Vec::new())).detail(), "[]");
+	}
+
+	#[test]
+	fn service_problem_surface_is_stable_and_distinct() {
+		use ServiceProblem::{DescriptorUpload, IntroductionPoint, Other, Runtime};
+		let all = [
+			Runtime("boom".into()),
+			DescriptorUpload("upload failed".into()),
+			IntroductionPoint("no ipts".into()),
+			Other("mystery".into()),
+		];
+		// `detail()` round-trips the diagnostic; `Display` is exactly `"<label>: <detail>"`.
+		for p in &all {
+			assert!(!p.label().is_empty());
+			assert_eq!(p.to_string(), format!("{}: {}", p.label(), p.detail()));
+			// The category label is the kind's label.
+			assert_eq!(p.label(), p.kind().label());
+		}
+		assert_eq!(Runtime("boom".into()).detail(), "boom");
+
+		// Labels are distinct across the four categories (a downstream may match on them).
+		let labels: std::collections::HashSet<_> = all.iter().map(ServiceProblem::label).collect();
+		assert_eq!(labels.len(), all.len(), "labels must be distinct");
+
+		// Only a runtime error is fatal; the retriable problems are not.
+		assert!(Runtime("x".into()).is_fatal());
+		for p in [DescriptorUpload("x".into()), IntroductionPoint("x".into()), Other("x".into())] {
+			assert!(!p.is_fatal(), "{p:?} must not read as fatal");
+		}
 	}
 
 	#[test]

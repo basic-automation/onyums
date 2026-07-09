@@ -18,6 +18,7 @@
 - [x] Replace synchronous Drop cleanup — `spawn_ephemeral_cleanup` offloads `remove_dir_all` to the blocking pool when a runtime is live (else runs inline); `shutdown()` `take()`s and awaits the removal, `Drop` cleans up only what shutdown left (best-effort, detached). No `remove_dir_all` on a runtime worker.
 - [x] Add #![forbid(unsafe_code)] — onyums' own code has no `unsafe` (grep-verified); the crate-level `#![forbid(unsafe_code)]` makes any future `unsafe` a hard compile error. Builds green.
 - [ ] Unify dependency tree — #![allow(clippy::multiple_crate_versions)] suggests hyper/tokio/arti version mismatches; reduce compiled binary weight.
+- [ ] Explore https://github.com/plabayo/rama and see if it can open any new features for onyums, if so, flush out the roadmap
 
 
 ## Phase 1 — Stable identity by default — `0.5`

@@ -906,7 +906,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_ssti_hash_delim", category: WafCategory::CodeInjection, pattern: r"#\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_razor", category: WafCategory::CodeInjection, pattern: r"@\(\s*\d+\s*[*]\s*\d+\s*\)" },
 		Rule { id: "code_ssti_thymeleaf", category: WafCategory::CodeInjection, pattern: r"\*\{\s*\d+\s*[*]\s*\d+\s*\}" },
-		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"rO0AB[A-Za-z0-9+/=]{2,}" },
+		// Java serialized-object stream smuggled base64 through a text field (cookie/header/body) — the
+		// delivery vehicle for a Commons-Collections-style gadget chain. `rO0AB…` is the base64 opener
+		// of the raw `\xac\xed\x00\x05` STREAM_MAGIC header (the raw bytes rarely survive as valid UTF-8
+		// in a string field, so the base64 form is the one that appears). Broadened to the `KztAAU` /
+		// `Cs7QAF` gzip/variant openers OWASP-CRS rule 944210 lists alongside the raw one. Case-SENSITIVE
+		// (base64 is) — the exact openers do not occur in benign text. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"(?:rO0AB[A-Za-z0-9+/=]{2,}|KztAAU|Cs7QAF)" },
 		// Double-extension upload filename (the file-upload RCE vector behind CVE-2026-33691): a
 		// benign-looking media/document/archive extension immediately followed by a *trailing*
 		// server-script extension — `avatar.jpg.php`, `report.pdf.jsp`, `notes.txt.phtml`. The
@@ -1905,6 +1911,31 @@ mod tests {
 			"/docs/java-classloader-guide",   // "classloader" word, no `class.module.` chain
 			"/blog/spring-framework-context",  // "spring" + "context" prose, no gadget FQN
 			"/api/module-class-registry",      // reordered tokens, not the attack chain
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn java_serialized_variant_markers_match() {
+		// The `rO0AB…` raw base64 opener was already covered; this asserts the CRS 944210 gzip/variant
+		// openers (`KztAAU` / `Cs7QAF`) added to the same `code_java_serialized` rule also trip.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("state=rO0ABXNyABBqYXZh", "body").unwrap().rule_id, "code_java_serialized");
+		assert_eq!(waf.inspect_str("d=KztAAU9uZQ", "query").unwrap().rule_id, "code_java_serialized");
+		assert_eq!(waf.inspect_str("blob=Cs7QAFsomegzippeddata", "body").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn java_serialized_markers_keep_false_positives_low() {
+		// Ordinary base64 that does not open with a serialization magic stays clean, and the markers
+		// are case-sensitive so a lowercased look-alike in a path does not trip them.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("aGVsbG8gd29ybGQ=", "body").is_none(), "benign base64 should not false-positive");
+		for uri in [
+			"/files/ro0abstract-notes.txt",  // lowercase "ro0ab", not the case-sensitive marker
+			"/img/logo-rO0.png",             // partial, no full `rO0AB` opener
+			"/data/kztaau-lowercase.bin",    // lowercased variant opener stays clean
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

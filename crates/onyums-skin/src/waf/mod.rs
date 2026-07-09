@@ -931,6 +931,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		// Cloud metadata reachable by DNS name rather than the 169.254.169.254 link-local IP —
 		// GCP's `metadata.google.internal`. A value-inspection SSRF target the IP/path rules miss.
 		Rule { id: "ssrf_metadata_hostname", category: WafCategory::Ssrf, pattern: r"(?i)\bmetadata\.google\.internal\b" },
+		// Non-AWS cloud metadata endpoints the 169.254.169.254 IP + AWS/GCP/Azure path rules miss:
+		// Alibaba Cloud's distinct link-local metadata IP `100.100.100.200` (cloud-agnostic SSRF
+		// tooling routinely forgets it), and Oracle OCI's `/opc/v{1,2}/` metadata path (OCI keeps the
+		// 169.254 IP but exposes metadata under `/opc/`, so the AWS `/latest/meta-data` path rule does
+		// not fire). Value-inspection, no client IP needed. <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery/cloud-ssrf>
+		Rule { id: "ssrf_vendor_metadata", category: WafCategory::Ssrf, pattern: r"(?i)(100\.100\.100\.200|/opc/v[12]/)" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
@@ -1978,6 +1984,31 @@ mod tests {
 		// trip the lower-indexed `ssrf_cloud_metadata_path` first) so the hostname rule is what
 		// fires; either way the block is attributed to SSRF.
 		assert_eq!(waf.inspect_str("url=http://metadata.google.internal/", "query").unwrap().rule_id, "ssrf_metadata_hostname");
+	}
+
+	#[test]
+	fn ssrf_vendor_metadata_match() {
+		// Alibaba's distinct metadata IP and Oracle OCI's `/opc/v{1,2}/` path — the non-AWS endpoints
+		// the 169.254 IP and AWS/GCP/Azure path rules miss.
+		let waf = Waf::starter();
+		// Bare Alibaba IP (a `/latest/meta-data` path would trip the earlier generic path rule first).
+		assert_eq!(waf.inspect_str("url=http://100.100.100.200/instance-id", "query").unwrap().rule_id, "ssrf_vendor_metadata");
+		// The OCI form keeps the 169.254 IP, so first-match attributes it to the IP rule — still SSRF.
+		assert_eq!(waf.inspect_str("url=http://169.254.169.254/opc/v2/instance/", "query").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("target=/opc/v1/instance/id", "query").unwrap().rule_id, "ssrf_vendor_metadata");
+	}
+
+	#[test]
+	fn ssrf_vendor_metadata_keeps_false_positives_low() {
+		// A look-alike IP and an `/opc/` path without the version segment stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/status?ip=100.100.100.20",   // one octet short of the metadata IP
+			"/docs/opc-ua-protocol",       // "opc" as a word, not the `/opc/v1/` path
+			"/api/opc/status",             // `/opc/` without the `v{1,2}/` metadata segment
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

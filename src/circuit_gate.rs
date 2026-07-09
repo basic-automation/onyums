@@ -9,7 +9,8 @@
 //! So onyums mints its own [`CircuitId`](onyums_skin::CircuitId) per `RendRequest`.
 //!
 //! The `RendRequest` / `StreamRequest` types cannot be constructed outside arti, so the
-//! loop that drives them is only exercised by the live `test_serve`. This module factors
+//! loop that drives them is only exercised by the `--ignored` live-Tor test tier
+//! (`live_service_serves_over_the_tor_network_and_shuts_down`). This module factors
 //! the *decisions* out of that loop into pure functions and a synthetic id allocator, so
 //! the policy translation is unit-testable with no live Tor network.
 

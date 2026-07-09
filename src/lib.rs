@@ -277,9 +277,9 @@ fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig
 async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	event!(Level::INFO, "Creating Tor client...");
 	let config = tor_client_config(state_dir, cache_dir)?;
-	let runtime = TokioNativeTlsRuntime::current().map_err(|_| anyhow::anyhow!("Failed to get current tokio runtime."))?;
+	let runtime = TokioNativeTlsRuntime::current().map_err(|e| anyhow::anyhow!("Failed to get current tokio runtime: {e}"))?;
 	let client = TorClient::with_runtime(runtime);
-	client.config(config).create_bootstrapped().await.map_err(|_| anyhow::anyhow!("Failed to create bootstrapped Tor client."))
+	client.config(config).create_bootstrapped().await.map_err(|e| anyhow::anyhow!("Failed to create bootstrapped Tor client: {e}"))
 }
 
 /// The unique prefix every ephemeral state directory carries (see [`storage_dirs`]).
@@ -357,7 +357,7 @@ fn apply_restricted_discovery(cfg: &mut OnionServiceConfigBuilder, allowlist: &R
 /// Returns an error if the nickname fails to parse, the restricted-discovery allowlist
 /// is invalid (see [`apply_restricted_discovery`]), or the config fails to build.
 fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedDiscovery>) -> Result<OnionServiceConfig> {
-	let nickname = nickname.parse::<HsNickname>().map_err(|_| anyhow::anyhow!("Failed to parse nickname."))?;
+	let nickname = nickname.parse::<HsNickname>().map_err(|e| anyhow::anyhow!("Failed to parse nickname: {e}"))?;
 	let mut cfg = OnionServiceConfigBuilder::default();
 	cfg.nickname(nickname);
 	if let Some(allowlist) = allowlist {
@@ -374,7 +374,7 @@ fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedDisco
 fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
 	event!(Level::INFO, "Launching onion service...");
 	client.launch_onion_service(svc_cfg)
-		.map_err(|_| anyhow::anyhow!("Failed to launch onion service."))?
+		.map_err(|e| anyhow::anyhow!("Failed to launch onion service: {e}"))?
 		.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
 }
 
@@ -1593,7 +1593,7 @@ pub async fn serve(app: Router, nickname: &str) -> Result<()> {
 /// Handles a TLS connection on port 443.
 async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, circuit_id: CircuitId) -> Result<()> {
 	event!(Level::INFO, "Accepting the incoming stream and wrapping it in a TLS stream...");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 
 	// Surface the host-assigned per-circuit id to the application (and the Skin HTTP
 	// gate) via the axum connect-info, replacing the long-hardcoded `None`.
@@ -1628,7 +1628,7 @@ async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsA
 /// Handles a plain HTTP request on port 80 by redirecting to HTTPS.
 async fn handle_http_redirect(stream_request: StreamRequest, requested_host: String) -> Result<()> {
 	event!(Level::INFO, "Accepting plain HTTP request on port 80 and redirecting to HTTPS.");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 
 	let stream = TokioIo::new(onion_service_stream);
 
@@ -1774,7 +1774,7 @@ async fn handle_stream_request(stream_request: StreamRequest, ctx: ServeContext,
 /// [`OnionStream`] and handed to the handler, which owns it for the connection.
 async fn handle_raw_stream(stream_request: StreamRequest, handler: Arc<dyn StreamHandler>, port: u16) -> Result<()> {
 	event!(Level::INFO, "Accepting a raw stream on port {port} for a registered handler...");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|_| anyhow::anyhow!("failed to accept onion service stream"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 	handler.serve(Box::pin(onion_service_stream)).await
 }
 
@@ -2222,6 +2222,19 @@ mod tests {
 		allow.authorize("not a slug", ClientAuthKey::from_bytes([1u8; 32]));
 		let err = build_onion_service_config("bad_nick", Some(&allow)).expect_err("an invalid client nickname must be rejected");
 		assert!(err.to_string().contains("nickname"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn service_nickname_parse_error_preserves_the_arti_cause() {
+		// The service nickname takes the same context-preserving `map_err` as the other
+		// Tor-bootstrap sites: a bad nickname surfaces *why* (arti's underlying parse
+		// error) appended to onyums' context, not a bare "Failed to parse nickname."
+		let err = build_onion_service_config("bad service nickname", None).expect_err("a nickname with spaces must be rejected");
+		let msg = err.to_string();
+		assert!(msg.starts_with("Failed to parse nickname: "), "missing onyums context: {msg}");
+		// The underlying arti `InvalidNickname` Display must be carried, not dropped —
+		// the whole point of replacing `map_err(|_| ...)` with `map_err(|e| ...: {e})`.
+		assert!(msg.len() > "Failed to parse nickname: ".len(), "arti cause was dropped: {msg}");
 	}
 
 	#[tokio::test]

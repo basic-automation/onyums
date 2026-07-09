@@ -847,6 +847,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `<style>` out — they show up in benign rich-text often enough to raise false positives. An
 		// opening `<tag` in a request parameter is near-always an injection attempt. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
 		Rule { id: "xss_dangerous_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*(object|embed|applet|marquee|base|bgsound|layer|frame(set)?|isindex|math)\b" },
+		// CSS-context script-binding XSS (OWASP-CRS rule 941170): the two style vectors that execute
+		// script without a `<script>` tag or `on*=` handler — Gecko's deprecated `-moz-binding` (loads
+		// an XBL binding whose constructor runs JS) and IE's `behavior:url(...)` HTC binding. Both are
+		// obsolete legitimately, so their appearance in a reflected `style=`/CSS value is an injection.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_css_binding", category: WafCategory::Xss, pattern: r"(?i)(-moz-binding|behavior\s*:\s*url\s*\()" },
 		// HTML5 XSS vectors the small handler set above misses (OWASP-CRS 941 port). Newer event
 		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
 		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
@@ -1270,6 +1276,29 @@ mod tests {
 			"/docs/embed-a-video",       // "embed" as a word, no `<embed`
 			"/blog/object-oriented",     // "object" prose
 			"/shop/database-marquee",    // "marquee" as a word
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn css_binding_xss_matches() {
+		// OWASP-CRS 941170: the CSS-context script-binding vectors that carry no `<script>`/`on*=`.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("style=x:expr;-moz-binding:url(//evil/x.xml#e)", "query").unwrap().rule_id, "xss_css_binding");
+		assert_eq!(waf.inspect_str("style=behavior:url(evil.htc)", "query").unwrap().category, WafCategory::Xss);
+		assert_eq!(waf.inspect_str("s=behavior : url ( x )", "query").unwrap().rule_id, "xss_css_binding");
+	}
+
+	#[test]
+	fn css_binding_xss_keeps_false_positives_low() {
+		// Prose that names "behavior" or "binding" as words, without the CSS `:url(` / `-moz-binding`
+		// syntax, stays clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/user-behavior-analytics",  // "behavior" word, no `behavior:url(`
+			"/blog/data-binding-in-vue",      // "binding" word, no `-moz-binding`
+			"/api/behavior?mode=url",         // "behavior" + "url" split, no `behavior:url(`
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

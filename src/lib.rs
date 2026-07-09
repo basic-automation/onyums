@@ -2402,7 +2402,9 @@ mod tests {
 		let response = served_body.expect("no fetch attempt got the app body back over the live Tor network");
 		assert!(response.starts_with("HTTP/1.1 200"), "expected a 200 response, got: {}", response.lines().next().unwrap_or(""));
 
-		// Graceful teardown must return — the missing half of the old test.
-		handle.shutdown().await;
+		// Graceful teardown must return — the missing half of the old test. Bounded
+		// like every other phase, so a wedged accept loop fails the run instead of
+		// hanging it.
+		tokio::time::timeout(std::time::Duration::from_secs(60), handle.shutdown()).await.expect("graceful shutdown should complete within 60 seconds");
 	}
 }

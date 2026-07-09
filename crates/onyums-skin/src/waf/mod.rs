@@ -855,6 +855,15 @@ pub fn starter_rules() -> Vec<Rule> {
 		// SQL dump, a vim `.swp`. High-signal source/secret disclosure; an operator serving such
 		// files deliberately can `disable_rule("traversal_backup_files")`.
 		Rule { id: "traversal_backup_files", category: WafCategory::PathTraversal, pattern: r"(?i)\.(bak|swp|swo|sql|dump)\b" },
+		// AI coding-assistant artifact directories probed over HTTP (OWASP-CRS rule 930140, added
+		// 4.24.1 via issue #4474 — the `ai-critical-artifacts.data` `@pmFromFile` set). These
+		// per-tool dotdirs hold MCP server definitions, project rules, hooks, and — the real prize
+		// for a scanner — API keys / tokens in env or `settings.local.json` (`.claude/`, `.cursor/`,
+		// Codex `.codex/`, Windsurf `.windsurf/`, Agent Zero `.a0proj/secrets.env`, …). Enclosing-slash
+		// / dot-segment anchored like the VCS-config rule so `/declared/` and `x.cursor` stay clean;
+		// `.qwen_code` and `.crush` ship without a trailing slash in the CRS data file, so they take a
+		// word-boundary tail instead. <https://github.com/coreruleset/coreruleset/blob/main/rules/ai-critical-artifacts.data>
+		Rule { id: "traversal_ai_assistant_artifacts", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.(claude|cursor|continue|aider|roo|zed|cline|kiro|windsurf|rovodev|codex|opencode|a0proj|plandex|fabric|n8n|junie|gemini|openclaw|clawdbot|trustclaw|zeroclaw|warp)/|/\.(qwen_code|crush)\b)" },
 		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
@@ -1999,6 +2008,18 @@ mod tests {
 			("/backups/db.sql", "traversal_backup_files"),
 			("/wp-config.php.bak", "traversal_backup_files"),
 			("/index.php.swp", "traversal_backup_files"),
+			// AI coding-assistant artifact dotdirs (CRS rule 930140 / ai-critical-artifacts.data).
+			("/.claude/settings.local.json", "traversal_ai_assistant_artifacts"),
+			("/.cursor/mcp.json", "traversal_ai_assistant_artifacts"),
+			("/.codex/config.toml", "traversal_ai_assistant_artifacts"),
+			("/.windsurf/rules", "traversal_ai_assistant_artifacts"),
+			("/.a0proj/secrets.env", "traversal_ai_assistant_artifacts"),
+			("/.n8n/config", "traversal_ai_assistant_artifacts"),
+			// Nested under a project subdir — the substring is still anchored by its enclosing slash.
+			("/repo/.aider/aider.conf.yml", "traversal_ai_assistant_artifacts"),
+			// The two CRS entries that ship without a trailing slash take a word-boundary tail.
+			("/.qwen_code", "traversal_ai_assistant_artifacts"),
+			("/.crush", "traversal_ai_assistant_artifacts"),
 		] {
 			let v = waf.inspect(&parts("GET", uri));
 			let m = blocked(&v);
@@ -2019,6 +2040,13 @@ mod tests {
 			"/products/webcconfig-tool", // "webconfig" != "/web.config"
 			"/docs/backup-strategies",   // "backup" as a word, no `.bak` extension
 			"/blog/nosql-basics",        // "sql" inside "nosql", no `.sql` extension
+			// AI-artifact look-alikes: the tool names as path words, without the leading `/.` dot
+			// segment (CRS 930140 matches the dotdir, not the bare word).
+			"/blog/claude-code-tips",    // "claude" as a word, no `/.claude/`
+			"/products/cursor-ide",      // "cursor" as a word, no `/.cursor/`
+			"/docs/continue-reading",    // "continue" prose, no `/.continue/`
+			"/.crushed-ice",             // `.crush` guarded by \b: "crushed" != ".crush\b"
+			"/.qwen_coder-guide",        // `.qwen_code` guarded by \b, "coder" tail stays clean
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

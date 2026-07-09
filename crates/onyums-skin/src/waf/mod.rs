@@ -811,6 +811,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		// file read that `sqli_into_outfile` — write-only — and `sqli_oob_exec`'s `load_file` both miss).
 		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
 		Rule { id: "sqli_privilege_functions", category: WafCategory::Sqli, pattern: r"(?i)(\bprocedure\s+analyse\b|\bload\s+data\b[\s\S]{0,40}\binfile\b)" },
+		// Error-based extraction functions (OWASP-CRS rule 942151 function-name set): MySQL's
+		// `EXTRACTVALUE(` / `UPDATEXML(` (force a parse error that leaks query output into the message),
+		// `GTID_SUBSET(`, and the `FLOOR(RAND()` duplicate-entry double-query trick. These extract data
+		// through the DB error channel when UNION/boolean paths are closed — the signal the tautology
+		// and union rules miss. Anchored to the call form (`fn(`) and, for `floor`, to the `rand(`
+		// pairing so an ordinary `floor(x)` math call stays clean. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_error_based", category: WafCategory::Sqli, pattern: r"(?i)(\b(extractvalue|updatexml|gtid_subset)\s*\(|\bfloor\s*\(\s*rand\s*\()" },
 		// Boolean-based blind SQLi beyond `or N=N` (which `sqli_or_tautology` already covers):
 		// `and` with any comparator, or `or` with `<`/`>`. Deliberately excludes `or N=N` so it
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
@@ -1178,6 +1185,27 @@ mod tests {
 			"/api/load-more-data",           // "load" + "data" as words, no INFILE
 			"/blog/analyse-your-traffic",    // "analyse" alone
 		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn sqli_error_based_functions_match() {
+		// OWASP-CRS 942151: the MySQL error-channel extraction primitives.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 AND extractvalue(1,concat(0x7e,version()))", "query").unwrap().rule_id, "sqli_error_based");
+		assert_eq!(waf.inspect_str("id=1 AND updatexml(1,concat(0x7e,user()),1)", "query").unwrap().rule_id, "sqli_error_based");
+		assert_eq!(waf.inspect_str("id=1 OR gtid_subset(user(),1)", "query").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("id=1 AND (SELECT 1 FROM(SELECT COUNT(*),floor(rand(0)*2)x FROM t GROUP BY x)y)", "query").unwrap().rule_id, "sqli_error_based");
+	}
+
+	#[test]
+	fn sqli_error_based_keeps_false_positives_low() {
+		// An ordinary `floor(` math call and prose stay clean — the rule needs `floor(rand(` or the
+		// unambiguous extraction-function call forms.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("price=floor(total/count)", "query").is_none(), "floor() math should not false-positive");
+		for uri in ["/docs/xml-extract-tutorial", "/api/floor-plans", "/blog/random-numbers"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

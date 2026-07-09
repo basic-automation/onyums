@@ -32,6 +32,10 @@ tower-service = "0.3.3"
 tower-layer = "0.3.3"
 tracing = "0.1.44"
 rcgen = "0.14.8"
+# Phase 2 — scrub x25519 client-auth secret key material on drop. Pure Rust, no FFI
+# (MIT/Apache); already in the tree transitively via the dalek/arti crypto stack, so
+# adding it direct introduces no new version.
+zeroize = "1.8"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 http-body-util = "0.1.3"
 bytes = "1.12.0"
@@ -90,6 +94,7 @@ axum = { workspace = true }
 tower-service = { workspace = true }
 tracing = { workspace = true }
 rcgen = { workspace = true }
+zeroize = { workspace = true }
 tokio-rustls = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }

@@ -437,6 +437,27 @@ pub struct ServiceMetrics {
 	pub streams_shutdown: u64,
 }
 
+impl ServiceMetrics {
+	/// The per-counter activity between an `earlier` snapshot and this one: `self`
+	/// minus `earlier`, field by field, saturating at `0`.
+	///
+	/// The counters are monotonic, so over a real interval `self >= earlier` and the
+	/// result is the number of circuits/streams in each category during it — divide by
+	/// the elapsed time for a rate. Saturating (rather than panicking on underflow) means
+	/// accidentally swapping the operands yields zeros, not a crash.
+	#[must_use]
+	pub const fn since(&self, earlier: Self) -> Self {
+		Self {
+			circuits_offered: self.circuits_offered.saturating_sub(earlier.circuits_offered),
+			circuits_accepted: self.circuits_accepted.saturating_sub(earlier.circuits_accepted),
+			circuits_rejected: self.circuits_rejected.saturating_sub(earlier.circuits_rejected),
+			streams_served: self.streams_served.saturating_sub(earlier.streams_served),
+			streams_rejected: self.streams_rejected.saturating_sub(earlier.streams_rejected),
+			streams_shutdown: self.streams_shutdown.saturating_sub(earlier.streams_shutdown),
+		}
+	}
+}
+
 /// Shared atomic counters backing [`ServiceMetrics`]: incremented from the rendezvous
 /// loop and snapshotted by [`OnionServiceHandle::metrics`].
 ///
@@ -2645,6 +2666,21 @@ mod tests {
 		check(Serve, &served);
 		check(Reject, &rejected);
 		check(Shutdown, &shutdown);
+	}
+
+	#[test]
+	fn service_metrics_since_is_a_saturating_per_field_delta() {
+		let earlier = ServiceMetrics { circuits_offered: 10, circuits_accepted: 7, circuits_rejected: 3, streams_served: 20, streams_rejected: 4, streams_shutdown: 1 };
+		let later = ServiceMetrics { circuits_offered: 15, circuits_accepted: 10, circuits_rejected: 5, streams_served: 26, streams_rejected: 4, streams_shutdown: 2 };
+
+		// The interval delta is the per-field difference.
+		let delta = later.since(earlier);
+		assert_eq!(delta, ServiceMetrics { circuits_offered: 5, circuits_accepted: 3, circuits_rejected: 2, streams_served: 6, streams_rejected: 0, streams_shutdown: 1 });
+
+		// Swapped operands saturate to zero rather than underflow-panicking.
+		assert_eq!(earlier.since(later), ServiceMetrics::default());
+		// A snapshot minus itself is no activity.
+		assert_eq!(later.since(later), ServiceMetrics::default());
 	}
 
 	#[test]

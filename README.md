@@ -13,6 +13,7 @@ The posture is *secure and complete by default*: the hard, Tor-specific machiner
 - **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF, plus an Under Attack Mode toggle and observable security events; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
 - **Restricted discovery (v3 client authorization)** — `.authorized_clients(...)` publishes a descriptor only the listed clients can decrypt, so an unlisted client cannot even discover the service; `provision_client(...)` mints a new client's x25519 keypair and renders Tor's canonical `.auth` / `.auth_private` files. See [Restricted discovery](#restricted-discovery--v3-client-authorization).
 - **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()` (and bounded `ready_timeout()`), `wait_until_settled()` (resolves on reachable *or* a terminal failure, so a broken bootstrap never hangs), a synchronous `status()` snapshot and non-blocking `is_ready()`, a `status_events()` transition stream, the typed `.onion` address, and `shutdown()`.
+- **Observability — what, why, and how much** — `status()` says what the service's reachability is, `problem()` says *why* when it isn't healthy (a stable `ServiceProblem` projection of arti's `Display`-less diagnostics), `health()` bundles both from one consistent read, and `metrics()` exposes per-service circuit/stream counters (with `since()` interval deltas) for a `/up` line or a Prometheus/OpenTelemetry exporter.
 - **Multiple services on one bootstrap** — bootstrap once with `OnionService::shared_client()` (or reuse a running handle's `tor_client()`), pass it to several builders via `.tor_client(...)`, and aggregate fleet health with `ServiceStatus::worst_of([...])`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
@@ -89,6 +90,36 @@ if handle.ready_timeout(Duration::from_secs(90)).await {
 	// didn't come up in time — inspect why
 	println!("not ready: {}", handle.status()); // e.g. "bootstrapping" or "broken"
 }
+```
+
+When a service is not fully healthy, `status()` says *what* — `problem()` says
+*why*. It returns an `Option<ServiceProblem>` projected from arti's onion-service
+diagnostics: a stable, matchable category (`Runtime` / `DescriptorUpload` /
+`IntroductionPoint` / `Other`, via `.kind()`) plus a readable detail (`.detail()`
+/ `Display`). `health()` bundles both into a `ServiceHealth` snapshot read from a
+*single* status sample, so the status and its problem never disagree across a
+transition:
+
+```rust
+let health = handle.health();
+if !health.is_healthy() {
+	// e.g. "unreachable — introduction-point: ..." or "reachable" when all-green
+	eprintln!("degraded: {health}");
+}
+```
+
+`handle.metrics()` returns a `ServiceMetrics` snapshot of the per-service counters
+the accept loop keeps — rendezvous circuits offered / accepted / rejected at the
+circuit-policy gate, and streams served / rejected / circuit-torn-down at the
+per-stream gate. The counters are monotonic totals, so `later.since(earlier)`
+gives the activity over an interval for a rate or a Prometheus/OpenTelemetry
+exporter:
+
+```rust
+let before = handle.metrics();
+// ... serve for a while ...
+let rate = handle.metrics().since(before);
+println!("{} circuits, {} streams in the last interval", rate.circuits_offered, rate.streams_served);
 ```
 
 ### Multiple services on one bootstrap
@@ -239,7 +270,7 @@ let (_addr, recovered) = ClientAuthKeypair::from_auth_private_line(&auth_private
 assert_eq!(recovered.public_key(), alice.public_key());
 ```
 
-The keypair is minted with arti's own `tor-llcrypto` curve25519 (no extra crypto dependency), and the `.auth` / `.auth_private` renderings match Tor's canonical file formats — so a generated key drops straight into either a native-arti or a C-tor deployment. `ClientAuthKeypair` holds a secret, so its `Debug` is redacted.
+The keypair is minted with arti's own `tor-llcrypto` curve25519 (no extra crypto dependency), and the `.auth` / `.auth_private` renderings match Tor's canonical file formats — so a generated key drops straight into either a native-arti or a C-tor deployment. `ClientAuthKeypair` holds a secret, so its `Debug` is redacted and its secret is **zeroized on drop** (`ZeroizeOnDrop`), scrubbing the disposable x25519 key from memory rather than leaving it behind.
 
 Watching a service come up is a stream, not just a snapshot: `handle.status_events()` yields each `ServiceStatus` transition (bootstrapping → reachable → degraded) so you can react to health changes without polling `status()`.
 
@@ -313,6 +344,8 @@ let handle = OnionService::builder()
 ```
 
 `RawTcpHandler` forwards each accepted stream to a local TCP backend and splices the two together until either side closes. The backend protocol negotiates its own end-to-end security over the already-encrypted onion channel — onyums does **not** wrap a raw handler in its TLS, which is reserved for the HTTP handler.
+
+A raw port has no HTTP challenge surface, so when the circuit policy (e.g. Under Attack Mode) returns `Challenge` for a stream bound to a raw port, onyums **fails closed** — the stream is rejected rather than served ungated. The challenge is only presented on the reserved HTTP ports (80/443), where the Skin gate can render it.
 
 Bring your own protocol by implementing the `StreamHandler` trait (one method: `serve(&self, stream: OnionStream) -> ServeFuture`). The TLS-first posture is preserved no matter what you register: ports **80 and 443 stay reserved for the built-in HTTP handler**, so a raw handler may only occupy another (otherwise-rejected) port — registering a reserved port, port 0, or the same port twice is a clean error from `serve()`, not a runtime surprise. This is an opt **up** in protocol reach, never a relaxation of the secure HTTP defaults.
 

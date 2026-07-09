@@ -934,6 +934,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		// and template-injection chains. Keyed on the module require plus the `child_process.<fn>`
 		// call form, both Node-specific, so ordinary prose stays clean.
 		Rule { id: "code_node_child_process", category: WafCategory::CodeInjection, pattern: r#"(?i)(require\s*\(\s*['"]child_process['"]|child_process\s*\.\s*(exec|execsync|spawn|spawnsync|fork))"# },
+		// JavaScript prototype pollution (OWASP-CRS rule 934130, CRITICAL/PL1): the `__proto__`
+		// sentinel key and the `constructor.prototype` / `constructor[prototype]` chained-access
+		// forms an attacker smuggles through a query/body parameter to poison `Object.prototype` —
+		// the entry gadget for many Node RCE chains that then reach `code_node_child_process`.
+		// Faithful port of CRS's `__proto__|constructor[\s\x0b]*(?:\.|\]?\[)[\s\x0b]*prototype`
+		// (Rust `\s` already covers the vertical-tab CRS spells out); the `\]?\[` limb catches the
+		// `obj[constructor][prototype]` bracket-chain the dotted form misses. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf>
+		Rule { id: "code_prototype_pollution", category: WafCategory::CodeInjection, pattern: r"(?i)(__proto__|constructor\s*(?:\.|\]?\[)\s*prototype)" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -1842,6 +1850,34 @@ mod tests {
 		assert_eq!(waf.inspect_str("p=new ProcessBuilder('sh','-c','id')", "query").unwrap().rule_id, "code_java_runtime_exec");
 		assert_eq!(waf.inspect_str("m=require('child_process').exec('id')", "query").unwrap().rule_id, "code_node_child_process");
 		assert_eq!(waf.inspect_str("m=child_process.spawnSync('id')", "query").unwrap().rule_id, "code_node_child_process");
+	}
+
+	#[test]
+	fn prototype_pollution_rule_matches() {
+		// OWASP-CRS 934130: the `__proto__` sentinel plus the dotted and bracket-chain
+		// `constructor.prototype` access forms, however whitespace-padded.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("__proto__[polluted]=1", "query").unwrap().rule_id, "code_prototype_pollution");
+		// The JSON pollution vector rides the `__proto__` limb (CRS keys the nested-key form off it).
+		assert_eq!(waf.inspect_str(r#"{"__proto__": {"polluted": true}}"#, "body").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=constructor.prototype.toString", "query").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=constructor[prototype]", "query").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=obj[constructor][prototype]", "query").unwrap().rule_id, "code_prototype_pollution");
+		assert_eq!(waf.inspect_str("a=constructor . prototype", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn prototype_pollution_keeps_false_positives_low() {
+		// A class named "constructor", a docs mention of prototypes, and a "prototype" query value
+		// with no `constructor`/`__proto__` chain all stay clean — the rule needs the pairing.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/constructor-functions",  // "constructor" as a word, no `.prototype` chain
+			"/blog/prototype-design",       // "prototype" alone, no `constructor` head
+			"/api/build-a-prototype",       // ditto
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

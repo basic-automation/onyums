@@ -314,6 +314,25 @@ fn remove_ephemeral_state_dir(dir: &std::path::Path) {
 	}
 }
 
+/// Remove an ephemeral state dir *off* the async runtime (onyums ROADMAP Phase 0 —
+/// replace synchronous `Drop` cleanup).
+///
+/// [`remove_ephemeral_state_dir`] calls the blocking [`std::fs::remove_dir_all`]; running
+/// it directly in [`OnionServiceHandle::drop`] stalls a tokio worker. When a runtime is
+/// in scope this offloads the removal to the blocking pool and returns the
+/// `spawn_blocking` handle, so an async caller ([`OnionServiceHandle::shutdown`]) can
+/// await completion while [`Drop`] drops the handle and lets the task finish detached.
+/// With no runtime there is nothing to stall, so the removal runs inline and the
+/// function returns `None`.
+fn spawn_ephemeral_cleanup(dir: std::path::PathBuf) -> Option<JoinHandle<()>> {
+	if let Ok(handle) = tokio::runtime::Handle::try_current() {
+		Some(handle.spawn_blocking(move || remove_ephemeral_state_dir(&dir)))
+	} else {
+		remove_ephemeral_state_dir(&dir);
+		None
+	}
+}
+
 /// Apply a caller's authorized-clients allowlist to an [`OnionServiceConfigBuilder`]
 /// as Arti v3 restricted discovery (onyums ROADMAP Phase 2).
 ///
@@ -886,8 +905,9 @@ pub struct OnionServiceHandle {
 	task: Mutex<Option<JoinHandle<()>>>,
 	// Set only for an ephemeral service (see `OnionServiceBuilder::ephemeral`): the
 	// throwaway temp state dir, removed when the handle drops so the disposable
-	// identity key does not linger on disk.
-	ephemeral_state_dir: Option<std::path::PathBuf>,
+	// identity key does not linger on disk. `Mutex<Option<..>>` so `shutdown` can
+	// `take()` and await the removal while `Drop` only cleans up what shutdown left.
+	ephemeral_state_dir: Mutex<Option<std::path::PathBuf>>,
 }
 
 impl OnionServiceHandle {
@@ -1065,11 +1085,24 @@ impl OnionServiceHandle {
 	/// Cancels the spawned accept loop via its [`CancellationToken`] and joins
 	/// the task. Idempotent: a second call is a no-op. Full teardown of the Tor
 	/// client and onion service happens when the handle is dropped.
+	///
+	/// For an ephemeral service this also removes the throwaway keystore — offloaded to
+	/// the blocking pool and awaited here, so a graceful shutdown is a *complete* stop
+	/// (the disposable identity is gone before this returns) without the synchronous
+	/// `remove_dir_all` that would otherwise stall a runtime worker in [`Drop`].
 	pub async fn shutdown(&self) {
 		self.cancel.cancel();
 		let task = self.task.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
 		if let Some(task) = task {
 			let _ = task.await;
+		}
+		// Claim the ephemeral cleanup so `Drop` won't repeat it, and await the off-thread
+		// removal so shutdown() fully completes the teardown.
+		let dir = self.ephemeral_state_dir.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(dir) = dir
+			&& let Some(handle) = spawn_ephemeral_cleanup(dir)
+		{
+			let _ = handle.await;
 		}
 	}
 
@@ -1090,9 +1123,12 @@ impl Drop for OnionServiceHandle {
 		// Dropping the handle tears down the onion service and its client; for an
 		// ephemeral service, also remove the throwaway keystore so the disposable
 		// identity key does not outlive the service on disk. Best-effort and guarded
-		// (see `remove_ephemeral_state_dir`).
-		if let Some(dir) = &self.ephemeral_state_dir {
-			remove_ephemeral_state_dir(dir);
+		// (see `remove_ephemeral_state_dir`). Only cleans up what `shutdown` didn't
+		// already claim; offloads the blocking removal to the runtime's blocking pool so
+		// dropping a handle inside async code never stalls a worker on `remove_dir_all`.
+		let dir = self.ephemeral_state_dir.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(dir) = dir {
+			let _ = spawn_ephemeral_cleanup(dir);
 		}
 	}
 }
@@ -1528,7 +1564,7 @@ impl OnionServiceBuilder {
 			}
 		});
 
-		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir })
+		Ok(OnionServiceHandle { address, service, client, cancel, task: Mutex::new(Some(task)), ephemeral_state_dir: Mutex::new(ephemeral_state_dir) })
 	}
 }
 
@@ -2100,6 +2136,45 @@ mod tests {
 		let dir = std::path::PathBuf::from(&state);
 		assert!(!dir.exists(), "a freshly-minted ephemeral path does not yet exist");
 		remove_ephemeral_state_dir(&dir); // must not panic
+	}
+
+	#[test]
+	fn spawn_ephemeral_cleanup_runs_inline_without_a_runtime() {
+		// Outside any tokio runtime there is nothing to stall: the removal runs inline and
+		// the helper reports `None` (nothing to await).
+		let (state, _cache) = storage_dirs(true);
+		let dir = std::path::PathBuf::from(&state);
+		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
+		assert!(dir.exists());
+		let handle = spawn_ephemeral_cleanup(dir.clone());
+		assert!(handle.is_none(), "with no runtime the removal is inline, not spawned");
+		assert!(!dir.exists(), "the ephemeral dir must be gone after an inline cleanup");
+	}
+
+	#[tokio::test]
+	async fn spawn_ephemeral_cleanup_offloads_to_the_blocking_pool_in_a_runtime() {
+		// Inside a runtime the blocking `remove_dir_all` is offloaded (so it never stalls a
+		// worker) and the returned handle resolves once the dir is gone — the path
+		// `shutdown()` awaits.
+		let (state, _cache) = storage_dirs(true);
+		let dir = std::path::PathBuf::from(&state);
+		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
+		std::fs::write(dir.join("keystore").join("hs_ed25519_secret_key"), b"fake").expect("write fake key");
+		assert!(dir.exists());
+		let handle = spawn_ephemeral_cleanup(dir.clone()).expect("a live runtime offloads the removal to a task");
+		handle.await.expect("the offloaded cleanup task must not panic");
+		assert!(!dir.exists(), "the ephemeral dir must be gone after the offloaded cleanup");
+	}
+
+	#[test]
+	fn spawn_ephemeral_cleanup_still_refuses_non_ephemeral_paths_inline() {
+		// The offload path must not weaken the safety belt: a non-ephemeral dir is left
+		// untouched even when cleaned up inline.
+		let guard = std::env::temp_dir().join(format!("onyums-not-ephemeral-{}-{:016x}", std::process::id(), rand::random::<u64>()));
+		std::fs::create_dir_all(&guard).expect("create non-ephemeral dir");
+		assert!(spawn_ephemeral_cleanup(guard.clone()).is_none());
+		assert!(guard.exists(), "a non-ephemeral dir must survive the cleanup helper");
+		std::fs::remove_dir_all(&guard).ok();
 	}
 
 	#[test]

@@ -805,6 +805,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
 		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
+		// MySQL privilege-escalation / file-read SQL beyond the `INTO OUTFILE` write and the `load_file`
+		// read already covered (OWASP-CRS rules 942151/942320 + 942480): `PROCEDURE ANALYSE` (the
+		// info-leak/version-probe MySQL appends to a query) and `LOAD DATA … INFILE` (the server-side
+		// file read that `sqli_into_outfile` — write-only — and `sqli_oob_exec`'s `load_file` both miss).
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_privilege_functions", category: WafCategory::Sqli, pattern: r"(?i)(\bprocedure\s+analyse\b|\bload\s+data\b[\s\S]{0,40}\binfile\b)" },
 		// Boolean-based blind SQLi beyond `or N=N` (which `sqli_or_tautology` already covers):
 		// `and` with any comparator, or `or` with `<`/`>`. Deliberately excludes `or N=N` so it
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
@@ -1151,6 +1157,29 @@ mod tests {
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect_str("id=1 AND SLEEP(5)", "target").unwrap().rule_id, "sqli_time_based");
 		assert_eq!(waf.inspect_str("UNION SELECT table_name FROM information_schema.tables", "target").map(|m| m.category), Some(WafCategory::Sqli));
+	}
+
+	#[test]
+	fn sqli_privilege_functions_match() {
+		// OWASP-CRS 942151/942320 + 942480: PROCEDURE ANALYSE and LOAD DATA INFILE, the file-read /
+		// info-leak SQL the write-only `sqli_into_outfile` and `load_file` rules miss.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 PROCEDURE ANALYSE(EXTRACTVALUE(1,CONCAT(0x3a,version())),1)", "query").unwrap().rule_id, "sqli_privilege_functions");
+		assert_eq!(waf.inspect_str("q=1;LOAD DATA INFILE '/etc/hostname' INTO TABLE t", "query").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("x=load data local infile 'f'", "query").unwrap().rule_id, "sqli_privilege_functions");
+	}
+
+	#[test]
+	fn sqli_privilege_functions_keep_false_positives_low() {
+		// Prose and reordered tokens that brush near the keywords without the attack syntax stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/docs/stored-procedure-guide",  // "procedure" word, no "procedure analyse"
+			"/api/load-more-data",           // "load" + "data" as words, no INFILE
+			"/blog/analyse-your-traffic",    // "analyse" alone
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

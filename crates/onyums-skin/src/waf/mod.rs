@@ -500,8 +500,21 @@ impl Waf {
 		//    close the whitespace/comment-padding evasion (`UNION/**/SELECT`, `AND  1=1`). Only
 		//    when the transform actually changed something (a plain payload skips this pass).
 		let stripped = strip_sql_comments_collapse_ws(&norm.decoded);
-		if stripped != norm.decoded {
-			return self.match_raw(&stripped, location);
+		if stripped != norm.decoded
+			&& let Some(m) = self.match_raw(&stripped, location)
+		{
+			return Some(m);
+		}
+		// 6. Match the HTML-entity-decoded form, closing the entity-obfuscated protocol-URI
+		//    evasion (`java&#115;cript:`, `&#x6a;avascript:`, `javascript&colon;`) so the
+		//    `xss_js_uri` / `xss_data_html_uri` / `xss_vbscript_uri` signatures fire on the
+		//    reassembled token. Runs on the percent-decoded form, so a `%26%23106%3B`-wrapped
+		//    entity collapses through both passes. Only when the decode actually changed input.
+		let entity = html_entity_decode(&norm.decoded);
+		if entity != norm.decoded
+			&& let Some(m) = self.match_raw(&entity, location)
+		{
+			return Some(m);
 		}
 		None
 	}
@@ -607,6 +620,18 @@ impl Waf {
 		if stripped != norm.decoded {
 			let mut extra = Vec::new();
 			self.match_all_raw(&stripped, location, &mut extra);
+			for m in extra {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// The HTML-entity-decoded form likewise contributes, so an entity-obfuscated protocol
+		// URI (`java&#115;cript:`) scores the same as its literal form. Deduped within the field.
+		let entity = html_entity_decode(&norm.decoded);
+		if entity != norm.decoded {
+			let mut extra = Vec::new();
+			self.match_all_raw(&entity, location, &mut extra);
 			for m in extra {
 				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
 					out.push(m);
@@ -788,6 +813,129 @@ const fn hex_val(b: u8) -> Option<u8> {
 		b'A'..=b'F' => Some(b - b'A' + 10),
 		_ => None,
 	}
+}
+
+/// Curated named HTML character references — the delimiters and separators an attacker uses to
+/// split a protocol token (`javascript&colon;`, `data&sol;text`) rather than the full HTML5
+/// named set. Decoded by [`html_entity_decode`] alongside the numeric `&#DDD;` / `&#xHH;` forms.
+/// Case-sensitive, matching HTML semantics (`&Tab;`, not `&TAB;`); the numeric forms cover the
+/// rest of the letters. Kept small on purpose so the pass never mangles ordinary `&name;` text
+/// beyond this delimiter set.
+const NAMED_ENTITIES: &[(&str, char)] = &[
+	("amp", '&'),
+	("lt", '<'),
+	("gt", '>'),
+	("quot", '"'),
+	("apos", '\''),
+	("colon", ':'),
+	("sol", '/'),
+	("lpar", '('),
+	("rpar", ')'),
+	("equals", '='),
+	("period", '.'),
+	("comma", ','),
+	("semi", ';'),
+	("Tab", '\t'),
+	("NewLine", '\n'),
+];
+
+/// The longest named-entity key in [`NAMED_ENTITIES`] (`"NewLine"`), bounding the scan for the
+/// terminating `;` so a stray `&` in ordinary text costs at most this many byte comparisons.
+const MAX_NAMED_ENTITY_LEN: usize = 7;
+
+/// The number of HTML-entity-decode passes [`html_entity_decode`] runs before stopping — enough
+/// to collapse a doubly-encoded reference (`&amp;#106;` → `&#106;` → `j`) without unbounded work.
+const MAX_ENTITY_PASSES: usize = 3;
+
+/// Decode HTML character references in `input`, closing the entity-obfuscated evasion class
+/// (OWASP-CRS rules 941210/941130): an attacker writes `java&#115;cript:`, `&#x6a;avascript:`, or
+/// `javascript&colon;alert(1)` so the literal `javascript:` / `data:text/html` signature never
+/// appears until a browser's HTML parser reassembles it. Three reference forms are recognized:
+///
+/// - **Decimal** `&#DDD;` → the code point (`&#106;` → `j`). A trailing `;` is optional (HTML
+///   tolerates `&#106` before a non-digit), so `&#106avascript:` still decodes its head.
+/// - **Hex** `&#xHH;` / `&#XHH;` → the code point (`&#x6a;` → `j`); trailing `;` optional.
+/// - **Named** — the curated [`NAMED_ENTITIES`] delimiter set (`&colon;` → `:`, `&sol;` → `/`,
+///   `&Tab;` → tab, …). Here the `;` is **required**, so an ordinary `AT&T` / `a=1&b=2` is left
+///   untouched — the pass never eats a query separator or a bare ampersand in text.
+///
+/// Runs to a fixed point (bounded by [`MAX_ENTITY_PASSES`]) so a doubly-encoded `&amp;#106;`
+/// collapses through `&#106;` to `j`. A malformed or unrecognized reference is left verbatim.
+/// Byte-wise like [`percent_decode_once`], finishing with [`String::from_utf8_lossy`], so
+/// multi-byte UTF-8 already present survives and the output is always valid UTF-8 for matching.
+fn html_entity_decode(input: &str) -> String {
+	let mut cur = input.to_owned();
+	for _ in 0..MAX_ENTITY_PASSES {
+		let (next, changed) = html_entity_decode_once(&cur);
+		if !changed {
+			break;
+		}
+		cur = next;
+	}
+	cur
+}
+
+/// One pass of [`html_entity_decode`]: replace each recognized character reference with its
+/// decoded character, leaving everything else verbatim. Returns the result and whether any
+/// reference was replaced (the fixed-point signal for the caller).
+fn html_entity_decode_once(input: &str) -> (String, bool) {
+	let b = input.as_bytes();
+	let mut out: Vec<u8> = Vec::with_capacity(b.len());
+	let mut changed = false;
+	let mut i = 0;
+	while i < b.len() {
+		if b[i] == b'&'
+			&& let Some((ch, len)) = parse_entity(&b[i..])
+		{
+			let mut buf = [0u8; 4];
+			out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+			i += len;
+			changed = true;
+			continue;
+		}
+		out.push(b[i]);
+		i += 1;
+	}
+	(String::from_utf8_lossy(&out).into_owned(), changed)
+}
+
+/// Parse a single HTML character reference at the head of `rest` (which begins with `&`).
+/// Returns the decoded `char` and the number of bytes consumed (the `&`, the body, and any
+/// trailing `;`), or `None` when `rest` does not open a reference this decoder recognizes.
+fn parse_entity(rest: &[u8]) -> Option<(char, usize)> {
+	if rest.get(1) == Some(&b'#') {
+		// Numeric reference: decimal `&#DDD;` or hex `&#xHH;` / `&#XHH;`.
+		let (radix, mut j) = if matches!(rest.get(2), Some(b'x' | b'X')) { (16u32, 3) } else { (10u32, 2) };
+		let start = j;
+		let mut value: u32 = 0;
+		while j < rest.len() {
+			let digit = if radix == 16 { hex_val(rest[j]).map(u32::from) } else { (rest[j] as char).to_digit(10) };
+			match digit {
+				Some(v) => {
+					value = value.saturating_mul(radix).saturating_add(v);
+					j += 1;
+				}
+				None => break,
+			}
+		}
+		if j == start {
+			return None; // `&#;`, `&#x;`, or a non-digit body: not a numeric reference.
+		}
+		if rest.get(j) == Some(&b';') {
+			j += 1; // Optional terminating semicolon.
+		}
+		return char::from_u32(value).map(|ch| (ch, j));
+	}
+	// Named reference: `&name;`, semicolon required. Scan at most the longest key for the `;`.
+	let mut j = 1;
+	while j < rest.len() && j <= MAX_NAMED_ENTITY_LEN && rest[j] != b';' {
+		j += 1;
+	}
+	if rest.get(j) != Some(&b';') {
+		return None;
+	}
+	let name = &rest[1..j];
+	NAMED_ENTITIES.iter().find(|(ent, _)| ent.as_bytes() == name).map(|(_, ch)| (*ch, j + 1))
 }
 
 /// The built-in starter ruleset: a small, curated set of high-signal patterns across
@@ -1700,6 +1848,60 @@ mod tests {
 		let (decoded2, changed2) = percent_decode_once("bare % and %zz");
 		assert!(!changed2);
 		assert_eq!(decoded2, "bare % and %zz");
+	}
+
+	#[test]
+	fn html_entity_decode_transforms() {
+		// Decimal (semicolon optional), hex (either case), and named delimiter references decode;
+		// unrecognized / bare ampersands pass through; a doubly-encoded reference collapses.
+		assert_eq!(html_entity_decode("java&#115;cript:"), "javascript:");
+		assert_eq!(html_entity_decode("&#x6a;avascript:"), "javascript:");
+		assert_eq!(html_entity_decode("&#X6A;avascript:"), "javascript:");
+		assert_eq!(html_entity_decode("&#106avascript:"), "javascript:"); // no trailing semicolon
+		assert_eq!(html_entity_decode("javascript&colon;alert(1)"), "javascript:alert(1)");
+		assert_eq!(html_entity_decode("data&#58;text&sol;html"), "data:text/html");
+		assert_eq!(html_entity_decode("java&amp;#115;cript:"), "javascript:"); // double-encoded
+		// Left verbatim: a bare ampersand, a query separator, and an unknown named entity.
+		assert_eq!(html_entity_decode("AT&T Corp"), "AT&T Corp");
+		assert_eq!(html_entity_decode("a=1&b=2"), "a=1&b=2");
+		assert_eq!(html_entity_decode("&notareal;entity"), "&notareal;entity");
+		assert_eq!(html_entity_decode("plain value"), "plain value");
+	}
+
+	#[test]
+	fn entity_obfuscated_protocol_uri_is_caught() {
+		// CRS 941210/941130: the entity-obfuscated `javascript:` / `data:text/html` / `vbscript:`
+		// forms slip past the literal signature until the entity-decode pass reassembles them.
+		let waf = Waf::starter();
+		for (payload, rule) in [
+			("java&#115;cript:alert(1)", "xss_js_uri"),
+			("&#x6a;avascript:alert(1)", "xss_js_uri"),
+			("javascript&colon;alert(1)", "xss_js_uri"),
+			("href=data&colon;text/html,PHN2Zz4", "xss_data_html_uri"),
+			("vb&#115;cript:msgbox(1)", "xss_vbscript_uri"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after entity decode"));
+			assert_eq!(m.rule_id, rule, "{payload}");
+		}
+	}
+
+	#[test]
+	fn entity_and_percent_obfuscated_js_uri_is_caught() {
+		// The entity decode runs on the percent-decoded form, so a `%26%23106%3B`-wrapped `&#106;`
+		// collapses through both passes back to `javascript:`.
+		let waf = Waf::starter();
+		let v = waf.inspect(&parts("GET", "/x?u=%26%23106%3Bavascript:alert(1)"));
+		assert_eq!(blocked(&v).rule_id, "xss_js_uri");
+	}
+
+	#[test]
+	fn entity_decode_keeps_false_positives_low() {
+		// Ordinary ampersands — a company name, multi-param query separators — must not be decoded
+		// into a spurious signature.
+		let waf = Waf::starter();
+		for uri in ["/about?q=AT%26T%20Corp", "/search?a=1&b=2&c=3", "/p?note=fish%20%26%20chips"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

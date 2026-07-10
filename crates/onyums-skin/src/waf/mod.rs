@@ -964,8 +964,13 @@ fn html_entity_decode_once(input: &str) -> (String, bool) {
 ///   `cat` (the shell removes the quotes and concatenates).
 /// - **Backslash escapes** — a `\` is dropped, keeping the following character, so `c\at` → `cat`
 ///   (`\c` → `c` for an ordinary char).
-/// - **Empty positional expansions** — `$@` / `$*` expand to nothing in a no-argument injection
-///   context, so `c$@at` / `c$*at` → `cat`.
+/// - **Empty parameter-expansion spacers** — an expansion that yields the empty string and so
+///   splits a command *between* characters: `$@` / `$*` (`c$@at` → `cat`), a single-digit
+///   positional `$1`..`$9` (`c$1at` → `cat`), and a braced `${name}` (`who${x}ami` → `whoami`) —
+///   the "uninitialized variable spacer" RCE evasion CRS 4.28.0 added (Rule 932). See
+///   [`shell_var_spacer_len`]. `$IFS` / `${IFS}` are *kept* (they expand to whitespace, a separate
+///   signal via `cmdi_ifs_evasion`), and a bare `$name` is kept too — the shell consumes the
+///   following letters into the variable name, so it does not reassemble a split command.
 ///
 /// The result is fed to [`Waf::match_raw_in_category`] with [`WafCategory::CommandInjection`] only,
 /// so this deliberately aggressive strip can surface a de-obfuscated shell command but can never
@@ -979,7 +984,13 @@ fn strip_shell_evasion(input: &str) -> String {
 	while i < b.len() {
 		match b[i] {
 			b'\'' | b'"' | b'\\' => i += 1, // drop the quote/backslash, keep what follows
-			b'$' if matches!(b.get(i + 1), Some(b'@' | b'*')) => i += 2, // empty `$@`/`$*` expansion
+			b'$' => match shell_var_spacer_len(&b[i..]) {
+				Some(len) => i += len, // empty-expanding spacer: drop it whole
+				None => {
+					out.push(b[i]); // a `$` to keep (`$IFS`, `$(`, bare `$name`, bare `$`)
+					i += 1;
+				}
+			},
 			_ => {
 				out.push(b[i]);
 				i += 1;
@@ -987,6 +998,33 @@ fn strip_shell_evasion(input: &str) -> String {
 		}
 	}
 	String::from_utf8_lossy(&out).into_owned()
+}
+
+/// If `rest` (which starts with `$`) is a shell parameter expansion that yields the *empty* string
+/// — the token-splitting "spacer" evasion used to break a command word between characters — return
+/// the byte length to drop. Recognizes `$@` / `$*`, a single-digit positional `$1`..`$9`, and a
+/// braced identifier `${name}`. Returns `None` for a `$` to keep: `$IFS` / `${IFS}` (expands to
+/// whitespace — its own signal via `cmdi_ifs_evasion`), `$(` command substitution, a bare `$name`
+/// (the shell folds the trailing letters into the variable name, so it cannot rejoin a split
+/// command), a two-plus-digit `$12` (`$1` then literal `2`), or a lone `$`.
+fn shell_var_spacer_len(rest: &[u8]) -> Option<usize> {
+	match rest.get(1) {
+		Some(b'@' | b'*') => Some(2),                          // "$@" / "$*"
+		Some(&c) if c.is_ascii_digit() => Some(2),             // single-digit positional "$1".."$9"
+		Some(b'{') => {
+			let mut j = 2;
+			while j < rest.len() && (rest[j].is_ascii_alphanumeric() || rest[j] == b'_') {
+				j += 1;
+			}
+			// A bare "${name}" (non-empty identifier, not IFS, no operator) expands empty; drop it.
+			if j > 2 && rest.get(j) == Some(&b'}') && &rest[2..j] != b"IFS" {
+				Some(j + 1)
+			} else {
+				None
+			}
+		}
+		_ => None,
+	}
 }
 
 /// Strip the C0 control characters a browser silently drops while parsing a URL scheme, an HTML
@@ -1777,6 +1815,13 @@ mod tests {
 		assert_eq!(strip_shell_evasion(r"c\at"), "cat");
 		assert_eq!(strip_shell_evasion("c$@at"), "cat");
 		assert_eq!(strip_shell_evasion("w$*get"), "wget");
+		// Uninitialized-variable / positional-parameter spacers (CRS 4.28.0 Rule 932).
+		assert_eq!(strip_shell_evasion("c$1at"), "cat");
+		assert_eq!(strip_shell_evasion("who${x}ami"), "whoami");
+		assert_eq!(strip_shell_evasion("c${undef}at"), "cat");
+		// Kept: `$IFS`/`${IFS}` (whitespace, its own rule) and a bare `$name` (folds the letters).
+		assert_eq!(strip_shell_evasion("cat${IFS}x"), "cat${IFS}x");
+		assert_eq!(strip_shell_evasion("who$uami"), "who$uami");
 		assert_eq!(strip_shell_evasion("plain café"), "plain café");
 	}
 
@@ -1793,6 +1838,8 @@ mod tests {
 			r"| w\get http://host/x",
 			"& n\"c\" -e shell",
 			"; c$@at note.txt",
+			"; who${x}ami now",        // braced uninitialized-variable spacer
+			"; c$1at note.txt",        // positional-parameter spacer
 			";%20c%27a%27t%20note.txt", // percent-encoded quotes
 			";%20c%5cat%20note.txt",    // percent-encoded backslash
 		] {

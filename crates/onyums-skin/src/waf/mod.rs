@@ -1301,9 +1301,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `User-Agent` carries). Requiring the trailing `/` is the false-positive guard: prose that
 		// merely *mentions* a tool (`/docs/sqlmap-guide`, `?q=how+to+use+wpscan`) lacks the version
 		// slash, so it stays clean, while a real `sqlmap/1.7`, `Nikto/2.1.6`, `ghauri/1.x`,
-		// `WhatWAF/…` UA trips. ghauri + WhatWAF are the CRS 4.26.0 additions.
-		// <https://www.linuxcompatible.org/story/owasp-crs-4260-released>
-		Rule { id: "scanner_security_tool", category: WafCategory::ScannerDetection, pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|gobuster|feroxbuster|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/" },
+		// `WhatWAF/…` UA trips. ghauri + WhatWAF are the CRS 4.26.0 additions; ffuf / dalfox /
+		// dirsearch / feroxbuster / katana / subfinder / wafw00f / whatweb / joomscan / droopescan /
+		// cmsmap / sqlninja / havij / dirb round out the current offensive-tooling landscape.
+		// Deliberately excludes names that collide with legitimate client-library UAs (e.g.
+		// `python-httpx/…`), which would false-positive. <https://coreruleset.org/>
+		Rule { id: "scanner_security_tool", category: WafCategory::ScannerDetection, pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|dirsearch|dirb|gobuster|feroxbuster|ffuf|dalfox|sqlninja|havij|wafw00f|whatweb|joomscan|droopescan|cmsmap|katana|subfinder|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/" },
 		// Nmap's HTTP probe (NSE) carries a distinctive multi-word phrase rather than a `name/`
 		// version token, so it gets its own signature.
 		Rule { id: "scanner_nmap_nse", category: WafCategory::ScannerDetection, pattern: r"(?i)nmap scripting engine" },
@@ -2868,10 +2871,14 @@ mod tests {
 		assert_eq!(m.rule_id, "scanner_security_tool");
 		assert_eq!(m.category, WafCategory::ScannerDetection);
 		assert_eq!(m.location, "header:user-agent");
-		// The CRS 4.26.0 additions (ghauri, WhatWAF) and a classic (Nikto) all fire.
-		for ua in ["Mozilla/5.00 (Nikto/2.1.6)", "ghauri/1.3", "WhatWAF/2.0", "nuclei/3.1.0"] {
+		// The CRS 4.26.0 additions (ghauri, WhatWAF), a classic (Nikto), and the current-landscape
+		// additions all fire on their `name/version` UA token.
+		for ua in ["Mozilla/5.00 (Nikto/2.1.6)", "ghauri/1.3", "WhatWAF/2.0", "nuclei/3.1.0", "ffuf/2.1.0", "dalfox/2.9.0", "dirsearch/0.4.3", "wafw00f/2.2.0", "whatweb/0.5.5"] {
 			assert_eq!(waf.inspect_str(ua, "header:user-agent").unwrap().category, WafCategory::ScannerDetection, "{ua} should trip scanner detection");
 		}
+		// A legitimate client-library UA that merely embeds a scanner-adjacent word must NOT trip:
+		// `python-httpx` is a common HTTP client, deliberately excluded from the token set.
+		assert!(waf.inspect_str("python-httpx/0.27.0", "header:user-agent").is_none(), "python-httpx is a legitimate client library");
 		// Nmap's NSE probe (no version slash) has its own rule.
 		assert_eq!(waf.inspect_str("Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org)", "header:user-agent").unwrap().rule_id, "scanner_nmap_nse");
 	}

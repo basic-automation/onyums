@@ -516,6 +516,16 @@ impl Waf {
 		{
 			return Some(m);
 		}
+		// 7. Match the control-character-stripped form (built on the entity-decoded string, so an
+		//    entity-then-control combo like `java&Tab;script:` collapses too): browsers ignore
+		//    embedded NUL/TAB/LF/CR in a URL scheme or tag name, so `java\tscript:` / `<scri\npt>`
+		//    reassemble to their signature once the C0 controls are removed.
+		let unctrl = strip_control_chars(&entity);
+		if unctrl != entity
+			&& let Some(m) = self.match_raw(&unctrl, location)
+		{
+			return Some(m);
+		}
 		None
 	}
 
@@ -632,6 +642,18 @@ impl Waf {
 		if entity != norm.decoded {
 			let mut extra = Vec::new();
 			self.match_all_raw(&entity, location, &mut extra);
+			for m in extra {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// And the control-character-stripped form (over the entity-decoded string), so a
+		// `java\tscript:` / `<scri\npt>` splice scores like its literal form. Deduped within the field.
+		let unctrl = strip_control_chars(&entity);
+		if unctrl != entity {
+			let mut extra = Vec::new();
+			self.match_all_raw(&unctrl, location, &mut extra);
 			for m in extra {
 				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
 					out.push(m);
@@ -897,6 +919,21 @@ fn html_entity_decode_once(input: &str) -> (String, bool) {
 		i += 1;
 	}
 	(String::from_utf8_lossy(&out).into_owned(), changed)
+}
+
+/// Strip the C0 control characters a browser silently drops while parsing a URL scheme, an HTML
+/// tag name, or an attribute — NUL (`\0`), TAB, LF, VT, FF, CR — rejoining a token that was split
+/// to evade a literal signature (`java\tscript:`, `<scri\npt>`, a `%00`-spliced `javascript:`).
+/// This is the CRS `t:removeNulls` / embedded-whitespace transform: an additional matched form,
+/// never the string served, so it only ever *adds* coverage. Non-control and multi-byte UTF-8
+/// characters pass through untouched. Fast-paths the common no-control input to avoid an
+/// allocation. Pairs with [`html_entity_decode`] (applied to its output) so an entity-then-control
+/// combo (`java&Tab;script:`) collapses too.
+fn strip_control_chars(input: &str) -> String {
+	if !input.bytes().any(|b| matches!(b, 0x00 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)) {
+		return input.to_owned();
+	}
+	input.chars().filter(|&c| !matches!(c, '\0' | '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r')).collect()
 }
 
 /// Parse a single HTML character reference at the head of `rest` (which begins with `&`).
@@ -1902,6 +1939,41 @@ mod tests {
 		for uri in ["/about?q=AT%26T%20Corp", "/search?a=1&b=2&c=3", "/p?note=fish%20%26%20chips"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn strip_control_chars_transforms() {
+		// The six C0 controls a browser drops are removed, rejoining a split token; other
+		// characters (including multi-byte UTF-8) are untouched; the no-control fast path is a no-op.
+		assert_eq!(strip_control_chars("java\tscript:"), "javascript:");
+		assert_eq!(strip_control_chars("<scri\npt>"), "<script>");
+		assert_eq!(strip_control_chars("\0javascript:"), "javascript:");
+		assert_eq!(strip_control_chars("a\r\n\u{0b}\u{0c}b"), "ab");
+		assert_eq!(strip_control_chars("plain café"), "plain café");
+	}
+
+	#[test]
+	fn control_char_obfuscated_signature_is_caught() {
+		// Browsers ignore embedded C0 controls in a scheme / tag name; the strip pass reassembles
+		// the token so the signature fires — raw, percent-encoded, and entity-then-control combos.
+		let waf = Waf::starter();
+		for (payload, rule) in [
+			("java\tscript:alert(1)", "xss_js_uri"),
+			("<scri\npt>alert(1)</script>", "xss_script_tag"),
+			("java%09script:alert(1)", "xss_js_uri"), // percent-encoded tab
+			("%00javascript:alert(1)", "xss_js_uri"), // NUL splice
+			("java&Tab;script:alert(1)", "xss_js_uri"), // entity-then-control combo
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after control strip"));
+			assert_eq!(m.rule_id, rule, "{payload}");
+		}
+	}
+
+	#[test]
+	fn control_strip_keeps_multiline_text_clean() {
+		// A benign multiline body value with newlines/tabs must not fold into a spurious signature.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.inspect_body(b"comment=line one\nline two\tindented\nregards"), Verdict::Allow);
 	}
 
 	#[test]

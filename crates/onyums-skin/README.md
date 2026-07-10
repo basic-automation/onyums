@@ -29,15 +29,19 @@ Built out: the gate core (PoW/tarpit challenge chain, `hmac`-signed clearance,
 with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
 expression language + a curated OWASP-CRS-derived ruleset — SQLi (incl. error-based
 `EXTRACTVALUE`/`UPDATEXML` and MySQL file/privilege functions) / XSS (incl. dangerous
-HTML tags and CSS `-moz-binding`/`behavior:url()` script-binding) / traversal / SSRF
+HTML tags, CSS `-moz-binding`/`behavior:url()` script-binding, and the full
+mouse/keyboard/clipboard/drag/media event-handler families) / traversal / SSRF
 (incl. Alibaba & Oracle-OCI cloud-metadata endpoints), server-side template injection
 across engines and PHP/Java/Node code execution (Spring4Shell class-loader, JS
 prototype pollution, Java-deserialization markers), PowerShell download-cradle /
-encoded-command and `$IFS` whitespace-evasion RCE, NoSQL/ORM lookup injection,
-restricted-file access (incl. AI coding-assistant artifact dirs like `.claude/`/`.cursor/`),
-and a `ScannerDetection` class that hard-blocks self-identifying attack tools like
-sqlmap/nikto/ghauri/nuclei; input is normalized against percent-encoding *and* SQL
-comment / whitespace padding so `UNION/**/SELECT`-style evasions still trip — anomaly
+encoded-command RCE and Unix-shell evasion — `$IFS` whitespace plus character-insertion
+de-obfuscation (`c'a't`, `c\at`, `who${x}ami`) — network-recon/exfil command coverage,
+NoSQL/ORM lookup injection, restricted-file access (incl. AI coding-assistant artifact
+dirs like `.claude/`/`.cursor/`), and a `ScannerDetection` class that hard-blocks
+self-identifying attack tools (sqlmap/nikto/ghauri/nuclei/ffuf/dalfox/…); input is
+normalized against percent-encoding, SQL comment / whitespace padding, HTML character
+references, and embedded C0 control chars, so `UNION/**/SELECT`-, `java&#115;cript:`-,
+and `<scri\npt>`-style evasions all still trip — anomaly
 scoring, and
 operator-authored custom rules), observability (typed `SecurityEvent`s, metrics,
 request-shape baselining), and

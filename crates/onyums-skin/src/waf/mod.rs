@@ -1042,6 +1042,16 @@ pub fn starter_rules() -> Vec<Rule> {
 		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
 		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
 		Rule { id: "xss_html5_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(animation(start|end|iteration)|transitionend|pointer(over|down|enter|rawupdate)|beforetoggle|beforeprint|pageshow|hashchange|wheel)\s*=" },
+		// Interaction / clipboard / drag / media event handlers (OWASP-CRS 941 handler-list port):
+		// the mouse, keyboard, clipboard, drag-and-drop, and media families that fire on ordinary
+		// user interaction and are the standard bypass once the small `xss_event_handler` set
+		// (error/load/click/mouseover/focus/toggle) and the `xss_html5_event_handler` (animation/
+		// transition/pointer/…) set are filtered — `onmousedown`, `onkeydown`, `oncontextmenu`,
+		// `ondragstart`, `oncanplay`, `onpaste`, … Each alternative is disjoint from the other two
+		// rules (`load(start|eddata)`, not bare `load`; `mouse(out|down|…)`, not `mouseover`;
+		// `focus(in|out)`, not bare `focus`) so a match never double-counts in anomaly scoring.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_interaction_event_handler", category: WafCategory::Xss, pattern: r"(?i)\bon(mouse(enter|leave|move|out|down|up)|auxclick|dblclick|contextmenu|key(down|up|press)|drag(start|end|enter|leave|over)?|drop|copy|cut|paste|play(ing)?|canplay|ended|load(start|eddata)|focus(in|out)|input|submit)\s*=" },
 		// Injection-only attributes: an iframe `srcdoc` carrying inline markup, and a `formaction`
 		// that hijacks a form's submit target. Reflected into a response these are near-always an
 		// XSS vector; an operator legitimately reflecting them can disable this rule.
@@ -1424,6 +1434,47 @@ mod tests {
 		assert_eq!(waf.inspect_str("x=<details ontoggle=alert(1)>", "query").unwrap().category, WafCategory::Xss);
 		assert_eq!(waf.inspect_str("x=<z srcdoc=PHNjcmlwdD4>", "query").unwrap().rule_id, "xss_dangerous_attribute");
 		assert_eq!(waf.inspect_str("x=<button formaction=javascript:alert(1)>", "query").unwrap().category, WafCategory::Xss);
+	}
+
+	#[test]
+	fn interaction_event_handlers_match() {
+		// OWASP-CRS 941 handler-list port: the mouse/keyboard/clipboard/drag/media families past the
+		// classic and HTML5 sets. Each attributes to the new rule (disjoint from the other two).
+		let waf = Waf::starter();
+		for payload in [
+			"x=<div onmousedown=alert(1)>",
+			"x=<body onkeydown=alert(1)>",
+			"x=<img oncontextmenu=alert(1)>",
+			"x=<a ondragstart=alert(1)>",
+			"x=<video oncanplay=alert(1)>",
+			"x=<input onpaste=alert(1)>",
+			"x=<b onmouseout=alert(1)>",
+			"x=<z onfocusin=alert(1)>",
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the interaction-handler rule"));
+			assert_eq!(m.rule_id, "xss_interaction_event_handler", "{payload}");
+			assert_eq!(m.category, WafCategory::Xss);
+		}
+	}
+
+	#[test]
+	fn interaction_event_handler_no_overlap_with_classic_and_html5() {
+		// The disjointness the comment promises: `onmouseover` / `onload` / `onfocus` stay on their
+		// original rules, not the new one, so anomaly scoring never double-counts a single handler.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("x=<a onmouseover=alert(1)>", "query").unwrap().rule_id, "xss_event_handler");
+		assert_eq!(waf.inspect_str("x=<svg onload=alert(1)>", "query").unwrap().rule_id, "xss_event_handler");
+		assert_eq!(waf.inspect_str("x=<a onfocus=alert(1)>", "query").unwrap().rule_id, "xss_event_handler");
+	}
+
+	#[test]
+	fn interaction_event_handler_keeps_false_positives_low() {
+		// Words that merely embed a handler substring but are not `on<handler>=` attributes stay
+		// clean: `dragon`/`onward` (no word-boundary handler), a benign `drop`/`copy` query key.
+		let waf = Waf::starter();
+		for uri in ["/game?dragon=slain", "/go?onward=true", "/cart?drop=item&copy=1", "/media?canplay=check"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

@@ -437,6 +437,12 @@ pub struct ServiceMetrics {
 	pub streams_shutdown: u64,
 }
 
+/// One service's six counter samples as `(prometheus_metric_name, HELP_text, value)`
+/// triples in the shared family order — the return of
+/// [`ServiceMetrics::prometheus_series`], named so the per-service and fleet exporters
+/// share one type.
+type PrometheusSeries = [(&'static str, &'static str, u64); 6];
+
 impl ServiceMetrics {
 	/// The per-counter activity between an `earlier` snapshot and this one: `self`
 	/// minus `earlier`, field by field, saturating at `0`.
@@ -483,7 +489,7 @@ impl ServiceMetrics {
 	/// stable order. The single source of truth both [`to_prometheus`](Self::to_prometheus)
 	/// and [`to_prometheus_labeled`](Self::to_prometheus_labeled) render from, so the two
 	/// exports can never drift in name, help, or ordering.
-	const fn prometheus_series(&self) -> [(&'static str, &'static str, u64); 6] {
+	const fn prometheus_series(&self) -> PrometheusSeries {
 		[
 			("onyums_circuits_offered_total", "Rendezvous circuits offered to the service (one per arti RendRequest).", self.circuits_offered),
 			("onyums_circuits_accepted_total", "Circuits accepted after the circuit-level policy gate.", self.circuits_accepted),
@@ -542,6 +548,56 @@ impl ServiceMetrics {
 /// (which key, which value) is offline-testable without a running service.
 fn service_metrics_prometheus(metrics: ServiceMetrics, address: &OnionAddress) -> String {
 	metrics.to_prometheus_labeled(&[("service", address.as_str())])
+}
+
+/// Render several services' metrics into **one valid** Prometheus exposition.
+///
+/// Each metric's `# HELP` / `# TYPE` header is emitted exactly once, followed by every
+/// service's sample under its own `service="<label>"` label. This is the correct way to
+/// scrape a fleet at a single `/metrics` endpoint.
+/// Concatenating per-service [`ServiceMetrics::to_prometheus`] /
+/// [`OnionServiceHandle::metrics_prometheus`] outputs instead repeats the HELP/TYPE
+/// headers for every service, which the Prometheus/OpenMetrics text format forbids
+/// (metadata must appear at most once per metric family) and strict parsers reject.
+///
+/// Each item is `(service_label, metrics)`; the label is escaped and rides as
+/// `service="…"`. Feed it from a set of handles with
+/// `fleet_prometheus(handles.iter().map(|h| (h.onion_address().as_str(), h.metrics())))`.
+/// An empty iterator yields the empty string. The family metadata (names, help, order)
+/// comes from the same [`ServiceMetrics::prometheus_series`] the per-service exporter
+/// uses, so the two exports can never disagree.
+#[must_use]
+pub fn fleet_prometheus<'a>(services: impl IntoIterator<Item = (&'a str, ServiceMetrics)>) -> String {
+	// Snapshot each service's series once (name/help/value in the shared order), paired
+	// with its rendered `service="…"` label block — we then walk metric-family-outer,
+	// service-inner so each header prints once.
+	let rows: Vec<(String, PrometheusSeries)> = services.into_iter().map(|(label, metrics)| (format_prometheus_labels(&[("service", label)]), metrics.prometheus_series())).collect();
+
+	let Some((_, first_series)) = rows.first() else {
+		return String::new();
+	};
+
+	let mut out = String::new();
+	for family in 0..first_series.len() {
+		let (name, help, _) = first_series[family];
+		out.push_str("# HELP ");
+		out.push_str(name);
+		out.push(' ');
+		out.push_str(help);
+		out.push('\n');
+		out.push_str("# TYPE ");
+		out.push_str(name);
+		out.push_str(" counter\n");
+		for (label_block, series) in &rows {
+			let (_, _, value) = series[family];
+			out.push_str(name);
+			out.push_str(label_block);
+			out.push(' ');
+			out.push_str(&value.to_string());
+			out.push('\n');
+		}
+	}
+	out
 }
 
 /// Render a `{k="v",…}` Prometheus label block, escaping each value; the empty slice
@@ -1258,10 +1314,13 @@ impl OnionServiceHandle {
 	/// exposition format, labeled with the service's `.onion` address under the
 	/// `service` key (onyums ROADMAP Phase 4 — per-service metrics).
 	///
-	/// The ready-to-serve body for a `/metrics` endpoint: concatenate several handles'
-	/// output to scrape a whole fleet in one exposition, each series distinguished by
-	/// its `service="…​.onion"` label. Equivalent to
+	/// The ready-to-serve body for a single service's `/metrics` endpoint, each series
+	/// carrying its `service="…​.onion"` label. Equivalent to
 	/// `self.metrics().to_prometheus_labeled(&[("service", self.onion_address().as_str())])`.
+	///
+	/// For **several** services, do not concatenate these outputs — that repeats each
+	/// metric's HELP/TYPE header, which strict Prometheus parsers reject. Use
+	/// [`fleet_prometheus`] instead, which emits the headers once.
 	#[must_use]
 	pub fn metrics_prometheus(&self) -> String {
 		service_metrics_prometheus(self.metrics(), &self.address)
@@ -2917,6 +2976,44 @@ mod tests {
 		assert!(text.contains(&format!("onyums_streams_served_total{label} 4\n")), "served series is labeled:\n{text}");
 		// Same as calling the labeled exporter directly with the address.
 		assert_eq!(text, m.to_prometheus_labeled(&[("service", addr.as_str())]));
+	}
+
+	#[test]
+	fn fleet_prometheus_emits_each_header_once_and_every_service_sample() {
+		let a = ServiceMetrics { circuits_offered: 9, streams_served: 4, ..Default::default() };
+		let b = ServiceMetrics { circuits_offered: 1, streams_served: 100, ..Default::default() };
+		let text = fleet_prometheus([("aaa.onion", a), ("bbb.onion", b)]);
+
+		// The whole point: HELP/TYPE metadata appears exactly once per metric family, even
+		// though two services report — this is what raw concatenation would get wrong.
+		for name in ["onyums_circuits_offered_total", "onyums_circuits_accepted_total", "onyums_circuits_rejected_total", "onyums_streams_served_total", "onyums_streams_rejected_total", "onyums_streams_shutdown_total"] {
+			assert_eq!(text.matches(&format!("# TYPE {name} counter\n")).count(), 1, "{name} declared exactly once");
+			assert_eq!(text.matches(&format!("# HELP {name} ")).count(), 1, "{name} HELP exactly once");
+		}
+
+		// Both services' samples are present, each under its own service label.
+		assert!(text.contains("onyums_circuits_offered_total{service=\"aaa.onion\"} 9\n"), "service a offered:\n{text}");
+		assert!(text.contains("onyums_circuits_offered_total{service=\"bbb.onion\"} 1\n"), "service b offered:\n{text}");
+		assert!(text.contains("onyums_streams_served_total{service=\"aaa.onion\"} 4\n"));
+		assert!(text.contains("onyums_streams_served_total{service=\"bbb.onion\"} 100\n"));
+
+		// Each family's header precedes both of its samples (metadata-then-samples ordering).
+		let type_pos = text.find("# TYPE onyums_circuits_offered_total").unwrap();
+		let sample_a = text.find("onyums_circuits_offered_total{service=\"aaa.onion\"}").unwrap();
+		assert!(type_pos < sample_a, "TYPE header precedes the sample");
+	}
+
+	#[test]
+	fn fleet_prometheus_of_one_matches_the_single_service_export() {
+		// A one-service fleet is exactly the labeled single-service exposition.
+		let m = ServiceMetrics { circuits_offered: 7, ..Default::default() };
+		assert_eq!(fleet_prometheus([("solo.onion", m)]), m.to_prometheus_labeled(&[("service", "solo.onion")]));
+	}
+
+	#[test]
+	fn fleet_prometheus_of_nothing_is_empty() {
+		let empty: [(&str, ServiceMetrics); 0] = [];
+		assert_eq!(fleet_prometheus(empty), "");
 	}
 
 	#[test]

@@ -7,13 +7,28 @@ Onyums is an axum wrapper for serving tor onion services — secure and complete
 
 The posture is *secure and complete by default*: the hard, Tor-specific machinery ships enabled, and you opt **down** when you have a reason to — never assemble safety from feature flags.
 
+**What this is:** a Rust library for serving [axum](https://github.com/tokio-rs/axum) applications as Tor onion services, with the Tor client ([Arti](https://gitlab.torproject.org/tpo/core/arti)) embedded — no external `tor` daemon. **What this is not:** a host provisioning / configuration-management tool, a reverse proxy for existing servers, or a SOCKS client. If you want to front an already-running service, that is a planned CLI, not the library.
+
+## Installation
+
+```sh
+cargo add onyums tokio --features tokio/full
+```
+
+Onyums is a library — add it to an async binary. No external Tor daemon is
+required: the [Arti](https://gitlab.torproject.org/tpo/core/arti) Tor client is
+embedded, so the first run downloads Tor consensus data over the network and
+creates the keystore/cache under `./tor/onyums/` itself. It uses Rust **edition
+2024**, so a recent stable toolchain (Rust 1.85 or newer) is required; a pinned,
+CI-enforced MSRV is still on the roadmap.
+
 ## Features
 
 - **One-liner serve** — `serve(app, "nickname")` is the full secure stack; the builder (`OnionService::builder()`) tunes or relaxes it.
 - **Abuse defense on by default (Skin)** — a proof-of-work gate, no-JS fallbacks, token-keyed rate limiting, and a pure-Rust WAF, plus an Under Attack Mode toggle and observable security events; see [Abuse defense (Skin)](#abuse-defense-skin--on-by-default).
 - **Restricted discovery (v3 client authorization)** — `.authorized_clients(...)` publishes a descriptor only the listed clients can decrypt, so an unlisted client cannot even discover the service; `provision_client(...)` mints a new client's x25519 keypair and renders Tor's canonical `.auth` / `.auth_private` files. See [Restricted discovery](#restricted-discovery--v3-client-authorization).
 - **Real readiness + graceful shutdown** — the builder returns an `OnionServiceHandle` with `ready()` (and bounded `ready_timeout()`), `wait_until_settled()` (resolves on reachable *or* a terminal failure, so a broken bootstrap never hangs), a synchronous `status()` snapshot and non-blocking `is_ready()`, a `status_events()` transition stream, the typed `.onion` address, and `shutdown()`.
-- **Observability — what, why, and how much** — `status()` says what the service's reachability is, `problem()` says *why* when it isn't healthy (a stable `ServiceProblem` projection of arti's `Display`-less diagnostics), `health()` bundles both from one consistent read, and `metrics()` exposes per-service circuit/stream counters (with `since()` interval deltas) for a `/up` line or a Prometheus/OpenTelemetry exporter.
+- **Observability — what, why, and how much** — `status()` says what the service's reachability is, `problem()` says *why* when it isn't healthy (a stable `ServiceProblem` projection of arti's `Display`-less diagnostics), `health()` bundles both from one consistent read, and `metrics()` exposes per-service circuit/stream counters (with `since()` interval deltas) for a `/up` line — plus a built-in Prometheus exporter (`metrics_prometheus()` per service, `fleet_prometheus(...)` for many) ready to serve at `/metrics`.
 - **Multiple services on one bootstrap** — bootstrap once with `OnionService::shared_client()` (or reuse a running handle's `tor_client()`), pass it to several builders via `.tor_client(...)`, and aggregate fleet health with `ServiceStatus::worst_of([...])`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
@@ -112,14 +127,37 @@ if !health.is_healthy() {
 the accept loop keeps — rendezvous circuits offered / accepted / rejected at the
 circuit-policy gate, and streams served / rejected / circuit-torn-down at the
 per-stream gate. The counters are monotonic totals, so `later.since(earlier)`
-gives the activity over an interval for a rate or a Prometheus/OpenTelemetry
-exporter:
+gives the activity over an interval for a rate, and the derived
+`circuits_failed_transport()` (offers arti couldn't accept) and `total_streams()`
+helpers round out a health line:
 
 ```rust
 let before = handle.metrics();
 // ... serve for a while ...
 let rate = handle.metrics().since(before);
 println!("{} circuits, {} streams in the last interval", rate.circuits_offered, rate.streams_served);
+```
+
+**Prometheus export is built in.** `handle.metrics_prometheus()` renders the
+counters in the Prometheus text exposition format, labeled with the service's
+`.onion` address — the ready-to-serve body for a `/metrics` endpoint. For several
+services, `onyums::fleet_prometheus(...)` folds them into one valid exposition
+(each metric's `# HELP`/`# TYPE` header emitted once), which is what you want
+instead of concatenating per-service outputs:
+
+```rust
+use onyums::fleet_prometheus;
+
+// One service:
+let body = handle.metrics_prometheus();
+
+// A whole fleet at a single /metrics endpoint:
+let body = fleet_prometheus(
+	handles.iter().map(|h| (h.onion_address().as_str(), h.metrics())),
+);
+// # HELP onyums_circuits_offered_total ...
+// # TYPE onyums_circuits_offered_total counter
+// onyums_circuits_offered_total{service="abcd….onion"} 42
 ```
 
 ### Multiple services on one bootstrap

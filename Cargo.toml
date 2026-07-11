@@ -69,8 +69,8 @@ license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
 readme = "README.md"
 description = "An Onion-service server using axum."
-keywords = ["tor", "http", "request", "server", "SOCKS"]
-categories = ["network-programming", "web-programming::http-client"]
+keywords = ["tor", "onion-service", "axum", "server", "arti"]
+categories = ["network-programming", "web-programming::http-server"]
 
 [dependencies]
 anyhow = { workspace = true }

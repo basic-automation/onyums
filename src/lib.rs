@@ -47,7 +47,6 @@ use tower_service::Service;
 use tracing::{event, span, Level};
 extern crate rcgen;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 pub use axum::*;
 pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, SecurityEvent, SecurityEventSink, Skin};
@@ -61,13 +60,17 @@ use onyums_skin::CircuitId;
 /// rather than adding your own `arti-client` / `tor-*` dependency.
 pub use {arti_client, tor_cell, tor_cert, tor_hscrypto, tor_hsservice, tor_llcrypto, tor_proto, tor_rtcompat};
 
+mod address;
 mod circuit_gate;
 mod client_auth;
+mod metrics;
 mod port_router;
 mod raw_tcp;
 mod provided_cert;
 mod tls_policy;
 mod vanity;
+pub use address::OnionAddress;
+pub use metrics::{fleet_prometheus, ServiceMetrics};
 pub use client_auth::{provision_client, ClientAuthKeypair, ClientAuthKeypairError};
 pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeFuture, StreamHandler};
 pub use raw_tcp::RawTcpHandler;
@@ -76,146 +79,11 @@ pub use tls_policy::Tls;
 pub use vanity::{address_from_expanded_secret, address_from_secret_seed, address_from_tor_secret_key_file, expanded_secret_from_tor_file, mine, mine_parallel, mine_within, tor_secret_key_file_from_expanded, validate_prefix, VanityKey};
 
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
+use metrics::{service_metrics_prometheus, CircuitMetrics};
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
 	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
 };
-
-/// A Tor v3 onion service address — the service's public identity.
-///
-/// Normalized to exactly one trailing `.onion` suffix, so it is safe to use
-/// directly as a TLS subject-alternative-name or an HTTP redirect host. This is
-/// the typed replacement for the stringly-typed, process-global onion name: the
-/// address is threaded explicitly from the launched service to the handlers that
-/// need it (TLS cert generation, the port-80 → HTTPS redirect) rather than read
-/// from a shared `static`.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct OnionAddress(String);
-
-impl OnionAddress {
-	/// Normalize a raw onion service name to exactly one trailing `.onion`
-	/// suffix, handling a bare name, a single suffix, or accidental repetition.
-	///
-	/// This *trusts* its input — it only fixes the suffix and does not check that
-	/// the name is a real v3 onion address. Use it for names that came from arti
-	/// itself (the launched service). For operator- or user-supplied strings,
-	/// prefer the validating [`Self::parse`].
-	#[must_use]
-	pub fn normalized(name: &str) -> Self {
-		Self(format!("{}.onion", name.trim_end_matches(".onion")))
-	}
-
-	/// Parse and *validate* a v3 `.onion` address.
-	///
-	/// Unlike [`Self::normalized`], this confirms the string is a real v3 onion
-	/// name — correct length, base32 alphabet, checksum, and version — by
-	/// round-tripping it through arti's own `HsId` parser, then returns the
-	/// canonical lowercase form. The input must be a bare `<base32>.onion` host
-	/// (no scheme, path, or subdomain); surrounding whitespace is trimmed.
-	///
-	/// # Errors
-	/// Returns an error if the string is not a valid v3 onion address.
-	pub fn parse(address: &str) -> Result<Self> {
-		let hsid: tor_hscrypto::pk::HsId = address.trim().parse().map_err(|e| anyhow::anyhow!("invalid v3 onion address: {e}"))?;
-		Ok(Self::normalized(&hsid.display_unredacted().to_string()))
-	}
-
-	/// The full address, including the `.onion` suffix.
-	#[must_use]
-	pub fn as_str(&self) -> &str {
-		&self.0
-	}
-
-	/// The host used for TLS SANs and redirect targets. Identical to
-	/// [`Self::as_str`]; named for intent at the call site.
-	#[must_use]
-	pub fn host(&self) -> &str {
-		&self.0
-	}
-
-	/// The canonical HTTPS URL for this service.
-	///
-	/// onyums serves HTTPS on port 443 (with a port-80 → HTTPS redirect), so this
-	/// is the URL clients should use.
-	#[must_use]
-	pub fn https_url(&self) -> String {
-		format!("https://{}/", self.0)
-	}
-
-	/// The plain-HTTP URL (port 80). onyums redirects this to [`Self::https_url`].
-	#[must_use]
-	pub fn http_url(&self) -> String {
-		format!("http://{}/", self.0)
-	}
-
-	/// The value for an [`Onion-Location`] response header (or its
-	/// `<meta http-equiv="onion-location">` equivalent): the canonical onion URL a
-	/// clearnet site emits to point Tor Browser at its onion equivalent.
-	///
-	/// [`Onion-Location`]: https://community.torproject.org/onion-services/advanced/onion-location/
-	#[must_use]
-	pub fn onion_location(&self) -> String {
-		self.https_url()
-	}
-
-	/// The `(name, value)` pair for the `Onion-Location` response header, ready to
-	/// insert into a response. The name is lowercase, as is conventional for HTTP/2.
-	#[must_use]
-	pub fn onion_location_header(&self) -> (&'static str, String) {
-		("onion-location", self.onion_location())
-	}
-
-	/// Render a scannable QR code of the service's canonical HTTPS URL as a
-	/// standalone SVG document string.
-	///
-	/// The QR encodes [`Self::https_url`] — the URL a client should actually open
-	/// — so a Tor Browser user can scan it instead of typing 56 base32 characters
-	/// by hand. The output is pure text (an `<svg>` document); onyums pulls in no
-	/// raster-image dependency for this (`qrcode` is built with its `image`
-	/// renderer disabled), keeping the tree pure Rust.
-	///
-	/// # Panics
-	/// Never in practice: the encoded data is a fixed-shape onion URL (~70 bytes),
-	/// far below the smallest QR version's capacity, so encoding cannot fail.
-	#[must_use]
-	pub fn qr_svg(&self) -> String {
-		use qrcode::{render::svg, QrCode};
-		// The encoded data is a fixed-shape onion URL (~70 bytes), far below the
-		// capacity of even the smallest QR version, so construction cannot fail.
-		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
-		code.render::<svg::Color>().min_dimensions(256, 256).quiet_zone(true).build()
-	}
-
-	/// Render a scannable QR code of the service's canonical HTTPS URL as Unicode
-	/// text suitable for printing to a terminal.
-	///
-	/// Like [`Self::qr_svg`] but rendered with half-block characters
-	/// (`unicode::Dense1x2`), so an operator can print the address as a QR code
-	/// straight to the console — e.g. right after the service reports ready. Each
-	/// QR row maps to one line of output.
-	///
-	/// # Panics
-	/// Never in practice, for the same reason as [`Self::qr_svg`]: an onion URL
-	/// always fits in a QR code.
-	#[must_use]
-	pub fn qr_terminal(&self) -> String {
-		use qrcode::{render::unicode, QrCode};
-		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
-		code.render::<unicode::Dense1x2>().quiet_zone(true).build()
-	}
-}
-
-impl std::fmt::Display for OnionAddress {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str(&self.0)
-	}
-}
-
-impl From<OnionAddress> for String {
-	fn from(address: OnionAddress) -> Self {
-		address.0
-	}
-}
 
 /// The default persistent onyums state directory — home of the Arti keystore that
 /// holds the onion service's v3 identity key, so the `.onion` address is stable
@@ -410,103 +278,6 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 	let address = OnionAddress::normalized(&service_name);
 	event!(Level::INFO, "Cleaned onion service name: {address}");
 	Ok(address)
-}
-
-/// A point-in-time snapshot of a service's cumulative circuit/stream counters.
-///
-/// Returned by [`OnionServiceHandle::metrics`] (onyums ROADMAP Phase 4 — per-service
-/// metrics). Every field is a monotonic total since the service launched (a counter, not
-/// a gauge), so two snapshots subtract to a rate or a delta — feed them to a
-/// Prometheus/OpenTelemetry exporter, or print a health line. `circuits_offered` counts
-/// every offer; `circuits_accepted + circuits_rejected` can be slightly less, the
-/// difference being circuits arti failed to accept for transport reasons (neither a
-/// policy decision nor served).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct ServiceMetrics {
-	/// Rendezvous circuits offered to the service — one per arti `RendRequest`.
-	pub circuits_offered: u64,
-	/// Circuits accepted into service after the circuit-level policy gate.
-	pub circuits_accepted: u64,
-	/// Circuits the circuit-level policy rejected (or tore down) at the offer.
-	pub circuits_rejected: u64,
-	/// Streams handed to a handler after passing the per-stream policy gate.
-	pub streams_served: u64,
-	/// Streams the per-stream policy rejected while leaving the circuit alive.
-	pub streams_rejected: u64,
-	/// Streams whose policy action tore down the whole circuit.
-	pub streams_shutdown: u64,
-}
-
-impl ServiceMetrics {
-	/// The per-counter activity between an `earlier` snapshot and this one: `self`
-	/// minus `earlier`, field by field, saturating at `0`.
-	///
-	/// The counters are monotonic, so over a real interval `self >= earlier` and the
-	/// result is the number of circuits/streams in each category during it — divide by
-	/// the elapsed time for a rate. Saturating (rather than panicking on underflow) means
-	/// accidentally swapping the operands yields zeros, not a crash.
-	#[must_use]
-	pub const fn since(&self, earlier: Self) -> Self {
-		Self {
-			circuits_offered: self.circuits_offered.saturating_sub(earlier.circuits_offered),
-			circuits_accepted: self.circuits_accepted.saturating_sub(earlier.circuits_accepted),
-			circuits_rejected: self.circuits_rejected.saturating_sub(earlier.circuits_rejected),
-			streams_served: self.streams_served.saturating_sub(earlier.streams_served),
-			streams_rejected: self.streams_rejected.saturating_sub(earlier.streams_rejected),
-			streams_shutdown: self.streams_shutdown.saturating_sub(earlier.streams_shutdown),
-		}
-	}
-}
-
-/// Shared atomic counters backing [`ServiceMetrics`]: incremented from the rendezvous
-/// loop and snapshotted by [`OnionServiceHandle::metrics`].
-///
-/// `Relaxed` ordering throughout — each counter is an independent monotonic total, not a
-/// lock guarding other state, so no cross-counter ordering is needed.
-#[derive(Debug, Default)]
-struct CircuitMetrics {
-	circuits_offered: AtomicU64,
-	circuits_accepted: AtomicU64,
-	circuits_rejected: AtomicU64,
-	streams_served: AtomicU64,
-	streams_rejected: AtomicU64,
-	streams_shutdown: AtomicU64,
-}
-
-impl CircuitMetrics {
-	fn record_circuit_offered(&self) {
-		self.circuits_offered.fetch_add(1, Ordering::Relaxed);
-	}
-
-	fn record_circuit_accepted(&self) {
-		self.circuits_accepted.fetch_add(1, Ordering::Relaxed);
-	}
-
-	fn record_circuit_rejected(&self) {
-		self.circuits_rejected.fetch_add(1, Ordering::Relaxed);
-	}
-
-	/// Record the outcome of the per-stream policy gate against the matching counter, so
-	/// the loop increments through one tested mapping rather than three scattered calls.
-	fn record_stream(&self, disposition: circuit_gate::StreamDisposition) {
-		let counter = match disposition {
-			circuit_gate::StreamDisposition::Serve => &self.streams_served,
-			circuit_gate::StreamDisposition::Reject => &self.streams_rejected,
-			circuit_gate::StreamDisposition::Shutdown => &self.streams_shutdown,
-		};
-		counter.fetch_add(1, Ordering::Relaxed);
-	}
-
-	fn snapshot(&self) -> ServiceMetrics {
-		ServiceMetrics {
-			circuits_offered: self.circuits_offered.load(Ordering::Relaxed),
-			circuits_accepted: self.circuits_accepted.load(Ordering::Relaxed),
-			circuits_rejected: self.circuits_rejected.load(Ordering::Relaxed),
-			streams_served: self.streams_served.load(Ordering::Relaxed),
-			streams_rejected: self.streams_rejected.load(Ordering::Relaxed),
-			streams_shutdown: self.streams_shutdown.load(Ordering::Relaxed),
-		}
-	}
 }
 
 /// The shared, per-service context threaded through the rendezvous loop down to
@@ -1131,6 +902,22 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn metrics(&self) -> ServiceMetrics {
 		self.metrics.snapshot()
+	}
+
+	/// This service's [`metrics`](Self::metrics) rendered in the Prometheus text
+	/// exposition format, labeled with the service's `.onion` address under the
+	/// `service` key (onyums ROADMAP Phase 4 — per-service metrics).
+	///
+	/// The ready-to-serve body for a single service's `/metrics` endpoint, each series
+	/// carrying its `service="…​.onion"` label. Equivalent to
+	/// `self.metrics().to_prometheus_labeled(&[("service", self.onion_address().as_str())])`.
+	///
+	/// For **several** services, do not concatenate these outputs — that repeats each
+	/// metric's HELP/TYPE header, which strict Prometheus parsers reject. Use
+	/// [`fleet_prometheus`] instead, which emits the headers once.
+	#[must_use]
+	pub fn metrics_prometheus(&self) -> String {
+		service_metrics_prometheus(self.metrics(), &self.address)
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -1945,110 +1732,6 @@ mod tests {
 
 	use super::*;
 
-	#[test]
-	fn onion_address_normalizes_bare_name() {
-		let address = OnionAddress::normalized("abcdef");
-		assert_eq!(address.as_str(), "abcdef.onion");
-		assert_eq!(address.host(), "abcdef.onion");
-	}
-
-	#[test]
-	fn onion_address_keeps_single_suffix() {
-		let address = OnionAddress::normalized("abcdef.onion");
-		assert_eq!(address.as_str(), "abcdef.onion");
-	}
-
-	#[test]
-	fn onion_address_collapses_repeated_suffix() {
-		let address = OnionAddress::normalized("abcdef.onion.onion");
-		assert_eq!(address.as_str(), "abcdef.onion");
-	}
-
-	#[test]
-	fn onion_address_display_and_into_string_match() {
-		let address = OnionAddress::normalized("abcdef");
-		assert_eq!(address.to_string(), "abcdef.onion");
-		let owned: String = address.into();
-		assert_eq!(owned, "abcdef.onion");
-	}
-
-	#[test]
-	fn parse_accepts_a_valid_mined_address_and_canonicalizes() {
-		// Mining yields a guaranteed-valid v3 address; `parse` must accept it and
-		// round-trip to the same canonical form.
-		let key = vanity::mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
-		let canonical = key.address().as_str();
-		let parsed = OnionAddress::parse(canonical).expect("a mined address must validate");
-		assert_eq!(&parsed, key.address());
-		// Surrounding whitespace is tolerated.
-		let parsed_padded = OnionAddress::parse(&format!("  {canonical}  ")).expect("whitespace should be trimmed");
-		assert_eq!(&parsed_padded, key.address());
-	}
-
-	#[test]
-	fn parse_rejects_invalid_addresses() {
-		let key = vanity::mine_within("a", 50_000).expect("valid prefix").expect("should find a match");
-		let valid = key.address().as_str();
-
-		// Not an onion domain at all.
-		assert!(OnionAddress::parse("example.com").is_err());
-		// A bare name with no suffix is not accepted by the strict parser.
-		assert!(OnionAddress::parse("abcdef").is_err());
-		// A subdomain in front of a valid address is rejected.
-		assert!(OnionAddress::parse(&format!("www.{valid}")).is_err());
-
-		// Corrupt the public-key region (first base32 char) so the checksum no
-		// longer matches — a single flip is overwhelmingly likely to be rejected.
-		let mut chars: Vec<char> = valid.chars().collect();
-		chars[0] = if chars[0] == 'a' { 'b' } else { 'a' };
-		let corrupted: String = chars.into_iter().collect();
-		assert!(OnionAddress::parse(&corrupted).is_err(), "a corrupted checksum must be rejected");
-	}
-
-	#[test]
-	fn url_and_onion_location_helpers_format_correctly() {
-		let address = OnionAddress::normalized("abcdef");
-		assert_eq!(address.https_url(), "https://abcdef.onion/");
-		assert_eq!(address.http_url(), "http://abcdef.onion/");
-		assert_eq!(address.onion_location(), "https://abcdef.onion/");
-		let (name, value) = address.onion_location_header();
-		assert_eq!(name, "onion-location");
-		assert_eq!(value, "https://abcdef.onion/");
-	}
-
-	#[test]
-	fn qr_svg_is_a_wellformed_svg_document() {
-		let address = OnionAddress::normalized("abcdef");
-		let svg = address.qr_svg();
-		assert!(svg.starts_with("<?xml") || svg.starts_with("<svg"), "should be an SVG document, got: {}", &svg[..svg.len().min(40)]);
-		assert!(svg.contains("<svg"), "missing <svg> element");
-		assert!(svg.contains("</svg>"), "missing closing </svg>");
-		// A real QR renders dark modules as filled rects/paths — a blank/degenerate
-		// document would have none.
-		assert!(svg.contains("path") || svg.contains("rect"), "SVG has no QR modules");
-	}
-
-	#[test]
-	fn qr_encoding_is_deterministic_and_address_sensitive() {
-		let a = OnionAddress::normalized("abcdef");
-		let b = OnionAddress::normalized("ghijkl");
-		// Deterministic: same address → identical QR (encoding has no randomness).
-		assert_eq!(a.qr_svg(), a.qr_svg());
-		assert_eq!(a.qr_terminal(), a.qr_terminal());
-		// Address-sensitive: a different URL is encoded into a different QR.
-		assert_ne!(a.qr_svg(), b.qr_svg());
-		assert_ne!(a.qr_terminal(), b.qr_terminal());
-	}
-
-	#[test]
-	fn qr_terminal_is_multiline_block_art() {
-		let address = OnionAddress::normalized("abcdef");
-		let term = address.qr_terminal();
-		assert!(!term.is_empty(), "terminal QR must not be empty");
-		// Dense1x2 emits one line per two QR rows; a real code is many lines tall.
-		assert!(term.lines().count() > 5, "terminal QR should span multiple lines");
-	}
-
 	#[tokio::test]
 	async fn strict_tls_adds_hsts_header() {
 		use tower::ServiceExt as _;
@@ -2618,69 +2301,6 @@ mod tests {
 		let quiet = ServiceHealth { status: Unreachable, problem: None };
 		assert_eq!(quiet.to_string(), "unreachable");
 		assert!(!quiet.is_healthy());
-	}
-
-	#[test]
-	fn circuit_metrics_snapshot_reflects_recorded_events() {
-		use circuit_gate::StreamDisposition;
-		let m = CircuitMetrics::default();
-		assert_eq!(m.snapshot(), ServiceMetrics::default(), "a fresh counter set is all zeros");
-
-		m.record_circuit_offered();
-		m.record_circuit_offered();
-		m.record_circuit_accepted();
-		m.record_circuit_rejected();
-		m.record_stream(StreamDisposition::Serve);
-		m.record_stream(StreamDisposition::Serve);
-		m.record_stream(StreamDisposition::Reject);
-		m.record_stream(StreamDisposition::Shutdown);
-
-		let snap = m.snapshot();
-		assert_eq!(snap.circuits_offered, 2);
-		assert_eq!(snap.circuits_accepted, 1);
-		assert_eq!(snap.circuits_rejected, 1);
-		assert_eq!(snap.streams_served, 2);
-		assert_eq!(snap.streams_rejected, 1);
-		assert_eq!(snap.streams_shutdown, 1);
-	}
-
-	#[test]
-	fn record_stream_maps_each_disposition_to_its_own_counter() {
-		use circuit_gate::StreamDisposition::{Reject, Serve, Shutdown};
-
-		// Each disposition bumps exactly one distinct stream counter and never a circuit
-		// counter. `pick` returns the per-disposition target counter; a helper records one
-		// event and asserts only that counter (and no circuit counter) moved.
-		let served = |s: ServiceMetrics| s.streams_served;
-		let rejected = |s: ServiceMetrics| s.streams_rejected;
-		let shutdown = |s: ServiceMetrics| s.streams_shutdown;
-		let check = |disposition: circuit_gate::StreamDisposition, pick: &dyn Fn(ServiceMetrics) -> u64| {
-			let m = CircuitMetrics::default();
-			m.record_stream(disposition);
-			let snap = m.snapshot();
-			assert_eq!(pick(snap), 1, "{disposition:?} should bump its own counter");
-			assert_eq!(snap.streams_served + snap.streams_rejected + snap.streams_shutdown, 1, "exactly one stream counter moves");
-			assert_eq!(snap.circuits_offered + snap.circuits_accepted + snap.circuits_rejected, 0, "stream events never touch circuit counters");
-		};
-
-		check(Serve, &served);
-		check(Reject, &rejected);
-		check(Shutdown, &shutdown);
-	}
-
-	#[test]
-	fn service_metrics_since_is_a_saturating_per_field_delta() {
-		let earlier = ServiceMetrics { circuits_offered: 10, circuits_accepted: 7, circuits_rejected: 3, streams_served: 20, streams_rejected: 4, streams_shutdown: 1 };
-		let later = ServiceMetrics { circuits_offered: 15, circuits_accepted: 10, circuits_rejected: 5, streams_served: 26, streams_rejected: 4, streams_shutdown: 2 };
-
-		// The interval delta is the per-field difference.
-		let delta = later.since(earlier);
-		assert_eq!(delta, ServiceMetrics { circuits_offered: 5, circuits_accepted: 3, circuits_rejected: 2, streams_served: 6, streams_rejected: 0, streams_shutdown: 1 });
-
-		// Swapped operands saturate to zero rather than underflow-panicking.
-		assert_eq!(earlier.since(later), ServiceMetrics::default());
-		// A snapshot minus itself is no activity.
-		assert_eq!(later.since(later), ServiceMetrics::default());
 	}
 
 	#[test]

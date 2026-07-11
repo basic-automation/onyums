@@ -457,6 +457,28 @@ impl ServiceMetrics {
 		}
 	}
 
+	/// Circuits that were offered but neither accepted nor rejected by the policy gate —
+	/// `circuits_offered − (circuits_accepted + circuits_rejected)`, saturating at `0`.
+	///
+	/// These are the circuits arti failed to accept for transport reasons (the offer
+	/// arrived but `RendRequest::accept` errored) rather than any policy decision — a
+	/// distinct health signal from a policy rejection. Saturating so a torn read across
+	/// the independent `Relaxed` counter loads can never underflow-panic; over a settled
+	/// snapshot the identity holds exactly.
+	#[must_use]
+	pub const fn circuits_failed_transport(&self) -> u64 {
+		self.circuits_offered.saturating_sub(self.circuits_accepted.saturating_add(self.circuits_rejected))
+	}
+
+	/// All streams the per-stream gate saw, whatever the disposition —
+	/// `streams_served + streams_rejected + streams_shutdown`, saturating at `u64::MAX`.
+	///
+	/// The denominator for a served-fraction or reject-rate over the stream gate.
+	#[must_use]
+	pub const fn total_streams(&self) -> u64 {
+		self.streams_served.saturating_add(self.streams_rejected).saturating_add(self.streams_shutdown)
+	}
+
 	/// The six counters as `(prometheus_metric_name, HELP_text, value)` triples, in a
 	/// stable order. The single source of truth both [`to_prometheus`](Self::to_prometheus)
 	/// and [`to_prometheus_labeled`](Self::to_prometheus_labeled) render from, so the two
@@ -2793,6 +2815,29 @@ mod tests {
 		assert_eq!(earlier.since(later), ServiceMetrics::default());
 		// A snapshot minus itself is no activity.
 		assert_eq!(later.since(later), ServiceMetrics::default());
+	}
+
+	#[test]
+	fn circuits_failed_transport_is_the_offered_minus_gated_remainder() {
+		// offered − (accepted + rejected): the offers arti couldn't accept for transport
+		// reasons, neither served nor a policy decision.
+		let m = ServiceMetrics { circuits_offered: 20, circuits_accepted: 12, circuits_rejected: 5, ..Default::default() };
+		assert_eq!(m.circuits_failed_transport(), 3);
+
+		// Fully accounted-for offers → no transport failures.
+		let settled = ServiceMetrics { circuits_offered: 10, circuits_accepted: 7, circuits_rejected: 3, ..Default::default() };
+		assert_eq!(settled.circuits_failed_transport(), 0);
+
+		// A torn read where accepted+rejected momentarily exceeds offered saturates, never underflows.
+		let torn = ServiceMetrics { circuits_offered: 4, circuits_accepted: 3, circuits_rejected: 3, ..Default::default() };
+		assert_eq!(torn.circuits_failed_transport(), 0);
+	}
+
+	#[test]
+	fn total_streams_sums_every_disposition() {
+		let m = ServiceMetrics { streams_served: 26, streams_rejected: 4, streams_shutdown: 2, ..Default::default() };
+		assert_eq!(m.total_streams(), 32);
+		assert_eq!(ServiceMetrics::default().total_streams(), 0);
 	}
 
 	#[test]

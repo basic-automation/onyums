@@ -514,6 +514,14 @@ impl ServiceMetrics {
 	}
 }
 
+/// Render `metrics` as a Prometheus exposition labeled with the service's `.onion`
+/// address under the conventional `service` label key — the body of
+/// [`OnionServiceHandle::metrics_prometheus`], factored out so the labeling choice
+/// (which key, which value) is offline-testable without a running service.
+fn service_metrics_prometheus(metrics: ServiceMetrics, address: &OnionAddress) -> String {
+	metrics.to_prometheus_labeled(&[("service", address.as_str())])
+}
+
 /// Render a `{k="v",…}` Prometheus label block, escaping each value; the empty slice
 /// yields the empty string (no braces), so an unlabeled series stays bare.
 fn format_prometheus_labels(labels: &[(&str, &str)]) -> String {
@@ -1222,6 +1230,19 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn metrics(&self) -> ServiceMetrics {
 		self.metrics.snapshot()
+	}
+
+	/// This service's [`metrics`](Self::metrics) rendered in the Prometheus text
+	/// exposition format, labeled with the service's `.onion` address under the
+	/// `service` key (onyums ROADMAP Phase 4 — per-service metrics).
+	///
+	/// The ready-to-serve body for a `/metrics` endpoint: concatenate several handles'
+	/// output to scrape a whole fleet in one exposition, each series distinguished by
+	/// its `service="…​.onion"` label. Equivalent to
+	/// `self.metrics().to_prometheus_labeled(&[("service", self.onion_address().as_str())])`.
+	#[must_use]
+	pub fn metrics_prometheus(&self) -> String {
+		service_metrics_prometheus(self.metrics(), &self.address)
 	}
 
 	/// A stream of [`ServiceStatus`] transitions, so a caller can *watch* the
@@ -2835,6 +2856,22 @@ mod tests {
 	fn empty_labels_render_identically_to_the_unlabeled_export() {
 		let m = ServiceMetrics { streams_served: 3, ..Default::default() };
 		assert_eq!(m.to_prometheus_labeled(&[]), m.to_prometheus(), "an empty label slice yields bare metric lines");
+	}
+
+	#[test]
+	fn service_metrics_prometheus_labels_every_series_with_the_onion_address() {
+		// The handle-level convenience labels the whole exposition with `service="<addr>"`
+		// so several services scrape into one `/metrics` body distinguishably. Verified on
+		// the free helper so no running service is needed.
+		let addr = OnionAddress::normalized("pg6mmjiyjmcrsslvykfwnntlaru7p5svn6y2ymmju6nubxndf4pscryd.onion");
+		let m = ServiceMetrics { circuits_offered: 9, streams_served: 4, ..Default::default() };
+		let text = service_metrics_prometheus(m, &addr);
+
+		let label = format!("{{service=\"{}\"}}", addr.as_str());
+		assert!(text.contains(&format!("onyums_circuits_offered_total{label} 9\n")), "offered series is labeled:\n{text}");
+		assert!(text.contains(&format!("onyums_streams_served_total{label} 4\n")), "served series is labeled:\n{text}");
+		// Same as calling the labeled exporter directly with the address.
+		assert_eq!(text, m.to_prometheus_labeled(&[("service", addr.as_str())]));
 	}
 
 	#[test]

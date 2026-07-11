@@ -456,6 +456,97 @@ impl ServiceMetrics {
 			streams_shutdown: self.streams_shutdown.saturating_sub(earlier.streams_shutdown),
 		}
 	}
+
+	/// The six counters as `(prometheus_metric_name, HELP_text, value)` triples, in a
+	/// stable order. The single source of truth both [`to_prometheus`](Self::to_prometheus)
+	/// and [`to_prometheus_labeled`](Self::to_prometheus_labeled) render from, so the two
+	/// exports can never drift in name, help, or ordering.
+	const fn prometheus_series(&self) -> [(&'static str, &'static str, u64); 6] {
+		[
+			("onyums_circuits_offered_total", "Rendezvous circuits offered to the service (one per arti RendRequest).", self.circuits_offered),
+			("onyums_circuits_accepted_total", "Circuits accepted after the circuit-level policy gate.", self.circuits_accepted),
+			("onyums_circuits_rejected_total", "Circuits the circuit-level policy rejected or tore down at the offer.", self.circuits_rejected),
+			("onyums_streams_served_total", "Streams handed to a handler after passing the per-stream policy gate.", self.streams_served),
+			("onyums_streams_rejected_total", "Streams the per-stream policy rejected while leaving the circuit alive.", self.streams_rejected),
+			("onyums_streams_shutdown_total", "Streams whose policy action tore down the whole circuit.", self.streams_shutdown),
+		]
+	}
+
+	/// Render these counters in the Prometheus text exposition format (version 0.0.4) —
+	/// each counter as a `# HELP` / `# TYPE … counter` pair followed by its value, ready
+	/// to serve at a `/metrics` endpoint or hand to an OpenTelemetry scraper.
+	///
+	/// Metric names carry the conventional `_total` suffix for a monotonic counter. The
+	/// output ends with a trailing newline, per the format. Use
+	/// [`to_prometheus_labeled`](Self::to_prometheus_labeled) to attach a `service=…`
+	/// label when several onion services scrape into one exposition.
+	#[must_use]
+	pub fn to_prometheus(&self) -> String {
+		self.to_prometheus_labeled(&[])
+	}
+
+	/// Like [`to_prometheus`](Self::to_prometheus), but attaches `labels` (e.g.
+	/// `&[("service", "abcd….onion")]`) to every series so multiple services can be
+	/// distinguished in one scrape.
+	///
+	/// Label values are escaped per the exposition format (`\\`, `\"`, `\n`). An empty
+	/// `labels` slice produces bare metric lines identical to [`to_prometheus`](Self::to_prometheus).
+	#[must_use]
+	pub fn to_prometheus_labeled(&self, labels: &[(&str, &str)]) -> String {
+		let label_block = format_prometheus_labels(labels);
+		let mut out = String::new();
+		for (name, help, value) in self.prometheus_series() {
+			out.push_str("# HELP ");
+			out.push_str(name);
+			out.push(' ');
+			out.push_str(help);
+			out.push('\n');
+			out.push_str("# TYPE ");
+			out.push_str(name);
+			out.push_str(" counter\n");
+			out.push_str(name);
+			out.push_str(&label_block);
+			out.push(' ');
+			out.push_str(&value.to_string());
+			out.push('\n');
+		}
+		out
+	}
+}
+
+/// Render a `{k="v",…}` Prometheus label block, escaping each value; the empty slice
+/// yields the empty string (no braces), so an unlabeled series stays bare.
+fn format_prometheus_labels(labels: &[(&str, &str)]) -> String {
+	if labels.is_empty() {
+		return String::new();
+	}
+	let mut out = String::from("{");
+	for (i, (key, value)) in labels.iter().enumerate() {
+		if i > 0 {
+			out.push(',');
+		}
+		out.push_str(key);
+		out.push_str("=\"");
+		out.push_str(&escape_prometheus_label_value(value));
+		out.push('"');
+	}
+	out.push('}');
+	out
+}
+
+/// Escape a Prometheus label value: backslash, double-quote, and newline, per the text
+/// exposition format. Other bytes pass through unchanged.
+fn escape_prometheus_label_value(value: &str) -> String {
+	let mut out = String::with_capacity(value.len());
+	for ch in value.chars() {
+		match ch {
+			'\\' => out.push_str("\\\\"),
+			'"' => out.push_str("\\\""),
+			'\n' => out.push_str("\\n"),
+			_ => out.push(ch),
+		}
+	}
+	out
 }
 
 /// Shared atomic counters backing [`ServiceMetrics`]: incremented from the rendezvous
@@ -2681,6 +2772,69 @@ mod tests {
 		assert_eq!(earlier.since(later), ServiceMetrics::default());
 		// A snapshot minus itself is no activity.
 		assert_eq!(later.since(later), ServiceMetrics::default());
+	}
+
+	#[test]
+	fn to_prometheus_renders_all_six_counters_in_exposition_format() {
+		let m = ServiceMetrics { circuits_offered: 15, circuits_accepted: 10, circuits_rejected: 5, streams_served: 26, streams_rejected: 4, streams_shutdown: 2 };
+		let text = m.to_prometheus();
+
+		// One HELP + one TYPE + one value line per counter → exactly 18 lines, trailing newline.
+		assert!(text.ends_with('\n'), "exposition format ends with a newline");
+		assert_eq!(text.lines().count(), 18, "6 counters × (HELP, TYPE, value)");
+
+		// Each counter appears as a typed counter carrying its snapshot value, unlabeled.
+		for (name, value) in [
+			("onyums_circuits_offered_total", 15),
+			("onyums_circuits_accepted_total", 10),
+			("onyums_circuits_rejected_total", 5),
+			("onyums_streams_served_total", 26),
+			("onyums_streams_rejected_total", 4),
+			("onyums_streams_shutdown_total", 2),
+		] {
+			assert!(text.contains(&format!("# TYPE {name} counter\n")), "{name} declared as a counter");
+			assert!(text.contains(&format!("\n{name} {value}\n")), "{name} carries value {value} with no label block");
+		}
+	}
+
+	#[test]
+	fn to_prometheus_default_is_all_zeros() {
+		let text = ServiceMetrics::default().to_prometheus();
+		// Every counter is present and zero — a scraped fresh service is well-formed, not empty.
+		assert!(text.contains("\nonyums_circuits_offered_total 0\n"));
+		assert!(text.contains("\nonyums_streams_shutdown_total 0\n"));
+		assert_eq!(text.lines().count(), 18);
+	}
+
+	#[test]
+	fn to_prometheus_labeled_attaches_and_escapes_labels() {
+		let m = ServiceMetrics { circuits_offered: 7, ..Default::default() };
+		let text = m.to_prometheus_labeled(&[("service", "abcd.onion"), ("tier", "edge")]);
+
+		// Labels ride on the value line, comma-joined inside braces, in the given order.
+		assert!(text.contains("onyums_circuits_offered_total{service=\"abcd.onion\",tier=\"edge\"} 7\n"), "labels attach to the value line:\n{text}");
+		// HELP/TYPE lines stay label-free — labels belong only on the sample.
+		assert!(text.contains("# TYPE onyums_circuits_offered_total counter\n"));
+	}
+
+	#[test]
+	fn prometheus_label_values_are_escaped_per_the_format() {
+		// Backslash, double-quote, and newline are the three characters the exposition
+		// format requires escaping in a label value; everything else passes through.
+		assert_eq!(escape_prometheus_label_value("plain"), "plain");
+		assert_eq!(escape_prometheus_label_value(r#"a\b"#), r#"a\\b"#);
+		assert_eq!(escape_prometheus_label_value("a\"b"), "a\\\"b");
+		assert_eq!(escape_prometheus_label_value("a\nb"), "a\\nb");
+
+		// End to end: a hostile label value can't break out of the quoted string.
+		let text = ServiceMetrics::default().to_prometheus_labeled(&[("service", "a\"b\\c")]);
+		assert!(text.contains("{service=\"a\\\"b\\\\c\"}"), "escaped label survives into the sample line:\n{text}");
+	}
+
+	#[test]
+	fn empty_labels_render_identically_to_the_unlabeled_export() {
+		let m = ServiceMetrics { streams_served: 3, ..Default::default() };
+		assert_eq!(m.to_prometheus_labeled(&[]), m.to_prometheus(), "an empty label slice yields bare metric lines");
 	}
 
 	#[test]

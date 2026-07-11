@@ -7,6 +7,21 @@ Onyums is an axum wrapper for serving tor onion services — secure and complete
 
 The posture is *secure and complete by default*: the hard, Tor-specific machinery ships enabled, and you opt **down** when you have a reason to — never assemble safety from feature flags.
 
+**What this is:** a Rust library for serving [axum](https://github.com/tokio-rs/axum) applications as Tor onion services, with the Tor client ([Arti](https://gitlab.torproject.org/tpo/core/arti)) embedded — no external `tor` daemon. **What this is not:** a host provisioning / configuration-management tool, a reverse proxy for existing servers, or a SOCKS client. If you want to front an already-running service, that is a planned CLI, not the library.
+
+## Installation
+
+```sh
+cargo add onyums tokio --features tokio/full
+```
+
+Onyums is a library — add it to an async binary. No external Tor daemon is
+required: the [Arti](https://gitlab.torproject.org/tpo/core/arti) Tor client is
+embedded, so the first run downloads Tor consensus data over the network and
+creates the keystore/cache under `./tor/onyums/` itself. It uses Rust **edition
+2024**, so a recent stable toolchain (Rust 1.85 or newer) is required; a pinned,
+CI-enforced MSRV is still on the roadmap.
+
 ## Features
 
 - **One-liner serve** — `serve(app, "nickname")` is the full secure stack; the builder (`OnionService::builder()`) tunes or relaxes it.

@@ -46,6 +46,14 @@ pub const MAX_DECODE_PASSES: usize = 4;
 /// [`starter_rules`] — the engine emits it directly.
 pub const MULTI_ENCODING_RULE_ID: &str = "anomaly_multiple_encoding";
 
+/// The synthetic rule id reported when a field's raw bytes are not valid UTF-8
+/// (see [`Waf::flag_invalid_utf8`]). Like [`MULTI_ENCODING_RULE_ID`] it is not part of
+/// [`starter_rules`] — the engine emits it directly, as a [`WafCategory::ProtocolAnomaly`].
+/// Only fields carried as raw octets can trip it: header values and the request body. The
+/// method, path, and query reach the WAF as already-validated `&str` (hyper rejects a
+/// malformed request line upstream), so they can never be malformed here.
+pub const INVALID_UTF8_RULE_ID: &str = "anomaly_invalid_utf8";
+
 /// The signature class a rule belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WafCategory {
@@ -206,6 +214,14 @@ pub struct Waf {
 	/// When true (default), input requiring more than one percent-decode pass to reach a
 	/// fixed point is blocked outright as a [`WafCategory::ProtocolAnomaly`].
 	block_multi_encoded: bool,
+	/// When true (default), a header value or request body whose raw bytes are not valid UTF-8
+	/// is flagged as a [`WafCategory::ProtocolAnomaly`] ([`INVALID_UTF8_RULE_ID`]) — the CRS
+	/// "UTF-8 encoding validation" signal. Without it, the WAF only ever sees the
+	/// `from_utf8_lossy` normalization of such bytes, so a malformed encoding (which can splice
+	/// a payload past a signature or simply mark a hand-crafted non-conformant request) is
+	/// invisible. Relaxable with [`flag_invalid_utf8`](Self::flag_invalid_utf8) for operators
+	/// who front genuinely binary-header traffic.
+	flag_invalid_utf8: bool,
 	/// When `Some(cap)`, request bodies are inspected up to `cap` bytes (the host layer
 	/// buffers that much before forwarding). `None` (default) leaves bodies uninspected —
 	/// body inspection means buffering, a request-handling cost the operator opts into.
@@ -254,7 +270,7 @@ impl Waf {
 		for cat in WafCategory::ALL {
 			weights[cat.index()] = cat.weight();
 		}
-		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights, custom: Vec::new() })
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, flag_invalid_utf8: true, body_inspection: None, scoring_threshold: None, weights, custom: Vec::new() })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -264,6 +280,17 @@ impl Waf {
 	#[must_use]
 	pub fn block_multi_encoded(mut self, block: bool) -> Self {
 		self.block_multi_encoded = block;
+		self
+	}
+
+	/// Set whether a header value or request body whose raw bytes are not valid UTF-8 is
+	/// flagged as a protocol anomaly ([`INVALID_UTF8_RULE_ID`], default `true`). With it
+	/// `false`, such bytes are only ever scanned in their `from_utf8_lossy` form, so the
+	/// malformed encoding itself is not surfaced as a signal — set this only when the service
+	/// legitimately fronts binary-header traffic.
+	#[must_use]
+	pub fn flag_invalid_utf8(mut self, flag: bool) -> Self {
+		self.flag_invalid_utf8 = flag;
 		self
 	}
 
@@ -431,10 +458,17 @@ impl Waf {
 	#[must_use]
 	pub fn inspect_body(&self, body: &[u8]) -> Verdict {
 		let text = String::from_utf8_lossy(body);
-		match self.inspect_str(&text, "body") {
-			Some(m) => Verdict::Block(m),
-			None => Verdict::Allow,
+		// A concrete signature keeps precedence over the encoding anomaly: if the lossy form
+		// carries a real payload, name the specific rule that fired.
+		if let Some(m) = self.inspect_str(&text, "body") {
+			return Verdict::Block(m);
 		}
+		// Otherwise a body that isn't valid UTF-8 is itself the signal (CRS UTF-8 validation):
+		// the lossy scan came up clean, but the raw bytes are malformed.
+		if self.flag_invalid_utf8 && std::str::from_utf8(body).is_err() {
+			return Verdict::Block(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: "body".to_owned(), score: None });
+		}
+		Verdict::Allow
 	}
 
 	/// The default WAF over [`starter_rules`]. The starter patterns are known-good and
@@ -571,10 +605,14 @@ impl Waf {
 			return Verdict::Block(m);
 		}
 		for (name, value) in &parts.headers {
-			if let Ok(s) = value.to_str()
-				&& let Some(m) = self.inspect_field(s, &format!("header:{name}"), false)
-			{
-				return Verdict::Block(m);
+			if let Ok(s) = value.to_str() {
+				if let Some(m) = self.inspect_field(s, &format!("header:{name}"), false) {
+					return Verdict::Block(m);
+				}
+			} else if self.flag_invalid_utf8 && std::str::from_utf8(value.as_bytes()).is_err() {
+				// `to_str` also rejects valid-UTF-8-but-non-visible-ASCII values; the extra
+				// `from_utf8` check narrows this to genuinely malformed bytes.
+				return Verdict::Block(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None });
 			}
 		}
 		// Operator-authored custom rules run after the built-in signature fields, so a
@@ -714,6 +752,8 @@ impl Waf {
 		for (name, value) in &parts.headers {
 			if let Ok(s) = value.to_str() {
 				self.inspect_field_all(s, &format!("header:{name}"), false, &mut out);
+			} else if self.flag_invalid_utf8 && std::str::from_utf8(value.as_bytes()).is_err() {
+				out.push(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None });
 			}
 		}
 		// Custom filter-expression rules contribute to the aggregate score too.
@@ -3021,5 +3061,72 @@ mod tests {
 		let waf = Waf::starter().disable_category(WafCategory::ProtocolAnomaly);
 		let m = waf.inspect_str("a%252e%252e%252fb", "target").unwrap();
 		assert_eq!(m.rule_id, MULTI_ENCODING_RULE_ID);
+	}
+
+	/// Build a `Parts` carrying one header whose raw value bytes are exactly `value`. Bypasses
+	/// `HeaderValue`'s `&str` path so genuinely non-UTF-8 octets reach the WAF.
+	fn parts_with_raw_header(name: &str, value: &[u8]) -> Parts {
+		let hv = axum::http::HeaderValue::from_bytes(value).unwrap();
+		Request::builder().method("GET").uri("/").header(name, hv).body(()).unwrap().into_parts().0
+	}
+
+	#[test]
+	fn invalid_utf8_header_is_flagged_as_protocol_anomaly() {
+		let waf = Waf::starter();
+		// A lone continuation byte (0x80) is not valid UTF-8 and is legal in a header value.
+		let v = waf.inspect(&parts_with_raw_header("x-probe", &[0x80]));
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, INVALID_UTF8_RULE_ID);
+		assert_eq!(m.category, WafCategory::ProtocolAnomaly);
+		assert_eq!(m.location, "header:x-probe");
+	}
+
+	#[test]
+	fn invalid_utf8_header_can_be_relaxed() {
+		let waf = Waf::starter().flag_invalid_utf8(false);
+		// With the flag off, a malformed-encoding header carrying no ASCII signature is allowed.
+		assert_eq!(waf.inspect(&parts_with_raw_header("x-probe", &[0xff, 0xfe])), Verdict::Allow);
+	}
+
+	#[test]
+	fn valid_utf8_non_ascii_header_is_not_flagged() {
+		let waf = Waf::starter();
+		// `é` (0xC3 0xA9) is valid UTF-8 though not visible ASCII — a malformed-encoding flag
+		// must not fire on it (it just goes unscanned, as before).
+		assert_eq!(waf.inspect(&parts_with_raw_header("x-name", "café".as_bytes())), Verdict::Allow);
+	}
+
+	#[test]
+	fn invalid_utf8_body_is_flagged_when_no_signature_matches() {
+		let waf = Waf::starter();
+		let v = waf.inspect_body(&[0xc0, 0xaf]); // overlong '/', invalid UTF-8
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, INVALID_UTF8_RULE_ID);
+		assert_eq!(m.category, WafCategory::ProtocolAnomaly);
+		assert_eq!(m.location, "body");
+	}
+
+	#[test]
+	fn body_signature_wins_over_invalid_utf8_anomaly() {
+		let waf = Waf::starter();
+		// A body with a real XSS payload plus a trailing invalid byte: the specific signature
+		// is reported, not the generic encoding anomaly.
+		let mut body = b"<script>alert(1)</script>".to_vec();
+		body.push(0xff);
+		let v = waf.inspect_body(&body);
+		assert_eq!(blocked(&v).category, WafCategory::Xss);
+	}
+
+	#[test]
+	fn valid_utf8_body_is_not_flagged() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_body("just a normal comment".as_bytes()), Verdict::Allow);
+	}
+
+	#[test]
+	fn invalid_utf8_header_contributes_to_anomaly_score() {
+		let waf = Waf::starter();
+		let matches = waf.inspect_all(&parts_with_raw_header("x-probe", &[0x80]));
+		assert!(matches.iter().any(|m| m.rule_id == INVALID_UTF8_RULE_ID && m.category == WafCategory::ProtocolAnomaly));
 	}
 }

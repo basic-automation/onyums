@@ -1382,6 +1382,15 @@ pub fn starter_rules() -> Vec<Rule> {
 		// (Rust `\s` already covers the vertical-tab CRS spells out); the `\]?\[` limb catches the
 		// `obj[constructor][prototype]` bracket-chain the dotted form misses. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf>
 		Rule { id: "code_prototype_pollution", category: WafCategory::CodeInjection, pattern: r"(?i)(__proto__|constructor\s*(?:\.|\]?\[)\s*prototype)" },
+		// Client-side template injection sandbox escape (AngularJS/Vue CSTI, tplmap gadget): the
+		// `constructor.constructor('…')()` chain that reaches the `Function` constructor to run
+		// arbitrary JS — e.g. `{{constructor.constructor('alert(1)')()}}`. Distinct from the
+		// prototype-pollution rule above (which keys on `constructor…prototype`): here it is the
+		// *double* `constructor` token that is the tell. The `(?:\.|\]?\[\s*["']?)` limb catches both
+		// the dotted `constructor.constructor` and the bracket `constructor['constructor']` forms; two
+		// adjacent `constructor` tokens essentially never occur in benign input.
+		// <https://portswigger.net/research/server-side-template-injection>
+		Rule { id: "code_csti_constructor", category: WafCategory::CodeInjection, pattern: r#"(?i)constructor\s*(?:\.|\]?\[\s*["']?)\s*constructor"# },
 		// Spring4Shell class-loader manipulation (OWASP-CRS rule 944260, CVE-2022-22965): a data-binding
 		// payload walking `class.module.classLoader...` to rewrite the Tomcat access-log pattern into a
 		// webshell, plus the `springframework.context.support.FileSystemXmlApplicationContext` SpEL
@@ -2812,6 +2821,27 @@ mod tests {
 			"/blog/prototype-design",       // "prototype" alone, no `constructor` head
 			"/api/build-a-prototype",       // ditto
 		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn csti_constructor_rule_matches() {
+		// AngularJS/Vue CSTI sandbox escape: the double-`constructor` chain to the Function ctor,
+		// in both dotted and bracket forms, however whitespace-padded.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("q={{constructor.constructor('alert(1)')()}}", "query").unwrap().rule_id, "code_csti_constructor");
+		assert_eq!(waf.inspect_str("x=constructor['constructor']('return 1')", "query").unwrap().rule_id, "code_csti_constructor");
+		assert_eq!(waf.inspect_str("x=constructor [ constructor ]", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn csti_constructor_keeps_false_positives_low() {
+		// A single `constructor` reference — a class doc, a `.constructor.name` type check — stays
+		// clean; the rule needs two adjacent `constructor` tokens.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("x=obj.constructor.name", "query").is_none(), "single constructor should not false-positive");
+		for uri in ["/docs/constructor-overloading", "/api/constructor-injection-di"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

@@ -32,16 +32,21 @@ expression language + a curated OWASP-CRS-derived ruleset — SQLi (incl. error-
 HTML tags, CSS `-moz-binding`/`behavior:url()` script-binding, and the full
 mouse/keyboard/clipboard/drag/media event-handler families) / traversal / SSRF
 (incl. Alibaba & Oracle-OCI cloud-metadata endpoints), server-side template injection
-across engines and PHP/Java/Node code execution (Spring4Shell class-loader, JS
+across engines (incl. the AngularJS/Vue `constructor.constructor` CSTI sandbox escape)
+and PHP/Java/Node code execution (Spring4Shell class-loader, JS
 prototype pollution, Java-deserialization markers), PowerShell download-cradle /
-encoded-command RCE and Unix-shell evasion — `$IFS` whitespace plus character-insertion
-de-obfuscation (`c'a't`, `c\at`, `who${x}ami`) — network-recon/exfil command coverage,
+encoded-command RCE, Windows LOLBins (`mshta`/`regsvr32`/`rundll32`/`wmic`/`schtasks`)
+and Unix-shell evasion — `$IFS` whitespace plus character-insertion
+de-obfuscation (`c'a't`, `c\at`, `who${x}ami`) and `{cat,/path}` brace-expansion —
+network-recon/exfil command coverage,
 NoSQL/ORM lookup injection, restricted-file access (incl. AI coding-assistant artifact
 dirs like `.claude/`/`.cursor/`), and a `ScannerDetection` class that hard-blocks
 self-identifying attack tools (sqlmap/nikto/ghauri/nuclei/ffuf/dalfox/…); input is
 normalized against percent-encoding, SQL comment / whitespace padding, HTML character
 references, and embedded C0 control chars, so `UNION/**/SELECT`-, `java&#115;cript:`-,
-and `<scri\npt>`-style evasions all still trip — anomaly
+and `<scri\npt>`-style evasions all still trip, while a header value or body whose raw
+bytes are not valid UTF-8 is itself flagged as a protocol anomaly (opt down with
+`Waf::flag_invalid_utf8(false)`) — anomaly
 scoring, and
 operator-authored custom rules), observability (typed `SecurityEvent`s, metrics,
 request-shape baselining), and

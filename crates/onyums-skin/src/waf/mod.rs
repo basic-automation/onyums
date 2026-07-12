@@ -1288,6 +1288,16 @@ pub fn starter_rules() -> Vec<Rule> {
 		// token itself; the `\b` tail keeps `$IFSomething` and a benign `${IF}` conditional clean.
 		// The `${IFS}` sequence does not occur in ordinary HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
 		Rule { id: "cmdi_ifs_evasion", category: WafCategory::CommandInjection, pattern: r"\$\{?IFS\b" },
+		// Brace-expansion RCE globbing (OWASP-CRS rule 932280): `{cat,/etc/passwd}` — the shell
+		// expands a comma brace-set into a space-free argument vector, another way to run a command
+		// with no literal whitespace. This is the low-false-positive re-entry design the earlier
+		// deferral called for: anchored on a leading shell separator (`;`/`&`/`|`/backtick) AND
+		// requiring the second brace element to be *path-like* (starts with `/`), so an ordinary
+		// query brace-set like `?tags={cat,dog}` (no separator, non-path second element) stays clean
+		// while `; {cat,/tmp/x}` / `| {nl,/home/u/.ssh/id_rsa}` trip. The bare-first `{,cmd}` form is
+		// deliberately left out — it has no path-like element to key on and would raise FP.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_brace_expansion", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`]\s*\{[a-z0-9_.+-]+,\s*/[^,{}]*\}" },
 		// Shell fork-bomb resource-exhaustion payload (OWASP-CRS 4.25.0 LTS, PL2) — the classic
 		// `:(){ :|:& };:`. Keyed on the recursive self-pipe-into-background `:|:&` rather than the
 		// `(){` function-definition head, so it is a distinct signal from `anomaly_shellshock`'s
@@ -1937,6 +1947,29 @@ mod tests {
 		for uri in ["/docs/if-statements", "/api/config?tpl=${IF}-then"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn brace_expansion_rule_matches() {
+		// OWASP-CRS 932280: `{cmd,/path}` brace-expansion globbing riding a shell separator, with a
+		// path-like second element. Kept clear of /etc/passwd (which the traversal rule claims first)
+		// so first-match attributes these to the brace rule.
+		let waf = Waf::starter();
+		for payload in ["x=1; {cat,/tmp/secret.txt}", "y=2| {nl,/home/u/.ssh/id_rsa}", "z=3&{head,/var/log/app.log}"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the brace rule"));
+			assert_eq!(m.rule_id, "cmdi_brace_expansion", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn brace_expansion_keeps_false_positives_low() {
+		// The false positives the earlier deferral flagged: a query brace-set with no shell separator,
+		// and a brace-set whose second element is not path-like, both stay clean.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("tags={cat,dog}", "query").is_none(), "non-path brace-set should not false-positive");
+		assert!(waf.inspect_str("sizes={s,m,l}", "query").is_none(), "plain brace-set should not false-positive");
+		assert!(waf.inspect_str("path=/tmp/{a,b}", "query").is_none(), "brace-set with no leading shell separator should not false-positive");
 	}
 
 	#[test]

@@ -1161,6 +1161,19 @@ pub fn starter_rules() -> Vec<Rule> {
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
 		Rule { id: "sqli_boolean_condition", category: WafCategory::Sqli, pattern: r#"(?i)(\band\b\s+['"]?\d+\s*[=<>]|\bor\b\s+['"]?\d+\s*[<>])\s*['"]?\d+"# },
 		Rule { id: "sqli_oob_exec", category: WafCategory::Sqli, pattern: r"(?i)\b(xp_cmdshell|xp_dirtree|load_file|utl_http|dbms_ldap)\b" },
+		// MSSQL time-based blind SQLi (OWASP-CRS rule 942190/942200 family): `WAITFOR DELAY '0:0:5'`
+		// / `WAITFOR TIME '...'`. The `sqli_time_based` rule above requires a `(` after the keyword —
+		// true for `sleep(` / `benchmark(` / `pg_sleep(`, but MSSQL's WAITFOR takes a *quoted* time and
+		// no parens, so it slips through. This dedicated rule closes that gap; `waitfor delay`/`waitfor
+		// time` is a near-unique T-SQL phrase, so false positives stay negligible.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_mssql_waitfor", category: WafCategory::Sqli, pattern: r"(?i)\bwaitfor\s+(delay|time)\b" },
+		// Oracle time-based blind SQLi (OWASP-CRS 942xxx Oracle set): `DBMS_PIPE.RECEIVE_MESSAGE(...)`
+		// (blocks the session for a timeout — Oracle's `SLEEP` analog) and `DBMS_LOCK.SLEEP(...)`. Both
+		// are Oracle-package calls the generic `sleep(`/`benchmark(` rule doesn't name; anchored to the
+		// `package.function(` call shape with tolerant whitespace so `dbms_pipe . receive_message (` also
+		// trips. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_oracle_timing", category: WafCategory::Sqli, pattern: r"(?i)\b(dbms_pipe\s*\.\s*receive_message|dbms_lock\s*\.\s*sleep)\s*\(" },
 		// Quote-wrapped string tautology (OWASP-CRS 4.28.0 quote-evasion audit) — the classic
 		// `' OR 'a'='a` / `" AND "x"="x` auth-bypass the numeric `sqli_or_tautology` misses because
 		// the equality is between two *quoted strings*, not digits. Keyed on the quote →
@@ -1577,6 +1590,35 @@ mod tests {
 		let waf = Waf::starter();
 		assert!(waf.inspect_str("price=floor(total/count)", "query").is_none(), "floor() math should not false-positive");
 		for uri in ["/docs/xml-extract-tutorial", "/api/floor-plans", "/blog/random-numbers"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn sqli_mssql_waitfor_matches() {
+		// OWASP-CRS 942190/942200: MSSQL time-based blind, the no-paren WAITFOR the generic
+		// `sqli_time_based` rule (which requires `(`) misses.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1; WAITFOR DELAY '0:0:5'", "query").unwrap().rule_id, "sqli_mssql_waitfor");
+		assert_eq!(waf.inspect_str("1);waitfor  time '01:00:00'--", "query").unwrap().category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn sqli_oracle_timing_matches() {
+		// OWASP-CRS 942xxx Oracle: DBMS_PIPE.RECEIVE_MESSAGE / DBMS_LOCK.SLEEP time delays.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 OR DBMS_PIPE.RECEIVE_MESSAGE('a',5)=1", "query").unwrap().rule_id, "sqli_oracle_timing");
+		// `dbms_lock.sleep(` also embeds `.sleep(`, so the lower-index generic `sqli_time_based`
+		// legitimately claims it first — either way it's a Sqli block.
+		assert_eq!(waf.inspect_str("id=1;dbms_lock.sleep(5)", "query").unwrap().category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn sqli_dialect_timing_keeps_false_positives_low() {
+		// "wait for" as prose (no DELAY/TIME keyword) and unrelated `.sleep(` calls stay clean.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("please wait for the results", "query").is_none());
+		for uri in ["/blog/waitfor-processing", "/api/thread-sleep-guide"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

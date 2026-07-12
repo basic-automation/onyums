@@ -605,14 +605,20 @@ impl Waf {
 			return Verdict::Block(m);
 		}
 		for (name, value) in &parts.headers {
-			if let Ok(s) = value.to_str() {
-				if let Some(m) = self.inspect_field(s, &format!("header:{name}"), false) {
-					return Verdict::Block(m);
+			// Read the value as full UTF-8, not `to_str` (which rejects any non-visible-ASCII
+			// byte): a valid-UTF-8 non-ASCII header like `<script>café` would otherwise go
+			// entirely unscanned — a signature-evasion gap. Only genuinely malformed bytes
+			// (`str::from_utf8` fails) fall through to the encoding anomaly.
+			match std::str::from_utf8(value.as_bytes()) {
+				Ok(s) => {
+					if let Some(m) = self.inspect_field(s, &format!("header:{name}"), false) {
+						return Verdict::Block(m);
+					}
 				}
-			} else if self.flag_invalid_utf8 && std::str::from_utf8(value.as_bytes()).is_err() {
-				// `to_str` also rejects valid-UTF-8-but-non-visible-ASCII values; the extra
-				// `from_utf8` check narrows this to genuinely malformed bytes.
-				return Verdict::Block(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None });
+				Err(_) if self.flag_invalid_utf8 => {
+					return Verdict::Block(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None });
+				}
+				Err(_) => {}
 			}
 		}
 		// Operator-authored custom rules run after the built-in signature fields, so a
@@ -750,10 +756,11 @@ impl Waf {
 			self.inspect_field_all(query, "query", true, &mut out);
 		}
 		for (name, value) in &parts.headers {
-			if let Ok(s) = value.to_str() {
-				self.inspect_field_all(s, &format!("header:{name}"), false, &mut out);
-			} else if self.flag_invalid_utf8 && std::str::from_utf8(value.as_bytes()).is_err() {
-				out.push(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None });
+			// Full UTF-8, not `to_str` — see the matching note in `inspect`.
+			match std::str::from_utf8(value.as_bytes()) {
+				Ok(s) => self.inspect_field_all(s, &format!("header:{name}"), false, &mut out),
+				Err(_) if self.flag_invalid_utf8 => out.push(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None }),
+				Err(_) => {}
 			}
 		}
 		// Custom filter-expression rules contribute to the aggregate score too.
@@ -3128,5 +3135,26 @@ mod tests {
 		let waf = Waf::starter();
 		let matches = waf.inspect_all(&parts_with_raw_header("x-probe", &[0x80]));
 		assert!(matches.iter().any(|m| m.rule_id == INVALID_UTF8_RULE_ID && m.category == WafCategory::ProtocolAnomaly));
+	}
+
+	#[test]
+	fn non_ascii_utf8_header_is_still_scanned_for_signatures() {
+		let waf = Waf::starter();
+		// A valid-UTF-8 non-ASCII byte (`é`) makes `HeaderValue::to_str()` fail, but the
+		// payload must still be inspected — reading via `str::from_utf8` closes that gap.
+		let mut val = "<script>café".as_bytes().to_vec();
+		val.extend_from_slice(b"</script>");
+		let v = waf.inspect(&parts_with_raw_header("x-note", &val));
+		assert_eq!(blocked(&v).category, WafCategory::Xss);
+		// And it also surfaces in the scoring/collect-all path.
+		let matches = waf.inspect_all(&parts_with_raw_header("x-note", &val));
+		assert!(matches.iter().any(|m| m.category == WafCategory::Xss));
+	}
+
+	#[test]
+	fn benign_non_ascii_utf8_header_is_allowed() {
+		let waf = Waf::starter();
+		// The wider scan must not false-positive on an ordinary UTF-8 header value.
+		assert_eq!(waf.inspect(&parts_with_raw_header("x-name", "Björk Guðmundsdóttir".as_bytes())), Verdict::Allow);
 	}
 }

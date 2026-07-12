@@ -1142,6 +1142,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r"(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)" },
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
+		// MySQL system-variable info-leak probes (OWASP-CRS 942xxx): `@@version`, `@@datadir`,
+		// `@@hostname`, `@@basedir`, `@@secure_file_priv`, and the `@@global.`/`@@session.` scopes —
+		// the fingerprint/enumeration payloads an attacker appends once a UNION or error channel is
+		// open. The `@@` double-sigil is near-unique to MySQL/T-SQL (an email address has a single
+		// `@`), so false positives stay negligible without a leading-context anchor.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_mysql_sysvar", category: WafCategory::Sqli, pattern: r"(?i)@@(version|datadir|hostname|basedir|tmpdir|secure_file_priv|version_compile_os|global|session)\b" },
 		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
 		// MySQL privilege-escalation / file-read SQL beyond the `INTO OUTFILE` write and the `load_file`
 		// read already covered (OWASP-CRS rules 942151/942320 + 942480): `PROCEDURE ANALYSE` (the
@@ -1620,6 +1627,23 @@ mod tests {
 		for uri in ["/docs/xml-extract-tutorial", "/api/floor-plans", "/blog/random-numbers"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn sqli_mysql_sysvar_matches() {
+		// OWASP-CRS 942xxx: MySQL system-variable info-leak probes via the `@@` double-sigil.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 UNION SELECT @@version", "query").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("id=1 AND @@datadir", "query").unwrap().rule_id, "sqli_mysql_sysvar");
+		assert_eq!(waf.inspect_str("x=@@global.secure_file_priv", "query").unwrap().rule_id, "sqli_mysql_sysvar");
+	}
+
+	#[test]
+	fn sqli_mysql_sysvar_keeps_false_positives_low() {
+		// A single `@` (email), and unrelated `@@`-free text, stay clean.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("email=user@example.com", "query").is_none(), "email should not false-positive");
+		assert!(waf.inspect_str("handle=version-2", "query").is_none());
 	}
 
 	#[test]

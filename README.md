@@ -559,6 +559,69 @@ warning for public users.
 
 ****
 
+## Deployment
+
+An onyums service is an ordinary Rust binary — `cargo build --release` and run it.
+The one thing that must survive a restart or redeploy is the **identity keystore**
+under `./tor/onyums/state` (relative to the process's working directory): it holds the
+onion service's secret key, so persisting it keeps the `.onion` address stable. Lose it
+and the service comes back on a *new* address.
+
+**systemd** — pin the working directory so `./tor/onyums` always resolves to the same
+place, and let it restart on failure:
+
+```ini
+# /etc/systemd/system/my-onion.service
+[Unit]
+Description=My onyums onion service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/my-onion/my-onion
+WorkingDirectory=/var/lib/my-onion      # ./tor/onyums/state lives here — keep it
+Restart=on-failure
+# Hardening: the service only needs its own state dir writable.
+DynamicUser=yes
+StateDirectory=my-onion
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Docker** — build the binary, then mount a **named volume** over the state directory
+so the identity outlives the container:
+
+```dockerfile
+FROM rust:1-slim AS build
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /srv                            # ./tor/onyums/state resolves under here
+COPY --from=build /app/target/release/my-onion /usr/local/bin/my-onion
+VOLUME ["/srv/tor/onyums/state"]        # persist the identity keystore
+CMD ["my-onion"]
+```
+
+```sh
+docker run -v my-onion-identity:/srv/tor/onyums/state my-onion
+```
+
+The `cache` directory (`./tor/onyums/cache`) is disposable — it only holds the Tor
+network consensus and is refetched if missing, so it does **not** need a volume.
+
+**Backing up the identity.** To migrate a service to a new host or recover after a
+disk loss, back up `./tor/onyums/state` (the keystore) and restore it before first
+launch — the address is derived from the key inside it. Confirm a restored key serves
+the address you expect *before* wiring it up with `address_from_tor_secret_key_file(...)`
+(see [Identity & address helpers](#identity--address-helpers)). Treat this directory as
+a secret: it *is* the service's identity.
+
+****
+
 ## Websocket example
 
 Websockets work over Tor too. Onyums supplies a `ConnectInfo<ConnectionInfo>` so a handler can read the per-rendezvous-circuit id — the stable per-client handle over Tor, where there is no client IP or `SocketAddr`:

@@ -513,6 +513,52 @@ let _svg_qr = address.qr_svg();           // standalone <svg> document
 
 ****
 
+## First launch & troubleshooting
+
+**What the first run does.** With no `tor` daemon to configure, the embedded Arti
+client bootstraps itself: it fetches the Tor network consensus over your outbound
+connection and creates `./tor/onyums/state` (the identity keystore) and
+`./tor/onyums/cache` (the disposable network directory). Outbound network access and
+a roughly correct system clock are required — Tor rejects a consensus it thinks is
+expired, so a badly-skewed clock is a common first-run failure.
+
+**Expect readiness to take a moment.** Coming up is more than bootstrapping: Arti
+publishes the service descriptor to the responsible directories, and it only reports
+the service *reachable* once those uploads land. `ready()` can therefore take a minute
+or more on the first launch, and — a real Arti behaviour onyums surfaces honestly —
+the reported status can still lag *de-facto* reachability. Use `ready_timeout(dur)` so
+startup never blocks forever, and read `status()` / `problem()` to see where it is:
+
+```rust
+if handle.ready_timeout(std::time::Duration::from_secs(120)).await {
+	println!("reachable at {}", handle.onion_address());
+} else {
+	// Not up yet — status() says what, problem() says why.
+	eprintln!("not ready: {} ({:?})", handle.status(), handle.problem());
+}
+```
+
+**Testing from Tor Browser.** Open `https://<your-address>.onion/`. With the default
+self-signed certificate the browser shows a certificate warning — that is *expected*:
+the onion address itself authenticates the service (see [TLS-first transport](#tls-first-transport)),
+so the warning is about WebPKI trust of the cert, not about who you are talking to.
+Serve a CA-signed `.onion` cert with `Tls::Provided(...)` if you need to avoid the
+warning for public users.
+
+**Common problems:**
+
+| Symptom | Likely cause / fix |
+|---|---|
+| Bootstrap never finishes | No outbound network, or a skewed system clock (fix the clock). |
+| `ready()` hangs | Use `ready_timeout(dur)`; then read `problem()` — a persistent `IntroductionPoint` / `DescriptorUpload` problem means the descriptor isn't published yet. |
+| Certificate warning in the browser | Expected with self-signed TLS — the address is the authenticator; use `Tls::Provided` for a CA-signed chain. |
+| A restricted-discovery client can't connect | Its x25519 key isn't in the allowlist, or its `.auth_private` line is wrong — re-check `provision_client(...)` output. |
+| A raw `route_port(...)` backend is unreachable | The local TCP backend isn't listening on the address you forwarded to. |
+| `serve()` returns a port error | Ports 80/443 are reserved for the built-in HTTP handler, and a port can't be registered twice or as `0` — this is a clean startup error, not a runtime surprise. |
+| Address changed after a restart | You used `.ephemeral()` (throwaway identity by design); drop it to keep the persistent keystore's stable address. |
+
+****
+
 ## Websocket example
 
 Websockets work over Tor too. Onyums supplies a `ConnectInfo<ConnectionInfo>` so a handler can read the per-rendezvous-circuit id — the stable per-client handle over Tor, where there is no client IP or `SocketAddr`:

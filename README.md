@@ -9,6 +9,48 @@ The posture is *secure and complete by default*: the hard, Tor-specific machiner
 
 **What this is:** a Rust library for serving [axum](https://github.com/tokio-rs/axum) applications as Tor onion services, with the Tor client ([Arti](https://gitlab.torproject.org/tpo/core/arti)) embedded — no external `tor` daemon. **What this is not:** a host provisioning / configuration-management tool, a reverse proxy for existing servers, or a SOCKS client. If you want to front an already-running service, that is a planned CLI, not the library.
 
+## Architecture
+
+Every request travels the same secure-by-default path from the Tor network to your
+handler. The circuit-level gate runs before any bytes are served; TLS is terminated
+inside the onion-encrypted stream; the Skin abuse-defense gate runs before the router:
+
+```
+                        Tor network
+                             │  rendezvous circuit (RendRequest)
+                             ▼
+                  ┌───────────────────────┐
+                  │   serve loop          │  one task per circuit
+                  │   CircuitPolicy gate  │  Accept · Challenge · Reject · Shutdown
+                  └──────────┬────────────┘
+                             │  accepted stream (StreamRequest)
+                             ▼
+                  ┌───────────────────────┐
+                  │   port dispatch       │  80/443 → HTTP · other → raw handler
+                  └────┬──────────────┬───┘
+                80/443 │              │ registered raw port
+                       ▼              ▼
+        ┌───────────────────────┐  ┌───────────────────┐
+        │   TLS termination     │  │   RawTcpHandler   │  no Skin / no TLS —
+        │   self-signed / BYO   │  │   → local backend │  the backend secures
+        │   HTTP→HTTPS · HSTS   │  └───────────────────┘  its own end-to-end
+        └──────────┬────────────┘
+                   │  decrypted HTTP request
+                   ▼
+        ┌───────────────────────┐
+        │   Skin gate           │  clearance check · PoW / CAPTCHA challenge ·
+        │   (abuse defense)     │  WAF · rate-limit (keyed on the clearance token)
+        └──────────┬────────────┘
+                   │  cleared request
+                   ▼
+             axum Router  →  your handler
+```
+
+Each stage is an explicit opt-**down**: `Tls::Strict` rejects plaintext instead of
+redirecting, `no_skin()` drops the abuse gate, `under_attack(true)` forces every
+circuit through the gate, and `route_port(...)` adds a raw-TCP branch. See the
+sections below for each.
+
 ## Installation
 
 ```sh

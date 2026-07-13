@@ -575,19 +575,6 @@ fn build_serve_router(app: Router, skin: SkinChoice, plaintext: tls_policy::Plai
 	apply_hsts(apply_skin(app, skin), plaintext)
 }
 
-/// Assemble a [`PortRouter`] from the builder's `route_port` registrations,
-/// surfacing the first invalid registration (reserved/zero port, or a duplicate).
-///
-/// Extracted from `serve` so the registration validation is unit-testable with no
-/// live Tor network.
-fn build_port_router(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<PortRouter> {
-	let mut router = PortRouter::new();
-	for (port, handler) in handlers {
-		router.register(port, handler)?;
-	}
-	Ok(router)
-}
-
 /// Resolve the per-rendezvous-circuit [`CircuitPolicy`] from the builder's choices.
 ///
 /// The default-policy toggles — Under Attack Mode ([`OnionServiceBuilder::under_attack`])
@@ -888,7 +875,7 @@ impl OnionServiceBuilder {
 		// bootstrap) so a bad registration — a reserved/zero port, or a duplicate —
 		// fails offline rather than at the first circuit. An empty router reproduces
 		// today's HTTP-only behaviour.
-		let port_router = Arc::new(build_port_router(self.raw_handlers)?);
+		let port_router = Arc::new(PortRouter::from_registrations(self.raw_handlers)?);
 
 		// Insert the onyums-skin gate ahead of the application on the HTTP path
 		// (Phase 2 Skin integration) + Phase 3 TLS-first HSTS. Derive the pure, `Copy`
@@ -1239,31 +1226,6 @@ mod tests {
 		let result = OnionService::builder().router(app).serve().await;
 		let err = result.err().expect("missing nickname should error");
 		assert!(err.to_string().contains("nickname not set"), "unexpected error: {err}");
-	}
-
-	#[test]
-	fn build_port_router_rejects_a_reserved_port() {
-		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(443, Arc::new(RawTcpHandler::new("127.0.0.1:9000")))];
-		// `PortRouter` is not `Debug` (it holds a `dyn StreamHandler`), so take the
-		// error via `.err()` rather than `expect_err`.
-		let err = build_port_router(handlers).err().expect("443 is reserved for the built-in HTTP handler");
-		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
-	}
-
-	#[test]
-	fn build_port_router_registers_valid_non_http_ports() {
-		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![
-			(9735, Arc::new(RawTcpHandler::new("127.0.0.1:9735"))),
-			(2222, Arc::new(RawTcpHandler::new("127.0.0.1:22"))),
-		];
-		let router = build_port_router(handlers).expect("9735 and 2222 are registerable");
-		assert_eq!(router.len(), 2);
-		assert!(router.contains_port(9735));
-		assert!(router.contains_port(2222));
-		// Dispatch routes the registered ports to a raw handler; an unregistered one
-		// is still rejected.
-		assert!(matches!(router.dispatch(9735, tls_policy::PlaintextPolicy::Upgrade), PortDispatch::Raw(_)));
-		assert!(matches!(router.dispatch(8080, tls_policy::PlaintextPolicy::Upgrade), PortDispatch::Reject));
 	}
 
 	#[test]

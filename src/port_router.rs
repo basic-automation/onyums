@@ -153,6 +153,25 @@ impl PortRouter {
 		Ok(())
 	}
 
+	/// Assemble a router from a builder's `route_port` registrations, surfacing the
+	/// first invalid registration (a reserved/zero port, or a duplicate).
+	///
+	/// The bulk form of [`register`](Self::register): it runs the same per-port
+	/// validation, so the whole thing fails offline — before any Tor launch — the moment
+	/// a single registration is bad. Backs `OnionServiceBuilder::serve`'s port-router
+	/// assembly, and is unit-testable with no live Tor network.
+	///
+	/// # Errors
+	/// Returns the first [`register`](Self::register) error (port `0`, a
+	/// [`RESERVED_HTTP_PORTS`] entry, or a duplicate port).
+	pub fn from_registrations(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<Self> {
+		let mut router = Self::new();
+		for (port, handler) in handlers {
+			router.register(port, handler)?;
+		}
+		Ok(router)
+	}
+
 	/// Whether any raw handler is registered (an empty router is the HTTP-only
 	/// default).
 	#[must_use]
@@ -289,5 +308,27 @@ mod tests {
 		let mut router = router;
 		router.register(9735, handler()).expect("register");
 		assert_eq!(format!("{:?}", router.dispatch(9735, PlaintextPolicy::Upgrade)), "Raw");
+	}
+
+	#[test]
+	fn from_registrations_rejects_a_reserved_port() {
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(443, handler())];
+		// `PortRouter` is not `Debug` (it holds a `dyn StreamHandler`), so take the
+		// error via `.err()` rather than `expect_err`.
+		let err = PortRouter::from_registrations(handlers).err().expect("443 is reserved for the built-in HTTP handler");
+		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
+	}
+
+	#[test]
+	fn from_registrations_registers_valid_non_http_ports() {
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(9735, handler()), (2222, handler())];
+		let router = PortRouter::from_registrations(handlers).expect("9735 and 2222 are registerable");
+		assert_eq!(router.len(), 2);
+		assert!(router.contains_port(9735));
+		assert!(router.contains_port(2222));
+		// Dispatch routes the registered ports to a raw handler; an unregistered one
+		// is still rejected.
+		assert!(matches!(router.dispatch(9735, PlaintextPolicy::Upgrade), PortDispatch::Raw(_)));
+		assert!(matches!(router.dispatch(8080, PlaintextPolicy::Upgrade), PortDispatch::Reject));
 	}
 }

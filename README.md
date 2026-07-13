@@ -78,6 +78,27 @@ CI-enforced MSRV is still on the roadmap.
 - **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity (typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers for per-circuit isolation); see [Websocket example](#websocket-example).
 - **Version-skew-proof arti** — the arti stack is re-exported (`onyums::arti_client`, `onyums::tor_hsservice`, `onyums::tor_hscrypto`, …) so downstreams use the exact versions onyums does, just like `axum`.
 
+## How onyums compares
+
+Onyums sits between "thin arti glue" and "a C-tor daemon behind a reverse proxy": a
+single embedded-Arti library that adds the TLS-first transport and Tor-native abuse
+defense you would otherwise assemble yourself.
+
+| | **onyums** | [arti-axum](https://github.com/jgraef/arti-axum) | [tor-hsrproxy](https://tpo.pages.torproject.net/core/arti/) (`arti hss`) | raw [Arti](https://gitlab.torproject.org/tpo/core/arti) (`arti-client` + `tor-hsservice`) | C-tor + nginx/Caddy |
+|---|---|---|---|---|---|
+| Serve an **axum app** | ✅ built-in | ✅ built-in | ⚠️ run your own server behind it | ⚠️ write the accept loop yourself | ⚠️ separate app server |
+| **Embedded** Tor (no external daemon) | ✅ Arti | ✅ Arti | ✅ Arti | ✅ Arti | ❌ external `tor` daemon |
+| **TLS-first** inside the circuit | ✅ auto self-signed / BYO / strict | ❌ | ❌ | ❌ (DIY) | ⚠️ proxy-configured |
+| **Abuse defense** (PoW · WAF · rate-limit) | ✅ Skin, on by default | ❌ | ❌ | ❌ | ⚠️ bolt-on proxy modules, not Tor-native |
+| **Restricted discovery** (v3 client auth) | ✅ `.authorized_clients(...)` | ❌ | ⚠️ via arti config | ⚠️ via arti config | ⚠️ via `tor` config |
+| **Raw-port / multi-protocol** routing | ✅ `.route_port(...)` | ❌ | ✅ (it *is* a port proxy) | ⚠️ DIY | ✅ separate services |
+| **Readiness / health / metrics** handle | ✅ `ready()` · `status()` · Prometheus | ❌ | ⚠️ operational, not in-process | ❌ | ⚠️ external monitoring |
+| Implementation | 100% Rust | 100% Rust | 100% Rust | 100% Rust | C + proxy |
+
+✅ built-in · ⚠️ possible but you assemble/operate it yourself · ❌ not provided.
+Reach for **raw Arti** when you want to build the stack yourself, **tor-hsrproxy** to
+front an existing local service with no app code, and **onyums** when you want the
+secure-by-default axum→onion path in one library.
 
 ## Hello world example
 

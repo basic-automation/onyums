@@ -21,11 +21,10 @@
 //! `no_run`: `serve` binds the live Tor network and runs until stopped, so the
 //! example is compiled and type-checked but never executed under `cargo test`.
 
-use std::{net::SocketAddr, sync::Mutex};
+use std::sync::Mutex;
 
 use anyhow::{bail, Result};
-use arti_client::{config::TorClientConfigBuilder, TorClient, TorClientConfig};
-use axum::extract::connect_info::Connected as AxumConnected;
+use arti_client::TorClient;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http_body_util::Empty;
@@ -37,9 +36,8 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{
-	config::{restricted_discovery::HsClientNickname, OnionServiceConfig, OnionServiceConfigBuilder}, HsNickname, RendRequest, RunningOnionService, StreamRequest
+	config::OnionServiceConfig, RendRequest, RunningOnionService, StreamRequest
 };
-use tor_hscrypto::pk::HsClientDescEncKey;
 use tor_proto::client::stream::IncomingStreamRequest;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use safelog::DisplayRedacted;
@@ -65,12 +63,23 @@ mod circuit_gate;
 mod client_auth;
 mod metrics;
 mod port_router;
+mod connection;
+mod http_stack;
 mod raw_tcp;
 mod provided_cert;
+mod service_config;
+mod status;
 mod tls_policy;
+mod tor_client;
 mod vanity;
 pub use address::OnionAddress;
+pub use connection::ConnectionInfo;
 pub use metrics::{fleet_prometheus, ServiceMetrics};
+pub use status::{ServiceHealth, ServiceProblem, ServiceProblemKind, ServiceStatus};
+use status::{await_status, project_service_problem, project_service_status};
+use http_stack::{build_serve_router, SkinChoice};
+use service_config::build_onion_service_config;
+use tor_client::{setup_tor_client, spawn_ephemeral_cleanup, storage_dirs};
 pub use client_auth::{provision_client, ClientAuthKeypair, ClientAuthKeypairError};
 pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeFuture, StreamHandler};
 pub use raw_tcp::RawTcpHandler;
@@ -84,178 +93,6 @@ use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
 	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
 };
-
-/// The default persistent onyums state directory — home of the Arti keystore that
-/// holds the onion service's v3 identity key, so the `.onion` address is stable
-/// across restarts (onyums ROADMAP Phase 1). Kept under `./tor/onyums` rather than
-/// arti's shared default so onyums never collides with a sibling arti instance.
-const PERSISTENT_STATE_DIR: &str = "./tor/onyums/state";
-/// The default onyums cache directory (disposable per arti's `/var/cache` rules).
-/// Shared by both the persistent and ephemeral identity modes: the cached network
-/// directory is not identity-bearing, so an ephemeral service reuses it to avoid
-/// re-downloading the consensus on every throwaway launch.
-const CACHE_DIR: &str = "./tor/onyums/cache";
-
-/// Resolve the `(state_dir, cache_dir)` pair for the chosen identity mode
-/// (onyums ROADMAP Phase 1).
-///
-/// Persistent (`ephemeral == false`, the default) returns the fixed
-/// [`PERSISTENT_STATE_DIR`], so the keystore — and therefore the `.onion` address —
-/// survives restarts. Ephemeral (`ephemeral == true`) returns a *unique*, throwaway
-/// state directory under the system temp dir, so each launch starts with an empty
-/// keystore, Arti generates a fresh identity key, and the service comes up on a new,
-/// disposable address that is never written to the persistent tree. The cache dir is
-/// [`CACHE_DIR`] in both modes (it holds no identity material).
-///
-/// This is a pure function so the directory logic is unit-testable with no live Tor
-/// network: the ephemeral path is distinct per call, the persistent path is stable.
-fn storage_dirs(ephemeral: bool) -> (String, String) {
-	if ephemeral {
-		// A unique per-launch suffix (pid + a CSPRNG draw) so two ephemeral services
-		// in one process — or successive restarts — never share a keystore and thus
-		// never reuse an address. The directory lives under the OS temp tree, outside
-		// the persistent `./tor/onyums` state.
-		let unique = format!("onyums-ephemeral-{}-{:016x}", std::process::id(), rand::random::<u64>());
-		let state_dir = std::env::temp_dir().join(unique);
-		(state_dir.to_string_lossy().into_owned(), CACHE_DIR.to_string())
-	} else {
-		(PERSISTENT_STATE_DIR.to_string(), CACHE_DIR.to_string())
-	}
-}
-
-/// Assemble a [`TorClientConfig`] for the given state/cache directories.
-///
-/// Extracted from [`setup_tor_client`] so the config assembly — the offline half of
-/// client setup — is unit-testable without bootstrapping the Tor network: `build`
-/// only validates and stores the directory paths (the dirs are created and the
-/// network reached later, at bootstrap).
-///
-/// # Errors
-/// Returns an error if Arti rejects the directory configuration.
-fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig> {
-	TorClientConfigBuilder::from_directories(state_dir, cache_dir)
-		.build()
-		.map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))
-}
-
-/// Sets up and bootstraps a Tor client for the given state/cache directories.
-///
-/// Uses onyums-specific state and cache directories (see [`storage_dirs`]) rather
-/// than arti's shared `TorClientConfig::default()` location. This keeps the cache
-/// from growing without bound across runs while staying isolated from any sibling
-/// arti instance on the machine (e.g. an artiqwest client using `./tor/arti`),
-/// avoiding a state-directory collision. For an ephemeral service the caller passes a
-/// throwaway temp directory so the service's identity does not persist.
-async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
-	event!(Level::INFO, "Creating Tor client...");
-	let config = tor_client_config(state_dir, cache_dir)?;
-	let runtime = TokioNativeTlsRuntime::current().map_err(|e| anyhow::anyhow!("Failed to get current tokio runtime: {e}"))?;
-	let client = TorClient::with_runtime(runtime);
-	client.config(config).create_bootstrapped().await.map_err(|e| anyhow::anyhow!("Failed to create bootstrapped Tor client: {e}"))
-}
-
-/// The unique prefix every ephemeral state directory carries (see [`storage_dirs`]).
-/// Cleanup ([`remove_ephemeral_state_dir`]) refuses to delete any directory whose
-/// name does not start with this, so a bug that mis-threads a path can never remove
-/// a persistent or unrelated directory.
-const EPHEMERAL_DIR_PREFIX: &str = "onyums-ephemeral-";
-
-/// Best-effort removal of an ephemeral service's throwaway state directory, so the
-/// disposable identity key does not linger on disk after the service stops
-/// (onyums ROADMAP Phase 1).
-///
-/// As a safety belt this only removes a directory whose final component starts with
-/// [`EPHEMERAL_DIR_PREFIX`] — the exact shape [`storage_dirs`] mints — so it can
-/// never delete the persistent `./tor/onyums/state` tree or any unrelated path even
-/// if a wrong path is threaded in. A missing directory is a no-op; a removal failure
-/// (e.g. arti still holds a file open on Windows) is logged, not fatal — the OS
-/// reclaims the temp tree regardless.
-fn remove_ephemeral_state_dir(dir: &std::path::Path) {
-	let is_ephemeral = dir.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(EPHEMERAL_DIR_PREFIX));
-	if !is_ephemeral {
-		event!(Level::WARN, "refusing to remove non-ephemeral state dir {dir:?}");
-		return;
-	}
-	match std::fs::remove_dir_all(dir) {
-		Ok(()) => event!(Level::INFO, "removed ephemeral state dir {dir:?}"),
-		Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-		Err(e) => event!(Level::WARN, "failed to remove ephemeral state dir {dir:?}: {e}"),
-	}
-}
-
-/// Remove an ephemeral state dir *off* the async runtime (onyums ROADMAP Phase 0 —
-/// replace synchronous `Drop` cleanup).
-///
-/// [`remove_ephemeral_state_dir`] calls the blocking [`std::fs::remove_dir_all`]; running
-/// it directly in [`OnionServiceHandle::drop`] stalls a tokio worker. When a runtime is
-/// in scope this offloads the removal to the blocking pool and returns the
-/// `spawn_blocking` handle, so an async caller ([`OnionServiceHandle::shutdown`]) can
-/// await completion while [`Drop`] drops the handle and lets the task finish detached.
-/// With no runtime there is nothing to stall, so the removal runs inline and the
-/// function returns `None`.
-fn spawn_ephemeral_cleanup(dir: std::path::PathBuf) -> Option<JoinHandle<()>> {
-	if let Ok(handle) = tokio::runtime::Handle::try_current() {
-		Some(handle.spawn_blocking(move || remove_ephemeral_state_dir(&dir)))
-	} else {
-		remove_ephemeral_state_dir(&dir);
-		None
-	}
-}
-
-/// Apply a caller's authorized-clients allowlist to an [`OnionServiceConfigBuilder`]
-/// as Arti v3 restricted discovery (onyums ROADMAP Phase 2).
-///
-/// Restricted discovery encrypts the service descriptor (its introduction points and
-/// keys) to the listed clients' x25519 keys, so an unlisted client cannot even
-/// *discover* the service — a DoS-resistance measure enforced in descriptor crypto,
-/// upstream of every Skin HTTP layer. The allowlist is [`onyums_skin::RestrictedDiscovery`]
-/// (the orchestration half built in the skin crate); each entry's canonical
-/// `descriptor:x25519:<BASE32>` rendering is parsed straight into Arti's
-/// [`HsClientDescEncKey`], and each nickname into an [`HsClientNickname`] slug.
-///
-/// An empty allowlist is rejected: enabling restricted discovery with no authorized
-/// clients would hide the service from *everyone* (and Arti's own config validation
-/// rejects it too). Surfaced here so it fails offline, before any Tor bootstrap.
-///
-/// # Errors
-/// Returns an error if the allowlist is empty, a nickname is not a valid Tor client
-/// slug, or a key fails to parse into Arti's descriptor-encryption key type.
-fn apply_restricted_discovery(cfg: &mut OnionServiceConfigBuilder, allowlist: &RestrictedDiscovery) -> Result<()> {
-	if allowlist.is_empty() {
-		bail!("authorized_clients allowlist is empty: enabling restricted discovery with no clients would hide the service from everyone. Add at least one client key, or drop authorized_clients() to stay publicly discoverable");
-	}
-	let rd = cfg.restricted_discovery();
-	rd.enabled(true);
-	for (nickname, key) in allowlist.iter() {
-		let parsed_nickname = nickname.parse::<HsClientNickname>().map_err(|e| anyhow::anyhow!("invalid restricted-discovery client nickname {nickname:?}: {e}"))?;
-		// `ClientAuthKey`'s `Display` is the canonical `descriptor:x25519:<BASE32>` line,
-		// which is exactly what Arti's `HsClientDescEncKey` parses (case-insensitively).
-		let parsed_key = key.to_string().parse::<HsClientDescEncKey>().map_err(|e| anyhow::anyhow!("invalid restricted-discovery key for client {nickname:?}: {e}"))?;
-		rd.static_keys().access().push((parsed_nickname, parsed_key));
-	}
-	Ok(())
-}
-
-/// Build the [`OnionServiceConfig`] for `nickname`, applying restricted discovery if
-/// the caller supplied an authorized-clients allowlist.
-///
-/// Everything here is offline: the nickname parse, the restricted-discovery assembly,
-/// and Arti's own config validation all run before any Tor bootstrap, so a bad
-/// nickname or allowlist fails fast rather than after the network round-trip. Extracted
-/// from the launch path so it is unit-testable with no live Tor network.
-///
-/// # Errors
-/// Returns an error if the nickname fails to parse, the restricted-discovery allowlist
-/// is invalid (see [`apply_restricted_discovery`]), or the config fails to build.
-fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedDiscovery>) -> Result<OnionServiceConfig> {
-	let nickname = nickname.parse::<HsNickname>().map_err(|e| anyhow::anyhow!("Failed to parse nickname: {e}"))?;
-	let mut cfg = OnionServiceConfigBuilder::default();
-	cfg.nickname(nickname);
-	if let Some(allowlist) = allowlist {
-		apply_restricted_discovery(&mut cfg, allowlist)?;
-	}
-	cfg.build().map_err(|e| anyhow::anyhow!("Failed to build onion service config: {e}"))
-}
 
 /// Launches an onion service from an already-built [`OnionServiceConfig`].
 ///
@@ -406,360 +243,6 @@ fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: 
 	Ok((service, address, request_stream))
 }
 
-/// A stable, high-level snapshot of an onion service's reachability
-/// (onyums ROADMAP Phase 4 — observability).
-///
-/// This is onyums' own projection of arti's `#[non_exhaustive]`
-/// [`tor_hsservice::status::State`], the same way [`OnionAddress`] and
-/// [`ConnectionInfo`] are typed projections of arti primitives: downstreams match on
-/// this exhaustively without a wildcard and without breaking when arti adds a state,
-/// and read reachability through [`is_reachable`](Self::is_reachable) rather than
-/// re-deriving arti's `is_fully_reachable` semantics. Read the current value from a
-/// running service via [`OnionServiceHandle::status`].
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServiceStatus {
-	/// Not launched, or shut down. Not reachable.
-	Shutdown,
-	/// Building introduction points and publishing the descriptor; no significant
-	/// problems yet, but not yet reachable. This is the state a freshly launched
-	/// service passes through before [`OnionServiceHandle::ready`] resolves.
-	Bootstrapping,
-	/// Believed fully reachable: satisfied with its introduction points and its
-	/// descriptor is up to date.
-	Reachable,
-	/// Reachable, but running degraded — fewer or less-satisfactory introduction
-	/// points than desired, though the descriptor is current.
-	DegradedReachable,
-	/// Running but unlikely to be reachable right now — recovering from a dead intro
-	/// point, a failed descriptor upload, or a similar transient problem.
-	Unreachable,
-	/// A problem onyums could not recover from. Not fully reachable.
-	Broken,
-}
-
-impl ServiceStatus {
-	/// Whether the service is *believed* to be reachable by clients.
-	///
-	/// Mirrors arti's `State::is_fully_reachable`: true for [`Reachable`](Self::Reachable)
-	/// and [`DegradedReachable`](Self::DegradedReachable). Like arti's, this is a
-	/// one-directional implication — `false` does not prove unreachability.
-	#[must_use]
-	pub const fn is_reachable(self) -> bool {
-		matches!(self, Self::Reachable | Self::DegradedReachable)
-	}
-
-	/// Whether the service is running reachable but *degraded* — up, with a current
-	/// descriptor, but fewer or less-satisfactory introduction points than desired.
-	///
-	/// A subset of [`is_reachable`](Self::is_reachable): a degraded service still
-	/// serves clients, but an operator may want to alarm on it.
-	#[must_use]
-	pub const fn is_degraded(self) -> bool {
-		matches!(self, Self::DegradedReachable)
-	}
-
-	/// Whether the service hit a problem onyums could not recover from
-	/// ([`Broken`](Self::Broken)) — distinct from the transient
-	/// [`Unreachable`](Self::Unreachable), which is expected to recover on its own.
-	#[must_use]
-	pub const fn is_broken(self) -> bool {
-		matches!(self, Self::Broken)
-	}
-
-	/// Whether this is a *settled* status the service will not leave on its own:
-	/// [`Shutdown`](Self::Shutdown) (stopped) or [`Broken`](Self::Broken) (unrecoverable).
-	///
-	/// The complement of the states a service passes through or recovers from —
-	/// [`Bootstrapping`](Self::Bootstrapping), [`Unreachable`](Self::Unreachable), and the
-	/// reachable states — so a caller watching the lifecycle knows when further waiting
-	/// is pointless. See [`OnionServiceHandle::wait_until_settled`], which resolves once
-	/// the service is either reachable or terminal.
-	#[must_use]
-	pub const fn is_terminal(self) -> bool {
-		matches!(self, Self::Shutdown | Self::Broken)
-	}
-
-	/// A short, stable, lowercase operator-facing label for this status — suitable for a
-	/// health line or a `/up`-style check. Never changes for a given variant, so it is
-	/// safe to match on downstream.
-	#[must_use]
-	pub const fn label(self) -> &'static str {
-		match self {
-			Self::Shutdown => "shutdown",
-			Self::Bootstrapping => "bootstrapping",
-			Self::Reachable => "reachable",
-			Self::DegradedReachable => "degraded",
-			Self::Unreachable => "unreachable",
-			Self::Broken => "broken",
-		}
-	}
-
-	/// Operational severity rank — `0` is healthiest ([`Reachable`](Self::Reachable)),
-	/// higher is worse. Ranks a reachable service healthiest, a degraded-but-reachable
-	/// one next, then the not-yet/again-reachable transients
-	/// ([`Bootstrapping`](Self::Bootstrapping) before [`Unreachable`](Self::Unreachable)),
-	/// then the terminal [`Broken`](Self::Broken) and [`Shutdown`](Self::Shutdown). Total
-	/// and distinct across variants; backs [`worst_of`](Self::worst_of).
-	const fn severity(self) -> u8 {
-		match self {
-			Self::Reachable => 0,
-			Self::DegradedReachable => 1,
-			Self::Bootstrapping => 2,
-			Self::Unreachable => 3,
-			Self::Broken => 4,
-			Self::Shutdown => 5,
-		}
-	}
-
-	/// The worst (least healthy) status across several services — the aggregate health
-	/// of, say, N onion services sharing one Tor client (see
-	/// [`OnionServiceBuilder::tor_client`]). Returns `None` for an empty iterator.
-	///
-	/// Folds by [`severity`](Self::severity), so a single unhealthy service in a fleet is
-	/// never masked by its healthy siblings: `worst_of([Reachable, Broken])` is
-	/// [`Broken`](Self::Broken).
-	#[must_use]
-	pub fn worst_of(statuses: impl IntoIterator<Item = Self>) -> Option<Self> {
-		statuses.into_iter().max_by_key(|status| status.severity())
-	}
-}
-
-impl std::fmt::Display for ServiceStatus {
-	/// Writes the stable [`label`](Self::label), so `ServiceStatus` drops straight into a
-	/// log line or a health response.
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		f.write_str(self.label())
-	}
-}
-
-/// Project arti's `#[non_exhaustive]` onion-service [`State`](tor_hsservice::status::State)
-/// onto onyums' stable [`ServiceStatus`].
-///
-/// An unrecognized future arti state is conservatively reported as
-/// [`ServiceStatus::Unreachable`] — onyums never claims reachability for a state it
-/// does not understand. Pure and total, so it is unit-testable against every arti
-/// state with no live Tor network.
-fn project_service_status(state: tor_hsservice::status::State) -> ServiceStatus {
-	use tor_hsservice::status::State;
-	match state {
-		State::Shutdown => ServiceStatus::Shutdown,
-		State::Bootstrapping => ServiceStatus::Bootstrapping,
-		State::Running => ServiceStatus::Reachable,
-		State::DegradedReachable => ServiceStatus::DegradedReachable,
-		State::DegradedUnreachable | State::Recovering => ServiceStatus::Unreachable,
-		State::Broken => ServiceStatus::Broken,
-		// `State` is `#[non_exhaustive]`; treat any state arti adds later as
-		// not-reachable until onyums maps it explicitly.
-		_ => ServiceStatus::Unreachable,
-	}
-}
-
-/// The stable *category* of a [`ServiceProblem`], with the owned diagnostic detail
-/// stripped.
-///
-/// A `Copy` discriminant a downstream can match on exhaustively and store cheaply, the
-/// way [`ServiceStatus`] is matched (onyums ROADMAP Phase 4).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ServiceProblemKind {
-	/// A fatal runtime error — see [`ServiceProblem::Runtime`].
-	Runtime,
-	/// A descriptor-upload failure — see [`ServiceProblem::DescriptorUpload`].
-	DescriptorUpload,
-	/// An introduction-point failure — see [`ServiceProblem::IntroductionPoint`].
-	IntroductionPoint,
-	/// An unmodelled subsystem — see [`ServiceProblem::Other`].
-	Other,
-}
-
-impl ServiceProblemKind {
-	/// A short, stable, lowercase label for this category — safe to match on downstream
-	/// (a health line or an alert rule) because it never changes for a given variant.
-	#[must_use]
-	pub const fn label(self) -> &'static str {
-		match self {
-			Self::Runtime => "runtime",
-			Self::DescriptorUpload => "descriptor-upload",
-			Self::IntroductionPoint => "introduction-point",
-			Self::Other => "other",
-		}
-	}
-}
-
-/// The reason a service is running degraded, unreachable, or broken — onyums' stable
-/// projection of arti's `#[non_exhaustive]` [`Problem`](tor_hsservice::status::Problem).
-///
-/// This is the "why" behind a non-[`Reachable`](ServiceStatus::Reachable)
-/// [`ServiceStatus`] (onyums ROADMAP Phase 4 — observability).
-///
-/// arti's `Problem` is `#[non_exhaustive]` and — unlike its `State` — carries **no
-/// `Display`** (only `Debug`) in the pinned 0.43 source, so it cannot be surfaced to
-/// operators cleanly as-is. This is onyums' typed projection, the same pattern as
-/// [`ServiceStatus`]: downstreams match on the stable [`kind`](Self::kind) without a
-/// wildcard, and read the operator-facing diagnostic through [`detail`](Self::detail)
-/// or [`Display`](std::fmt::Display). Read the current value from a running service via
-/// [`OnionServiceHandle::problem`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ServiceProblem {
-	/// A fatal runtime error the service could not recover from — the reason behind a
-	/// [`Broken`](ServiceStatus::Broken) status. Carries arti's `Debug` diagnostic.
-	Runtime(String),
-	/// One or more onion-service descriptor uploads failed, so clients may be unable to
-	/// find the service until a later upload succeeds.
-	DescriptorUpload(String),
-	/// One or more introduction points could not be established — the usual reason a
-	/// service reads [`Unreachable`](ServiceStatus::Unreachable) or
-	/// [`DegradedReachable`](ServiceStatus::DegradedReachable).
-	IntroductionPoint(String),
-	/// A problem in a subsystem onyums does not model explicitly: arti's `PoW` manager
-	/// (only compiled with the experimental `hs-pow-full` feature), or a category a
-	/// newer arti adds to its `#[non_exhaustive]` `Problem`. The diagnostic still
-	/// carries arti's `Debug` rendering, so the cause is never silently dropped.
-	Other(String),
-}
-
-impl ServiceProblem {
-	/// The stable [`ServiceProblemKind`] of this problem — safe to match on downstream,
-	/// unlike the owned diagnostic [`detail`](Self::detail) string.
-	#[must_use]
-	pub const fn kind(&self) -> ServiceProblemKind {
-		match self {
-			Self::Runtime(_) => ServiceProblemKind::Runtime,
-			Self::DescriptorUpload(_) => ServiceProblemKind::DescriptorUpload,
-			Self::IntroductionPoint(_) => ServiceProblemKind::IntroductionPoint,
-			Self::Other(_) => ServiceProblemKind::Other,
-		}
-	}
-
-	/// The operator-facing diagnostic detail — arti's `Debug` rendering of the
-	/// underlying problem, since arti's `Problem` exposes no `Display`.
-	#[must_use]
-	pub fn detail(&self) -> &str {
-		match self {
-			Self::Runtime(d) | Self::DescriptorUpload(d) | Self::IntroductionPoint(d) | Self::Other(d) => d,
-		}
-	}
-
-	/// A short, stable, lowercase label for this problem's category — the
-	/// [`kind`](Self::kind)'s [`label`](ServiceProblemKind::label).
-	#[must_use]
-	pub const fn label(&self) -> &'static str {
-		self.kind().label()
-	}
-
-	/// Whether this is a *fatal* problem the service will not recover from on its own — a
-	/// [`Runtime`](Self::Runtime) error, which drives arti to
-	/// [`Broken`](ServiceStatus::Broken) — as opposed to the transient descriptor-upload
-	/// and introduction-point problems arti retries.
-	#[must_use]
-	pub const fn is_fatal(&self) -> bool {
-		matches!(self, Self::Runtime(_))
-	}
-}
-
-impl std::fmt::Display for ServiceProblem {
-	/// Writes `"<label>: <detail>"` — the stable category plus arti's diagnostic — so a
-	/// `ServiceProblem` drops straight into a log line or a degraded-health response.
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		write!(f, "{}: {}", self.label(), self.detail())
-	}
-}
-
-/// Project arti's `#[non_exhaustive]` [`Problem`](tor_hsservice::status::Problem) onto
-/// onyums' stable [`ServiceProblem`], capturing arti's `Debug` rendering as the
-/// operator-facing [`detail`](ServiceProblem::detail) (arti exposes no `Display` on
-/// `Problem` or its inner errors). Keys only on the variant, so it is unit-testable
-/// offline over a constructed `Problem` with no live Tor network. A subsystem onyums
-/// does not model — the feature-gated `PoW` manager, or any category a newer arti adds —
-/// maps to [`ServiceProblem::Other`] rather than being dropped.
-fn project_service_problem(problem: &tor_hsservice::status::Problem) -> ServiceProblem {
-	use tor_hsservice::status::Problem;
-	match problem {
-		Problem::Runtime(e) => ServiceProblem::Runtime(format!("{e:?}")),
-		Problem::DescriptorUpload(errs) => ServiceProblem::DescriptorUpload(format!("{errs:?}")),
-		Problem::Ipt(errs) => ServiceProblem::IntroductionPoint(format!("{errs:?}")),
-		// `Problem` is `#[non_exhaustive]`; the PoW variant (feature-gated off) and any
-		// future arti category fall here rather than being silently dropped.
-		_ => ServiceProblem::Other(format!("{problem:?}")),
-	}
-}
-
-/// A consistent point-in-time health snapshot of an onion service (onyums ROADMAP
-/// Phase 4 — observability).
-///
-/// Bundles the [`ServiceStatus`] and, when the service is not fully healthy, the
-/// [`ServiceProblem`] explaining why. Read via [`OnionServiceHandle::health`]. The value is derived from a **single** read
-/// of arti's status, so the `status` and `problem` are always mutually consistent —
-/// unlike calling [`status`](OnionServiceHandle::status) and
-/// [`problem`](OnionServiceHandle::problem) separately, which reads arti twice and can
-/// straddle a state transition (e.g. read `Reachable` then a just-arrived problem).
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct ServiceHealth {
-	status: ServiceStatus,
-	problem: Option<ServiceProblem>,
-}
-
-impl ServiceHealth {
-	/// The reachability [`ServiceStatus`] at the moment of the snapshot.
-	#[must_use]
-	pub const fn status(&self) -> ServiceStatus {
-		self.status
-	}
-
-	/// The active [`ServiceProblem`] explaining a non-healthy status, or `None` when the
-	/// service reported no problem at the moment of the snapshot.
-	#[must_use]
-	pub const fn problem(&self) -> Option<&ServiceProblem> {
-		self.problem.as_ref()
-	}
-
-	/// Whether the service was believed reachable — the snapshot's
-	/// [`ServiceStatus::is_reachable`].
-	#[must_use]
-	pub const fn is_reachable(&self) -> bool {
-		self.status.is_reachable()
-	}
-
-	/// Whether the service was *fully* healthy: reachable **and** reporting no active
-	/// problem. Stricter than [`is_reachable`](Self::is_reachable), which is still true
-	/// for a [`DegradedReachable`](ServiceStatus::DegradedReachable) service carrying a
-	/// problem — this is the "all green" check for a `/up`-style endpoint.
-	#[must_use]
-	pub const fn is_healthy(&self) -> bool {
-		self.status.is_reachable() && self.problem.is_none()
-	}
-}
-
-impl std::fmt::Display for ServiceHealth {
-	/// Writes the [`ServiceStatus`] label, and — when a problem is present — the
-	/// [`ServiceProblem`] after an em dash, e.g. `"unreachable — introduction-point: []"`
-	/// or just `"reachable"`.
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match &self.problem {
-			Some(problem) => write!(f, "{} — {problem}", self.status),
-			None => std::fmt::Display::fmt(&self.status, f),
-		}
-	}
-}
-
-/// Drive a [`ServiceStatus`] stream until the first item satisfying `pred`, returning
-/// that status — or `None` if the stream ends first (the underlying service was
-/// dropped before the condition was met).
-///
-/// Extracted from [`OnionServiceHandle::ready`] and its timeout/settle siblings so the
-/// wait logic is unit-testable offline over a constructed stream, with no live Tor
-/// service (the projection that feeds it is already covered by
-/// `service_status_projects_every_arti_state`). Takes the stream by value and pins it
-/// internally, so callers hand `status_events()` straight in without an `Unpin` bound.
-async fn await_status(events: impl Stream<Item = ServiceStatus>, mut pred: impl FnMut(ServiceStatus) -> bool) -> Option<ServiceStatus> {
-	futures::pin_mut!(events);
-	while let Some(status) = events.next().await {
-		if pred(status) {
-			return Some(status);
-		}
-	}
-	None
-}
-
 /// A running onion service plus its controls.
 ///
 /// Returned by [`OnionServiceBuilder::serve`]. The accept loop runs on a spawned
@@ -885,10 +368,7 @@ impl OnionServiceHandle {
 	#[must_use]
 	pub fn health(&self) -> ServiceHealth {
 		let raw = self.service.status();
-		ServiceHealth {
-			status: project_service_status(raw.state()),
-			problem: raw.current_problem().map(project_service_problem),
-		}
+		ServiceHealth::new(project_service_status(raw.state()), raw.current_problem().map(project_service_problem))
 	}
 
 	/// A snapshot of this service's cumulative circuit/stream counters — a
@@ -1038,76 +518,6 @@ impl Drop for OnionServiceHandle {
 			let _ = spawn_ephemeral_cleanup(dir);
 		}
 	}
-}
-
-/// How the onyums-skin abuse-defense gate is applied to the served router.
-///
-/// Secure by default: with no explicit choice, the secure-default Skin gate is
-/// on. You opt *down* (`no_skin`) or *across* (a custom [`Skin`]), never *up*.
-#[derive(Default)]
-enum SkinChoice {
-	/// Apply [`Skin::secure_default`] — the frontier secure-by-default posture.
-	#[default]
-	Default,
-	/// Apply a caller-supplied gate. Boxed: a `Skin` is much larger than the unit
-	/// variants.
-	Custom(Box<Skin>),
-	/// No Skin gate — an explicit opt-down.
-	Disabled,
-}
-
-/// Apply the chosen Skin gate to the router. Extracted from `serve` so the gate
-/// wiring is testable with `tower::ServiceExt::oneshot` and no live Tor network.
-fn apply_skin(app: Router, skin: SkinChoice) -> Router {
-	match skin {
-		SkinChoice::Default => app.layer(Skin::secure_default().into_layer()),
-		SkinChoice::Custom(skin) => app.layer((*skin).into_layer()),
-		SkinChoice::Disabled => app,
-	}
-}
-
-/// Add the HSTS response header to every served response when the plaintext
-/// policy enforces it ([`tls_policy::PlaintextPolicy::Reject`]), so a conforming
-/// client never silently downgrades from HTTPS. A no-op when plaintext is merely
-/// upgraded.
-///
-/// Like [`apply_skin`], this is a plain `Router` transform so it is testable with
-/// `tower::ServiceExt::oneshot` and no live Tor network.
-fn apply_hsts(app: Router, plaintext: tls_policy::PlaintextPolicy) -> Router {
-	match tls_policy::hsts_header(plaintext) {
-		Some((name, value)) => app.layer(axum::middleware::map_response(move |mut response: axum::response::Response| async move {
-			response.headers_mut().insert(axum::http::HeaderName::from_static(name), axum::http::HeaderValue::from_static(value));
-			response
-		})),
-		None => app,
-	}
-}
-
-/// Assemble the application-facing HTTP stack exactly as [`OnionServiceBuilder::serve`]
-/// layers it: the Skin abuse-defense gate (Phase 2) wrapping the caller's app, then the
-/// HSTS response header under a plaintext-reject TLS policy (Phase 3). This is the full
-/// request path a client hits *inside* the onion-encrypted TLS stream, minus the TLS
-/// transport itself.
-///
-/// Extracted from `serve` so the *composed* stack — not just its two halves in isolation
-/// ([`apply_skin`] / [`apply_hsts`]) — is testable end-to-end with
-/// `tower::ServiceExt::oneshot` and no live Tor network. First slice of an
-/// in-process/loopback test mode (cross-cutting roadmap item).
-fn build_serve_router(app: Router, skin: SkinChoice, plaintext: tls_policy::PlaintextPolicy) -> Router {
-	apply_hsts(apply_skin(app, skin), plaintext)
-}
-
-/// Assemble a [`PortRouter`] from the builder's `route_port` registrations,
-/// surfacing the first invalid registration (reserved/zero port, or a duplicate).
-///
-/// Extracted from `serve` so the registration validation is unit-testable with no
-/// live Tor network.
-fn build_port_router(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<PortRouter> {
-	let mut router = PortRouter::new();
-	for (port, handler) in handlers {
-		router.register(port, handler)?;
-	}
-	Ok(router)
 }
 
 /// Resolve the per-rendezvous-circuit [`CircuitPolicy`] from the builder's choices.
@@ -1410,7 +820,7 @@ impl OnionServiceBuilder {
 		// bootstrap) so a bad registration — a reserved/zero port, or a duplicate —
 		// fails offline rather than at the first circuit. An empty router reproduces
 		// today's HTTP-only behaviour.
-		let port_router = Arc::new(build_port_router(self.raw_handlers)?);
+		let port_router = Arc::new(PortRouter::from_registrations(self.raw_handlers)?);
 
 		// Insert the onyums-skin gate ahead of the application on the HTTP path
 		// (Phase 2 Skin integration) + Phase 3 TLS-first HSTS. Derive the pure, `Copy`
@@ -1590,64 +1000,6 @@ async fn handle_http_redirect(stream_request: StreamRequest, requested_host: Str
 	hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).http1_only().serve_connection(stream, hyper_service).await.map_err(|err| anyhow::anyhow!("Error serving HTTP redirect: {err}"))
 }
 
-/// Per-connection identity threaded to the application via axum's connect-info
-/// extractor.
-///
-/// Over Tor there is no client IP, so [`socket_addr`](Self::socket_addr) is always
-/// `None`; the meaningful identity is [`circuit_id`](Self::circuit_id) — the host-assigned
-/// id of the rendezvous circuit the request arrived on. Two requests sharing a
-/// `circuit_id` came over the same circuit (the closest Tor analogue to "same client
-/// connection"), which is the handle for per-circuit isolation of application state. Use
-/// the typed helpers ([`is_over_tor`](Self::is_over_tor), [`circuit`](Self::circuit),
-/// [`same_circuit`](Self::same_circuit)) rather than matching on the raw fields.
-#[derive(Clone, Debug, Default)]
-pub struct ConnectionInfo {
-	pub circuit_id: Option<String>,
-	pub socket_addr: Option<SocketAddr>,
-}
-
-impl ConnectionInfo {
-	/// Whether this connection arrived over a Tor rendezvous circuit — i.e. a
-	/// [`circuit_id`](Self::circuit_id) is known. Always true for onion-served requests;
-	/// `false` only for a default/synthetic `ConnectionInfo` (e.g. a request-level test).
-	#[must_use]
-	pub const fn is_over_tor(&self) -> bool {
-		self.circuit_id.is_some()
-	}
-
-	/// The per-rendezvous-circuit identifier, if known — the key for isolating
-	/// application state per Tor circuit.
-	#[must_use]
-	pub fn circuit(&self) -> Option<&str> {
-		self.circuit_id.as_deref()
-	}
-
-	/// Whether `self` and `other` came over the *same* known rendezvous circuit.
-	///
-	/// Returns `false` if either side's circuit is unknown — an unknown circuit is never
-	/// treated as matching, so this is safe to gate circuit-isolation decisions on.
-	#[must_use]
-	pub fn same_circuit(&self, other: &Self) -> bool {
-		matches!((self.circuit(), other.circuit()), (Some(a), Some(b)) if a == b)
-	}
-}
-
-impl AxumConnected<Request<Incoming>> for ConnectionInfo {
-	fn connect_info(target: Request<Incoming>) -> Self {
-		// onyums' serve path injects the per-connection `ConnectionInfo` as a request
-		// extension; if it is somehow absent, fall back to an empty (non-Tor) info rather
-		// than panicking the connection task.
-		target.extensions().get::<Self>().cloned().unwrap_or_default()
-	}
-}
-
-impl AxumConnected<Self> for ConnectionInfo {
-	fn connect_info(target: Self) -> Self {
-		target
-	}
-}
-
-// Move tls_acceptor function up, before serve
 fn tls_acceptor(address: &OnionAddress, tls: &Tls) -> Result<TlsAcceptor> {
 	// Phase 3 bring-your-own cert: `Tls::Provided` serves the caller-supplied,
 	// already-validated config (parsed once in `ProvidedCert::from_pem`); every
@@ -1732,25 +1084,6 @@ mod tests {
 
 	use super::*;
 
-	#[tokio::test]
-	async fn strict_tls_adds_hsts_header() {
-		use tower::ServiceExt as _;
-
-		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Strict.plaintext_policy());
-		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
-		let hsts = response.headers().get("strict-transport-security").expect("strict mode must emit HSTS");
-		assert_eq!(hsts, "max-age=63072000; includeSubDomains");
-	}
-
-	#[tokio::test]
-	async fn upgrade_tls_omits_hsts_header() {
-		use tower::ServiceExt as _;
-
-		let app = apply_hsts(Router::new().route("/", get(|| async { "ok" })), Tls::Upgrade.plaintext_policy());
-		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
-		assert!(response.headers().get("strict-transport-security").is_none(), "upgrade mode must not emit HSTS");
-	}
-
 	#[test]
 	fn builder_defaults_to_upgrade_tls() {
 		let builder = OnionServiceBuilder::default();
@@ -1780,32 +1113,6 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn no_skin_passes_requests_through() {
-		use tower::ServiceExt as _;
-
-		let app = apply_skin(Router::new().route("/", get(|| async { "ok" })), SkinChoice::Disabled);
-		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
-		assert_eq!(response.status(), StatusCode::OK);
-	}
-
-	#[tokio::test]
-	async fn default_skin_gates_uncleared_requests() {
-		use http_body_util::BodyExt as _;
-		use tower::ServiceExt as _;
-
-		// An uncleared request must be intercepted by the gate and never reach the
-		// app. The secure-default gate answers with the PoW interstitial (a 200 HTML
-		// challenge page), so we assert on the body, not the status: the app's
-		// "secret" must not leak, and the challenge page must be served instead.
-		let app = apply_skin(Router::new().route("/", get(|| async { "secret" })), SkinChoice::Default);
-		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
-		let body = response.into_body().collect().await.unwrap().to_bytes();
-		let body = String::from_utf8_lossy(&body);
-		assert!(!body.contains("secret"), "the gated app response must not leak");
-		assert!(body.contains("Checking your connection"), "the challenge interstitial should be served, got: {body}");
-	}
-
-	#[tokio::test]
 	async fn builder_rejects_missing_router() {
 		// Validation happens before any Tor bootstrap, so this needs no network.
 		let result = OnionService::builder().nickname("no_router").serve().await;
@@ -1819,31 +1126,6 @@ mod tests {
 		let result = OnionService::builder().router(app).serve().await;
 		let err = result.err().expect("missing nickname should error");
 		assert!(err.to_string().contains("nickname not set"), "unexpected error: {err}");
-	}
-
-	#[test]
-	fn build_port_router_rejects_a_reserved_port() {
-		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(443, Arc::new(RawTcpHandler::new("127.0.0.1:9000")))];
-		// `PortRouter` is not `Debug` (it holds a `dyn StreamHandler`), so take the
-		// error via `.err()` rather than `expect_err`.
-		let err = build_port_router(handlers).err().expect("443 is reserved for the built-in HTTP handler");
-		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
-	}
-
-	#[test]
-	fn build_port_router_registers_valid_non_http_ports() {
-		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![
-			(9735, Arc::new(RawTcpHandler::new("127.0.0.1:9735"))),
-			(2222, Arc::new(RawTcpHandler::new("127.0.0.1:22"))),
-		];
-		let router = build_port_router(handlers).expect("9735 and 2222 are registerable");
-		assert_eq!(router.len(), 2);
-		assert!(router.contains_port(9735));
-		assert!(router.contains_port(2222));
-		// Dispatch routes the registered ports to a raw handler; an unregistered one
-		// is still rejected.
-		assert!(matches!(router.dispatch(9735, tls_policy::PlaintextPolicy::Upgrade), PortDispatch::Raw(_)));
-		assert!(matches!(router.dispatch(8080, tls_policy::PlaintextPolicy::Upgrade), PortDispatch::Reject));
 	}
 
 	#[test]
@@ -1871,115 +1153,6 @@ mod tests {
 		let result = OnionService::builder().router(app).nickname("raw_reserved").route_port(443, RawTcpHandler::new("127.0.0.1:9000")).serve().await;
 		let err = result.err().expect("a reserved-port registration should error");
 		assert!(err.to_string().contains("reserved"), "unexpected error: {err}");
-	}
-
-	#[test]
-	fn storage_dirs_persistent_are_the_fixed_onyums_paths() {
-		// The default (persistent) identity mode always resolves to the stable
-		// onyums directories, so the keystore — and thus the address — survives
-		// restarts. Two calls are identical.
-		let (state, cache) = storage_dirs(false);
-		assert_eq!(state, PERSISTENT_STATE_DIR);
-		assert_eq!(cache, CACHE_DIR);
-		let (state2, cache2) = storage_dirs(false);
-		assert_eq!((state, cache), (state2, cache2), "persistent dirs must be stable across calls");
-	}
-
-	#[test]
-	fn storage_dirs_ephemeral_are_unique_and_under_temp() {
-		// An ephemeral service must never reuse a keystore: each call yields a
-		// distinct state dir, located under the OS temp tree and outside the
-		// persistent `./tor/onyums` state. The disposable cache is still shared.
-		let (state_a, cache_a) = storage_dirs(true);
-		let (state_b, _cache_b) = storage_dirs(true);
-		assert_ne!(state_a, state_b, "two ephemeral launches must not share a keystore dir");
-		assert_ne!(state_a, PERSISTENT_STATE_DIR, "ephemeral state must not be the persistent tree");
-		let temp = std::env::temp_dir().to_string_lossy().into_owned();
-		assert!(state_a.starts_with(&temp), "ephemeral state {state_a} should live under the temp dir {temp}");
-		assert_eq!(cache_a, CACHE_DIR, "the disposable cache is shared across modes");
-	}
-
-	#[test]
-	fn tor_client_config_builds_offline_for_both_modes() {
-		// Config assembly is the offline half of client setup: it must build for
-		// both the persistent and ephemeral directory choices with no live Tor
-		// network (the dirs are only touched later, at bootstrap).
-		let (state, cache) = storage_dirs(false);
-		tor_client_config(&state, &cache).expect("persistent client config builds offline");
-		let (state, cache) = storage_dirs(true);
-		tor_client_config(&state, &cache).expect("ephemeral client config builds offline");
-	}
-
-	#[test]
-	fn remove_ephemeral_state_dir_removes_our_throwaway_dir() {
-		// A directory shaped like one `storage_dirs` mints (populated with a fake
-		// keystore file) is removed wholesale.
-		let (state, _cache) = storage_dirs(true);
-		let dir = std::path::PathBuf::from(&state);
-		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
-		std::fs::write(dir.join("keystore").join("hs_ed25519_secret_key"), b"fake").expect("write fake key");
-		assert!(dir.exists());
-		remove_ephemeral_state_dir(&dir);
-		assert!(!dir.exists(), "the ephemeral state dir (and its contents) must be gone");
-	}
-
-	#[test]
-	fn remove_ephemeral_state_dir_refuses_non_ephemeral_paths() {
-		// The safety belt: a directory whose name lacks the ephemeral prefix is never
-		// removed, so a mis-threaded path can't delete a persistent tree.
-		let guard = std::env::temp_dir().join(format!("onyums-not-ephemeral-{}-{:016x}", std::process::id(), rand::random::<u64>()));
-		std::fs::create_dir_all(&guard).expect("create non-ephemeral dir");
-		remove_ephemeral_state_dir(&guard);
-		assert!(guard.exists(), "a non-ephemeral dir must be left untouched");
-		std::fs::remove_dir_all(&guard).ok();
-	}
-
-	#[test]
-	fn remove_ephemeral_state_dir_is_a_noop_on_missing_dir() {
-		// Removing an already-absent ephemeral dir must not panic (idempotent cleanup).
-		let (state, _cache) = storage_dirs(true);
-		let dir = std::path::PathBuf::from(&state);
-		assert!(!dir.exists(), "a freshly-minted ephemeral path does not yet exist");
-		remove_ephemeral_state_dir(&dir); // must not panic
-	}
-
-	#[test]
-	fn spawn_ephemeral_cleanup_runs_inline_without_a_runtime() {
-		// Outside any tokio runtime there is nothing to stall: the removal runs inline and
-		// the helper reports `None` (nothing to await).
-		let (state, _cache) = storage_dirs(true);
-		let dir = std::path::PathBuf::from(&state);
-		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
-		assert!(dir.exists());
-		let handle = spawn_ephemeral_cleanup(dir.clone());
-		assert!(handle.is_none(), "with no runtime the removal is inline, not spawned");
-		assert!(!dir.exists(), "the ephemeral dir must be gone after an inline cleanup");
-	}
-
-	#[tokio::test]
-	async fn spawn_ephemeral_cleanup_offloads_to_the_blocking_pool_in_a_runtime() {
-		// Inside a runtime the blocking `remove_dir_all` is offloaded (so it never stalls a
-		// worker) and the returned handle resolves once the dir is gone — the path
-		// `shutdown()` awaits.
-		let (state, _cache) = storage_dirs(true);
-		let dir = std::path::PathBuf::from(&state);
-		std::fs::create_dir_all(dir.join("keystore")).expect("create fake ephemeral state");
-		std::fs::write(dir.join("keystore").join("hs_ed25519_secret_key"), b"fake").expect("write fake key");
-		assert!(dir.exists());
-		let handle = spawn_ephemeral_cleanup(dir.clone()).expect("a live runtime offloads the removal to a task");
-		handle.await.expect("the offloaded cleanup task must not panic");
-		assert!(!dir.exists(), "the ephemeral dir must be gone after the offloaded cleanup");
-	}
-
-	#[test]
-	fn spawn_ephemeral_cleanup_still_refuses_non_ephemeral_paths_inline() {
-		// The offload path must not weaken the safety belt: a non-ephemeral dir is left
-		// untouched even when cleaned up inline.
-		let guard = std::env::temp_dir().join(format!("onyums-not-ephemeral-{}-{:016x}", std::process::id(), rand::random::<u64>()));
-		std::fs::create_dir_all(&guard).expect("create non-ephemeral dir");
-		assert!(spawn_ephemeral_cleanup(guard.clone()).is_none());
-		assert!(guard.exists(), "a non-ephemeral dir must survive the cleanup helper");
-		std::fs::remove_dir_all(&guard).ok();
 	}
 
 	#[test]
@@ -2059,7 +1232,7 @@ mod tests {
 		// `HsClientDescEncKey` parses, and Arti renders it back identically. Guards
 		// against a base32 case / format drift between the two crates.
 		let key = ClientAuthKey::from_bytes([13u8; 32]);
-		let parsed: HsClientDescEncKey = key.to_string().parse().expect("a skin client key must parse as an Arti client descriptor key");
+		let parsed: crate::tor_hscrypto::pk::HsClientDescEncKey = key.to_string().parse().expect("a skin client key must parse as an Arti client descriptor key");
 		assert_eq!(parsed.to_string(), key.to_string(), "Arti must round-trip skin's canonical key form");
 	}
 
@@ -2070,54 +1243,6 @@ mod tests {
 		let builder = OnionServiceBuilder::default().authorized_clients(allow);
 		let recorded = builder.restricted_discovery.as_ref().expect("allowlist recorded on the builder");
 		assert_eq!(recorded.len(), 1);
-	}
-
-	#[test]
-	fn restricted_discovery_config_assembles_offline() {
-		// A non-empty allowlist assembles into a valid onion service config with no live
-		// Tor network — Arti's own config validation runs during `build`.
-		let mut allow = RestrictedDiscovery::new();
-		allow.authorize("alice", ClientAuthKey::from_bytes([7u8; 32]));
-		allow.authorize("bob", ClientAuthKey::from_bytes([42u8; 32]));
-		build_onion_service_config("restricted_svc", Some(&allow)).expect("restricted-discovery config builds offline");
-	}
-
-	#[test]
-	fn config_without_restricted_discovery_still_builds() {
-		// The default publicly-discoverable path is unchanged when no allowlist is set.
-		build_onion_service_config("plain_svc", None).expect("plain config builds offline");
-	}
-
-	#[test]
-	fn empty_allowlist_is_rejected_offline() {
-		// Enabling restricted discovery with no clients would hide the service from
-		// everyone — rejected before any bootstrap.
-		let allow = RestrictedDiscovery::new();
-		let err = build_onion_service_config("empty_allow", Some(&allow)).expect_err("an empty allowlist must be rejected");
-		assert!(err.to_string().contains("empty"), "unexpected error: {err}");
-	}
-
-	#[test]
-	fn invalid_client_nickname_is_rejected_offline() {
-		// A nickname that is not a valid Tor client slug (spaces) surfaces offline as a
-		// clear error rather than a late launch failure.
-		let mut allow = RestrictedDiscovery::new();
-		allow.authorize("not a slug", ClientAuthKey::from_bytes([1u8; 32]));
-		let err = build_onion_service_config("bad_nick", Some(&allow)).expect_err("an invalid client nickname must be rejected");
-		assert!(err.to_string().contains("nickname"), "unexpected error: {err}");
-	}
-
-	#[test]
-	fn service_nickname_parse_error_preserves_the_arti_cause() {
-		// The service nickname takes the same context-preserving `map_err` as the other
-		// Tor-bootstrap sites: a bad nickname surfaces *why* (arti's underlying parse
-		// error) appended to onyums' context, not a bare "Failed to parse nickname."
-		let err = build_onion_service_config("bad service nickname", None).expect_err("a nickname with spaces must be rejected");
-		let msg = err.to_string();
-		assert!(msg.starts_with("Failed to parse nickname: "), "missing onyums context: {msg}");
-		// The underlying arti `InvalidNickname` Display must be carried, not dropped —
-		// the whole point of replacing `map_err(|_| ...)` with `map_err(|e| ...: {e})`.
-		assert!(msg.len() > "Failed to parse nickname: ".len(), "arti cause was dropped: {msg}");
 	}
 
 	#[tokio::test]
@@ -2164,289 +1289,6 @@ mod tests {
 		let custom: Arc<dyn CircuitPolicy> = Arc::new(AccountingCircuitPolicy::new());
 		let err = resolve_circuit_policy(Some(custom), false, Some(Arc::new(CapturingSink::new()))).err().expect("a sink + custom policy must conflict");
 		assert!(err.to_string().contains("circuit_policy"), "unexpected error: {err}");
-	}
-
-	#[tokio::test]
-	async fn serve_router_gates_and_adds_hsts_under_strict_tls() {
-		use http_body_util::BodyExt as _;
-		use tower::ServiceExt as _;
-
-		// The full serve-path stack under the secure default + strict TLS: an uncleared
-		// request is intercepted by the gate (never reaching the app) AND the response
-		// carries HSTS. Exercises the composition serve() builds, with no live Tor.
-		let app = build_serve_router(Router::new().route("/", get(|| async { "secret" })), SkinChoice::Default, Tls::Strict.plaintext_policy());
-		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
-		let hsts = response.headers().get("strict-transport-security").expect("strict TLS must emit HSTS on the gate's own response");
-		assert_eq!(hsts, "max-age=63072000; includeSubDomains");
-		let body = response.into_body().collect().await.unwrap().to_bytes();
-		assert!(!String::from_utf8_lossy(&body).contains("secret"), "the gated app must not leak through the composed stack");
-	}
-
-	#[tokio::test]
-	async fn serve_router_no_skin_reaches_app_without_hsts_under_upgrade() {
-		use http_body_util::BodyExt as _;
-		use tower::ServiceExt as _;
-
-		// Opt-down: no gate + upgrade TLS — the app is reached and no HSTS is added.
-		let app = build_serve_router(Router::new().route("/", get(|| async { "reached" })), SkinChoice::Disabled, Tls::Upgrade.plaintext_policy());
-		let response = app.oneshot(Request::builder().uri("/").body(axum::body::Body::empty()).unwrap()).await.unwrap();
-		assert!(response.headers().get("strict-transport-security").is_none(), "upgrade TLS emits no HSTS");
-		let body = response.into_body().collect().await.unwrap().to_bytes();
-		assert_eq!(String::from_utf8_lossy(&body), "reached", "no_skin lets the request reach the app");
-	}
-
-	#[test]
-	fn connection_info_circuit_isolation_helpers() {
-		let a = ConnectionInfo { circuit_id: Some("7".into()), socket_addr: None };
-		let a_again = ConnectionInfo { circuit_id: Some("7".into()), socket_addr: None };
-		let b = ConnectionInfo { circuit_id: Some("9".into()), socket_addr: None };
-		let unknown = ConnectionInfo::default();
-
-		assert!(a.is_over_tor(), "a known circuit id means the request came over Tor");
-		assert!(!unknown.is_over_tor(), "a default info is not over Tor");
-		assert_eq!(a.circuit(), Some("7"));
-		assert_eq!(unknown.circuit(), None);
-
-		assert!(a.same_circuit(&a_again), "the same circuit id is the same circuit");
-		assert!(!a.same_circuit(&b), "different circuit ids are different circuits");
-		assert!(!a.same_circuit(&unknown), "a known circuit never matches an unknown one");
-		assert!(!unknown.same_circuit(&unknown), "two unknown circuits are not a known-same circuit");
-	}
-
-	#[test]
-	fn service_status_projects_every_arti_state() {
-		use tor_hsservice::status::State;
-		// Every known arti onion-service state maps onto onyums' stable projection.
-		// If arti adds or renames a state, this stops compiling (the `State` import)
-		// or the assertion drifts — a deliberate tripwire for the non_exhaustive enum.
-		assert_eq!(project_service_status(State::Shutdown), ServiceStatus::Shutdown);
-		assert_eq!(project_service_status(State::Bootstrapping), ServiceStatus::Bootstrapping);
-		assert_eq!(project_service_status(State::Running), ServiceStatus::Reachable);
-		assert_eq!(project_service_status(State::DegradedReachable), ServiceStatus::DegradedReachable);
-		assert_eq!(project_service_status(State::DegradedUnreachable), ServiceStatus::Unreachable);
-		assert_eq!(project_service_status(State::Recovering), ServiceStatus::Unreachable);
-		assert_eq!(project_service_status(State::Broken), ServiceStatus::Broken);
-	}
-
-	#[test]
-	fn service_problem_projects_arti_problem_categories() {
-		use tor_hsservice::status::Problem;
-		// Empty vecs exercise the category mapping without constructing arti's internal
-		// error types — the projection keys only on the `Problem` variant. If arti adds
-		// or renames a `Problem` category the `_` arm keeps this compiling but the new
-		// case reads as `Other`, the conservative default.
-		assert_eq!(project_service_problem(&Problem::Ipt(Vec::new())).kind(), ServiceProblemKind::IntroductionPoint);
-		assert_eq!(project_service_problem(&Problem::DescriptorUpload(Vec::new())).kind(), ServiceProblemKind::DescriptorUpload);
-		// The diagnostic detail is arti's `Debug` rendering, captured (not dropped) even
-		// though arti's `Problem` has no `Display`; an empty intro-point error list
-		// renders as an empty debug vec.
-		assert_eq!(project_service_problem(&Problem::Ipt(Vec::new())).detail(), "[]");
-	}
-
-	#[test]
-	fn service_problem_surface_is_stable_and_distinct() {
-		use ServiceProblem::{DescriptorUpload, IntroductionPoint, Other, Runtime};
-		let all = [
-			Runtime("boom".into()),
-			DescriptorUpload("upload failed".into()),
-			IntroductionPoint("no ipts".into()),
-			Other("mystery".into()),
-		];
-		// `detail()` round-trips the diagnostic; `Display` is exactly `"<label>: <detail>"`.
-		for p in &all {
-			assert!(!p.label().is_empty());
-			assert_eq!(p.to_string(), format!("{}: {}", p.label(), p.detail()));
-			// The category label is the kind's label.
-			assert_eq!(p.label(), p.kind().label());
-		}
-		assert_eq!(Runtime("boom".into()).detail(), "boom");
-
-		// Labels are distinct across the four categories (a downstream may match on them).
-		let labels: std::collections::HashSet<_> = all.iter().map(ServiceProblem::label).collect();
-		assert_eq!(labels.len(), all.len(), "labels must be distinct");
-
-		// Only a runtime error is fatal; the retriable problems are not.
-		assert!(Runtime("x".into()).is_fatal());
-		for p in [DescriptorUpload("x".into()), IntroductionPoint("x".into()), Other("x".into())] {
-			assert!(!p.is_fatal(), "{p:?} must not read as fatal");
-		}
-	}
-
-	#[test]
-	fn service_health_bundles_status_and_problem_consistently() {
-		use ServiceStatus::{Broken, DegradedReachable, Reachable, Unreachable};
-
-		// Fully healthy: reachable, no problem — Display is just the status label.
-		let healthy = ServiceHealth { status: Reachable, problem: None };
-		assert_eq!(healthy.status(), Reachable);
-		assert!(healthy.is_reachable());
-		assert!(healthy.is_healthy());
-		assert!(healthy.problem().is_none());
-		assert_eq!(healthy.to_string(), "reachable");
-
-		// Reachable but degraded and carrying a problem: reachable, yet not fully healthy.
-		let degraded = ServiceHealth { status: DegradedReachable, problem: Some(ServiceProblem::IntroductionPoint("[]".into())) };
-		assert!(degraded.is_reachable());
-		assert!(!degraded.is_healthy(), "a reachable service carrying a problem is not fully healthy");
-		assert_eq!(degraded.problem().map(ServiceProblem::kind), Some(ServiceProblemKind::IntroductionPoint));
-
-		// Broken with a fatal problem: neither reachable nor healthy; Display shows the why.
-		let broken = ServiceHealth { status: Broken, problem: Some(ServiceProblem::Runtime("boom".into())) };
-		assert!(!broken.is_reachable());
-		assert!(!broken.is_healthy());
-		assert!(broken.problem().is_some_and(ServiceProblem::is_fatal));
-		assert_eq!(broken.to_string(), "broken — runtime: boom");
-
-		// A non-reachable status with no reported problem still renders as just the status.
-		let quiet = ServiceHealth { status: Unreachable, problem: None };
-		assert_eq!(quiet.to_string(), "unreachable");
-		assert!(!quiet.is_healthy());
-	}
-
-	#[test]
-	fn service_status_reachability_matches_arti_semantics() {
-		use tor_hsservice::status::State;
-		// onyums' `is_reachable` must agree with arti's own `is_fully_reachable` for
-		// every known state — the projection must not change the reachability verdict.
-		for state in [State::Shutdown, State::Bootstrapping, State::Running, State::DegradedReachable, State::DegradedUnreachable, State::Recovering, State::Broken] {
-			assert_eq!(project_service_status(state).is_reachable(), state.is_fully_reachable(), "reachability disagreement for {state:?}");
-		}
-		// Spot-check the two reachable states and one non-reachable one directly.
-		assert!(ServiceStatus::Reachable.is_reachable());
-		assert!(ServiceStatus::DegradedReachable.is_reachable());
-		assert!(!ServiceStatus::Bootstrapping.is_reachable());
-	}
-
-	#[test]
-	fn service_status_predicates_partition_the_lifecycle() {
-		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
-
-		// `is_degraded` is exactly `DegradedReachable`, and it implies reachability.
-		assert!(DegradedReachable.is_degraded());
-		assert!(DegradedReachable.is_reachable());
-		for s in [Shutdown, Bootstrapping, Reachable, Unreachable, Broken] {
-			assert!(!s.is_degraded(), "{s:?} must not read as degraded");
-		}
-
-		// `is_broken` is exactly `Broken` — never the transient `Unreachable`.
-		assert!(Broken.is_broken());
-		assert!(!Unreachable.is_broken());
-
-		// `is_terminal` is exactly the settled states, and is disjoint from reachability:
-		// a service is never both reachable and terminal.
-		assert!(Shutdown.is_terminal());
-		assert!(Broken.is_terminal());
-		for s in [Bootstrapping, Reachable, DegradedReachable, Unreachable] {
-			assert!(!s.is_terminal(), "{s:?} must not read as terminal");
-		}
-		for s in [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken] {
-			assert!(!(s.is_reachable() && s.is_terminal()), "{s:?} cannot be both reachable and terminal");
-		}
-	}
-
-	#[test]
-	fn service_status_label_and_display_are_stable_and_distinct() {
-		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
-
-		let all = [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken];
-		// `Display` writes the stable `label`.
-		for s in all {
-			assert_eq!(s.to_string(), s.label());
-			assert!(!s.label().is_empty());
-		}
-		// Labels are pinned (a downstream health check may match on them) and distinct.
-		assert_eq!(Reachable.label(), "reachable");
-		assert_eq!(DegradedReachable.label(), "degraded");
-		assert_eq!(Broken.label(), "broken");
-		let labels: std::collections::HashSet<&str> = all.iter().map(|s| s.label()).collect();
-		assert_eq!(labels.len(), all.len(), "every status needs a distinct label");
-	}
-
-	#[test]
-	fn worst_of_surfaces_the_least_healthy_service_in_a_fleet() {
-		use ServiceStatus::{Bootstrapping, Broken, DegradedReachable, Reachable, Shutdown, Unreachable};
-
-		// Empty fleet has no aggregate health.
-		assert_eq!(ServiceStatus::worst_of([]), None);
-		// All-reachable stays reachable; a single element is itself.
-		assert_eq!(ServiceStatus::worst_of([Reachable, Reachable]), Some(Reachable));
-		assert_eq!(ServiceStatus::worst_of([Bootstrapping]), Some(Bootstrapping));
-		// One degraded among reachable surfaces the degradation.
-		assert_eq!(ServiceStatus::worst_of([Reachable, DegradedReachable, Reachable]), Some(DegradedReachable));
-		// A broken (or shut-down) service is never masked by healthy siblings; Shutdown
-		// ranks worst of all.
-		assert_eq!(ServiceStatus::worst_of([Reachable, Broken, DegradedReachable]), Some(Broken));
-		assert_eq!(ServiceStatus::worst_of([Broken, Shutdown, Reachable]), Some(Shutdown));
-		// Bootstrapping (coming up) is treated as less severe than a transient Unreachable.
-		assert_eq!(ServiceStatus::worst_of([Bootstrapping, Unreachable]), Some(Unreachable));
-
-		// The severity ranking is total and distinct — no two states share a rank, so the
-		// fold is deterministic.
-		let all = [Shutdown, Bootstrapping, Reachable, DegradedReachable, Unreachable, Broken];
-		let ranks: std::collections::HashSet<u8> = all.iter().map(|s| s.severity()).collect();
-		assert_eq!(ranks.len(), all.len(), "every status needs a distinct severity rank");
-	}
-
-	#[tokio::test]
-	async fn await_status_resolves_on_the_first_match() {
-		use ServiceStatus::{Bootstrapping, DegradedReachable, Reachable, Unreachable};
-
-		// Resolves on the first reachable item, returning *which* reachable status it saw.
-		let stream = futures::stream::iter([Bootstrapping, Unreachable, Reachable]);
-		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, Some(Reachable));
-
-		// The very first item already matching is returned immediately (mirrors a service
-		// that is reachable the moment the caller subscribes).
-		let stream = futures::stream::iter([DegradedReachable, Reachable]);
-		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, Some(DegradedReachable));
-	}
-
-	#[tokio::test]
-	async fn await_status_returns_none_when_the_stream_ends_unmatched() {
-		use ServiceStatus::{Bootstrapping, Shutdown, Unreachable};
-
-		// A stream that ends without ever reaching a reachable state (service torn down
-		// mid-bootstrap) resolves to `None` rather than hanging — this is why
-		// `ready_timeout` reports `false` on a dropped service.
-		let stream = futures::stream::iter([Bootstrapping, Unreachable, Shutdown]);
-		assert_eq!(await_status(stream, ServiceStatus::is_reachable).await, None);
-
-		let empty = futures::stream::iter(Vec::<ServiceStatus>::new());
-		assert_eq!(await_status(empty, ServiceStatus::is_reachable).await, None);
-	}
-
-	#[tokio::test]
-	async fn await_status_settles_on_reachable_or_terminal() {
-		use ServiceStatus::{Bootstrapping, Broken, Reachable, Unreachable};
-
-		// The `wait_until_settled` predicate: a service that *broke* during bootstrap
-		// settles on `Broken`, so a caller distinguishes "gave up" from "came up" instead
-		// of waiting on reachability that will never arrive.
-		let settled = |s: ServiceStatus| s.is_reachable() || s.is_terminal();
-		let stream = futures::stream::iter([Bootstrapping, Unreachable, Broken]);
-		assert_eq!(await_status(stream, settled).await, Some(Broken));
-
-		// Reachability settles too — the ordinary success path.
-		let stream = futures::stream::iter([Bootstrapping, Reachable]);
-		assert_eq!(await_status(stream, settled).await, Some(Reachable));
-
-		// Only-ever-transient churn never settles → `None` (which `wait_until_settled`
-		// maps to `Shutdown` for a torn-down stream).
-		let stream = futures::stream::iter([Bootstrapping, Unreachable, Bootstrapping]);
-		assert_eq!(await_status(stream, settled).await, None);
-	}
-
-	#[tokio::test]
-	async fn await_status_under_timeout_gives_up_on_a_stalled_stream() {
-		// The exact composition `ready_timeout` relies on: a status stream that never
-		// yields a matching item must elapse rather than block forever. `pending` never
-		// resolves, so a short real deadline reliably elapses (no timing race — the
-		// future genuinely cannot complete).
-		let stalled = futures::stream::pending::<ServiceStatus>();
-		let outcome = tokio::time::timeout(std::time::Duration::from_millis(20), await_status(stalled, ServiceStatus::is_reachable)).await;
-		assert!(outcome.is_err(), "a stalled stream must time out");
-		// And the `ready_timeout` fold of that result reads as not-ready.
-		assert!(outcome.ok().flatten().is_none());
 	}
 
 	#[test]
@@ -2567,7 +1409,7 @@ mod tests {
 		// disposable network cache (no second consensus download) but gets its own
 		// throwaway state dir, cleaned up below.
 		let (fetch_state, fetch_cache) = storage_dirs(true);
-		let mut fetch_cfg = TorClientConfigBuilder::from_directories(&fetch_state, &fetch_cache);
+		let mut fetch_cfg = arti_client::config::TorClientConfigBuilder::from_directories(&fetch_state, &fetch_cache);
 		fetch_cfg.address_filter().allow_onion_addrs(true);
 		let fetch_cfg = fetch_cfg.build().expect("fetch-client config should build");
 		let runtime = TokioNativeTlsRuntime::current().expect("current tokio runtime");
@@ -2590,7 +1432,7 @@ mod tests {
 			tokio::time::sleep(std::time::Duration::from_secs(15)).await;
 		}
 		drop(fetch_client);
-		remove_ephemeral_state_dir(std::path::Path::new(&fetch_state));
+		crate::tor_client::remove_ephemeral_state_dir(std::path::Path::new(&fetch_state));
 
 		let response = served_body.expect("no fetch attempt got the app body back over the live Tor network");
 		assert!(response.starts_with("HTTP/1.1 200"), "expected a 200 response, got: {}", response.lines().next().unwrap_or(""));

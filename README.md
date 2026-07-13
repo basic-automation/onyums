@@ -9,6 +9,48 @@ The posture is *secure and complete by default*: the hard, Tor-specific machiner
 
 **What this is:** a Rust library for serving [axum](https://github.com/tokio-rs/axum) applications as Tor onion services, with the Tor client ([Arti](https://gitlab.torproject.org/tpo/core/arti)) embedded — no external `tor` daemon. **What this is not:** a host provisioning / configuration-management tool, a reverse proxy for existing servers, or a SOCKS client. If you want to front an already-running service, that is a planned CLI, not the library.
 
+## Architecture
+
+Every request travels the same secure-by-default path from the Tor network to your
+handler. The circuit-level gate runs before any bytes are served; TLS is terminated
+inside the onion-encrypted stream; the Skin abuse-defense gate runs before the router:
+
+```
+                        Tor network
+                             │  rendezvous circuit (RendRequest)
+                             ▼
+                  ┌───────────────────────┐
+                  │   serve loop          │  one task per circuit
+                  │   CircuitPolicy gate  │  Accept · Challenge · Reject · Shutdown
+                  └──────────┬────────────┘
+                             │  accepted stream (StreamRequest)
+                             ▼
+                  ┌───────────────────────┐
+                  │   port dispatch       │  80/443 → HTTP · other → raw handler
+                  └────┬──────────────┬───┘
+                80/443 │              │ registered raw port
+                       ▼              ▼
+        ┌───────────────────────┐  ┌───────────────────┐
+        │   TLS termination     │  │   RawTcpHandler   │  no Skin / no TLS —
+        │   self-signed / BYO   │  │   → local backend │  the backend secures
+        │   HTTP→HTTPS · HSTS   │  └───────────────────┘  its own end-to-end
+        └──────────┬────────────┘
+                   │  decrypted HTTP request
+                   ▼
+        ┌───────────────────────┐
+        │   Skin gate           │  clearance check · PoW / CAPTCHA challenge ·
+        │   (abuse defense)     │  WAF · rate-limit (keyed on the clearance token)
+        └──────────┬────────────┘
+                   │  cleared request
+                   ▼
+             axum Router  →  your handler
+```
+
+Each stage is an explicit opt-**down**: `Tls::Strict` rejects plaintext instead of
+redirecting, `no_skin()` drops the abuse gate, `under_attack(true)` forces every
+circuit through the gate, and `route_port(...)` adds a raw-TCP branch. See the
+sections below for each.
+
 ## Installation
 
 ```sh
@@ -36,6 +78,27 @@ CI-enforced MSRV is still on the roadmap.
 - **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity (typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers for per-circuit isolation); see [Websocket example](#websocket-example).
 - **Version-skew-proof arti** — the arti stack is re-exported (`onyums::arti_client`, `onyums::tor_hsservice`, `onyums::tor_hscrypto`, …) so downstreams use the exact versions onyums does, just like `axum`.
 
+## How onyums compares
+
+Onyums sits between "thin arti glue" and "a C-tor daemon behind a reverse proxy": a
+single embedded-Arti library that adds the TLS-first transport and Tor-native abuse
+defense you would otherwise assemble yourself.
+
+| | **onyums** | [arti-axum](https://github.com/jgraef/arti-axum) | [tor-hsrproxy](https://tpo.pages.torproject.net/core/arti/) (`arti hss`) | raw [Arti](https://gitlab.torproject.org/tpo/core/arti) (`arti-client` + `tor-hsservice`) | C-tor + nginx/Caddy |
+|---|---|---|---|---|---|
+| Serve an **axum app** | ✅ built-in | ✅ built-in | ⚠️ run your own server behind it | ⚠️ write the accept loop yourself | ⚠️ separate app server |
+| **Embedded** Tor (no external daemon) | ✅ Arti | ✅ Arti | ✅ Arti | ✅ Arti | ❌ external `tor` daemon |
+| **TLS-first** inside the circuit | ✅ auto self-signed / BYO / strict | ❌ | ❌ | ❌ (DIY) | ⚠️ proxy-configured |
+| **Abuse defense** (PoW · WAF · rate-limit) | ✅ Skin, on by default | ❌ | ❌ | ❌ | ⚠️ bolt-on proxy modules, not Tor-native |
+| **Restricted discovery** (v3 client auth) | ✅ `.authorized_clients(...)` | ❌ | ⚠️ via arti config | ⚠️ via arti config | ⚠️ via `tor` config |
+| **Raw-port / multi-protocol** routing | ✅ `.route_port(...)` | ❌ | ✅ (it *is* a port proxy) | ⚠️ DIY | ✅ separate services |
+| **Readiness / health / metrics** handle | ✅ `ready()` · `status()` · Prometheus | ❌ | ⚠️ operational, not in-process | ❌ | ⚠️ external monitoring |
+| Implementation | 100% Rust | 100% Rust | 100% Rust | 100% Rust | C + proxy |
+
+✅ built-in · ⚠️ possible but you assemble/operate it yourself · ❌ not provided.
+Reach for **raw Arti** when you want to build the stack yourself, **tor-hsrproxy** to
+front an existing local service with no app code, and **onyums** when you want the
+secure-by-default axum→onion path in one library.
 
 ## Hello world example
 
@@ -316,7 +379,7 @@ Watching a service come up is a stream, not just a snapshot: `handle.status_even
 
 ## TLS-first transport
 
-Onyums treats encrypted, certificate-authenticated transport as the standard, never as optional cruft to strip away — even though Tor already encrypts the channel, end-to-end TLS adds independent cryptographic authentication and unlocks the browser **secure-context** semantics real apps depend on (WebCrypto, service workers, `Secure` / `__Host-` cookies, HTTP/2, no mixed-content downgrades). The knob is *how strictly* TLS is enforced, never whether it is on:
+Onyums treats encrypted transport as the standard, never as optional cruft to strip away. **The onion address itself authenticates the service** — a `.onion` is derived from the service's public key, so reaching one cryptographically proves you are talking to that key-holder, no certificate authority required. On top of that, end-to-end TLS — even the default self-signed cert — keeps the app-facing hop encrypted independently of Tor and unlocks the browser **secure-context** semantics real apps depend on (WebCrypto, service workers, `Secure` / `__Host-` cookies, HTTP/2, no mixed-content downgrades). What a self-signed cert does **not** add is WebPKI/browser-trusted authentication *of the certificate* — that job is already done by the onion address; use `Tls::Provided` with a CA-signed `.onion` cert only when a client insists on a publicly-trusted chain. The knob is *how strictly* TLS is enforced, never whether it is on:
 
 - **`Tls::Upgrade` (default)** — an auto-generated self-signed cert, and plaintext HTTP on port 80 is transparently redirected (`301`) to HTTPS. A client that arrives over plain HTTP is pointed at the secure URL rather than refused.
 - **`Tls::Strict`** — TLS is non-negotiable. Plaintext circuits are **rejected outright** (there is no port-80 redirect handler at all), and every HTTPS response carries an `Strict-Transport-Security` header (`max-age=63072000; includeSubDomains`) so a conforming client never silently downgrades.
@@ -447,6 +510,115 @@ let _svg_qr = address.qr_svg();           // standalone <svg> document
 ```
 
 `OnionAddress::parse` is the validating constructor for operator- or user-supplied strings (it round-trips through arti's own v3 address parser — length, base32 alphabet, checksum, and version are all checked). Vanity-address mining (`onyums::mine` / `mine_parallel`) generates keys until the derived address matches a desired prefix, parallelized across cores.
+
+****
+
+## First launch & troubleshooting
+
+**What the first run does.** With no `tor` daemon to configure, the embedded Arti
+client bootstraps itself: it fetches the Tor network consensus over your outbound
+connection and creates `./tor/onyums/state` (the identity keystore) and
+`./tor/onyums/cache` (the disposable network directory). Outbound network access and
+a roughly correct system clock are required — Tor rejects a consensus it thinks is
+expired, so a badly-skewed clock is a common first-run failure.
+
+**Expect readiness to take a moment.** Coming up is more than bootstrapping: Arti
+publishes the service descriptor to the responsible directories, and it only reports
+the service *reachable* once those uploads land. `ready()` can therefore take a minute
+or more on the first launch, and — a real Arti behaviour onyums surfaces honestly —
+the reported status can still lag *de-facto* reachability. Use `ready_timeout(dur)` so
+startup never blocks forever, and read `status()` / `problem()` to see where it is:
+
+```rust
+if handle.ready_timeout(std::time::Duration::from_secs(120)).await {
+	println!("reachable at {}", handle.onion_address());
+} else {
+	// Not up yet — status() says what, problem() says why.
+	eprintln!("not ready: {} ({:?})", handle.status(), handle.problem());
+}
+```
+
+**Testing from Tor Browser.** Open `https://<your-address>.onion/`. With the default
+self-signed certificate the browser shows a certificate warning — that is *expected*:
+the onion address itself authenticates the service (see [TLS-first transport](#tls-first-transport)),
+so the warning is about WebPKI trust of the cert, not about who you are talking to.
+Serve a CA-signed `.onion` cert with `Tls::Provided(...)` if you need to avoid the
+warning for public users.
+
+**Common problems:**
+
+| Symptom | Likely cause / fix |
+|---|---|
+| Bootstrap never finishes | No outbound network, or a skewed system clock (fix the clock). |
+| `ready()` hangs | Use `ready_timeout(dur)`; then read `problem()` — a persistent `IntroductionPoint` / `DescriptorUpload` problem means the descriptor isn't published yet. |
+| Certificate warning in the browser | Expected with self-signed TLS — the address is the authenticator; use `Tls::Provided` for a CA-signed chain. |
+| A restricted-discovery client can't connect | Its x25519 key isn't in the allowlist, or its `.auth_private` line is wrong — re-check `provision_client(...)` output. |
+| A raw `route_port(...)` backend is unreachable | The local TCP backend isn't listening on the address you forwarded to. |
+| `serve()` returns a port error | Ports 80/443 are reserved for the built-in HTTP handler, and a port can't be registered twice or as `0` — this is a clean startup error, not a runtime surprise. |
+| Address changed after a restart | You used `.ephemeral()` (throwaway identity by design); drop it to keep the persistent keystore's stable address. |
+
+****
+
+## Deployment
+
+An onyums service is an ordinary Rust binary — `cargo build --release` and run it.
+The one thing that must survive a restart or redeploy is the **identity keystore**
+under `./tor/onyums/state` (relative to the process's working directory): it holds the
+onion service's secret key, so persisting it keeps the `.onion` address stable. Lose it
+and the service comes back on a *new* address.
+
+**systemd** — pin the working directory so `./tor/onyums` always resolves to the same
+place, and let it restart on failure:
+
+```ini
+# /etc/systemd/system/my-onion.service
+[Unit]
+Description=My onyums onion service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+ExecStart=/opt/my-onion/my-onion
+WorkingDirectory=/var/lib/my-onion      # ./tor/onyums/state lives here — keep it
+Restart=on-failure
+# Hardening: the service only needs its own state dir writable.
+DynamicUser=yes
+StateDirectory=my-onion
+
+[Install]
+WantedBy=multi-user.target
+```
+
+**Docker** — build the binary, then mount a **named volume** over the state directory
+so the identity outlives the container:
+
+```dockerfile
+FROM rust:1-slim AS build
+WORKDIR /app
+COPY . .
+RUN cargo build --release
+
+FROM debian:stable-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+WORKDIR /srv                            # ./tor/onyums/state resolves under here
+COPY --from=build /app/target/release/my-onion /usr/local/bin/my-onion
+VOLUME ["/srv/tor/onyums/state"]        # persist the identity keystore
+CMD ["my-onion"]
+```
+
+```sh
+docker run -v my-onion-identity:/srv/tor/onyums/state my-onion
+```
+
+The `cache` directory (`./tor/onyums/cache`) is disposable — it only holds the Tor
+network consensus and is refetched if missing, so it does **not** need a volume.
+
+**Backing up the identity.** To migrate a service to a new host or recover after a
+disk loss, back up `./tor/onyums/state` (the keystore) and restore it before first
+launch — the address is derived from the key inside it. Confirm a restored key serves
+the address you expect *before* wiring it up with `address_from_tor_secret_key_file(...)`
+(see [Identity & address helpers](#identity--address-helpers)). Treat this directory as
+a secret: it *is* the service's identity.
 
 ****
 

@@ -1270,6 +1270,17 @@ pub fn starter_rules() -> Vec<Rule> {
 		// word-boundary tail instead. <https://github.com/coreruleset/coreruleset/blob/main/rules/ai-critical-artifacts.data>
 		Rule { id: "traversal_ai_assistant_artifacts", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.(claude|cursor|continue|aider|roo|zed|cline|kiro|windsurf|rovodev|codex|opencode|a0proj|plandex|fabric|n8n|junie|gemini|openclaw|clawdbot|trustclaw|zeroclaw|warp)/|/\.(qwen_code|crush)\b)" },
 		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
+		// Overlong / invalid UTF-8 traversal (OWASP-CRS path-traversal evasion): the invalid multi-byte
+		// encodings of `.` and `/`/`\` — `%c0%ae` / `%e0%80%ae` (overlong `.`), `%c0%af` / `%e0%80%af`
+		// (overlong `/`), `%c1%9c` (overlong `\`). A conformant UTF-8 decoder rejects these, but a
+		// permissive one folds them back to the ASCII char, so they slip a literal-dot-slash filter.
+		// These byte sequences are illegal UTF-8, so they never occur in benign input. (Note: *double*
+		// URL-encoding — `%252e%252e` — is already handled, more generally, by the multiple-encoding
+		// guard [`MULTI_ENCODING_RULE_ID`], which flags any field that decodes in ≥2 passes regardless
+		// of the payload class; a dedicated traversal rule for it would only shadow that anomaly.
+		// Overlong UTF-8 is single-pass, so the guard does not see it — hence this rule.)
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf>
+		Rule { id: "traversal_overlong_utf8", category: WafCategory::PathTraversal, pattern: r"(?i)(%c0%a[ef]|%c1%9c|%e0%80%a[ef])" },
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
@@ -1612,6 +1623,31 @@ mod tests {
 		let m = blocked(&v);
 		assert_eq!(m.category, WafCategory::PathTraversal);
 		assert_eq!(m.location, "target");
+	}
+
+	#[test]
+	fn traversal_overlong_utf8_is_blocked() {
+		// Overlong-UTF-8 encodings of `.`/`/`/`\` that the single-decode `traversal_encoded` (keyed on
+		// `%2e%2e`) does not see. (Double URL-encoding is handled separately by the multiple-encoding
+		// anomaly guard — see `double_encoded_input_is_blocked_as_anomaly`.)
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("/x?p=%c0%ae%c0%ae%c0%afetc", "target").unwrap().rule_id, "traversal_overlong_utf8");
+		assert_eq!(waf.inspect_str("/y?p=%e0%80%afboot.ini", "target").unwrap().category, WafCategory::PathTraversal);
+		assert_eq!(waf.inspect_str("/z?p=%c1%9cwindows", "target").unwrap().rule_id, "traversal_overlong_utf8");
+	}
+
+	#[test]
+	fn traversal_overlong_utf8_keeps_false_positives_low() {
+		// A once-encoded space (`%20`), a single-encoded `.`, and a `%c0` not part of an overlong
+		// sequence all stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/search?q=hello%20world",       // `%20`, an ordinary encoded space
+			"/img?name=photo%2ejpg",          // single-encoded `.`, not an overlong `%c0%ae`
+			"/theme?c=%c0ffee",               // `%c0` not followed by `%ae`/`%af`
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]

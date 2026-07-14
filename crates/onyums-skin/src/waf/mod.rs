@@ -1342,6 +1342,19 @@ pub fn starter_rules() -> Vec<Rule> {
 		// 169.254 IP but exposes metadata under `/opc/`, so the AWS `/latest/meta-data` path rule does
 		// not fire). Value-inspection, no client IP needed. <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery/cloud-ssrf>
 		Rule { id: "ssrf_vendor_metadata", category: WafCategory::Ssrf, pattern: r"(?i)(100\.100\.100\.200|/opc/v[12]/)" },
+		// Public wildcard-DNS ("magic DNS") resolvers abused to defeat a hostname allowlist / SSRF
+		// filter: `<anything>.127.0.0.1.nip.io` resolves straight back to 127.0.0.1, so a target that
+		// *looks* like an external hostname reaches an internal address. `nip.io`/`sslip.io`/`xip.io`
+		// are the canonical services; `1u.ms` and `traefik.me` are the current additions to the SSRF
+		// toolkit. These domains do not appear as a legitimate fetch target from an onion app; an
+		// operator who genuinely uses one can disable this rule.
+		// <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery>
+		Rule { id: "ssrf_wildcard_dns", category: WafCategory::Ssrf, pattern: r"(?i)\b(nip\.io|sslip\.io|xip\.io|1u\.ms|traefik\.me)\b" },
+		// Expanded / alternate IPv6 loopback + unspecified-address forms the literal `[::1]` in
+		// `ssrf_loopback_url` misses: the fully-written-out `[0:0:0:0:0:0:0:1]` (leading zeros per group
+		// tolerated) and the all-zeros `[::]` bind/unspecified address, which routes to loopback on many
+		// stacks. The IPv4-mapped `[::ffff:127.0.0.1]` is already covered by `ssrf_obfuscated_loopback`.
+		Rule { id: "ssrf_ipv6_loopback_expanded", category: WafCategory::Ssrf, pattern: r"(?i)(\[(?:0{1,4}:){7}0{0,3}1\]|\[::\])" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
@@ -2810,6 +2823,33 @@ mod tests {
 			"/blog/ipv6-addressing",                          // topic mention
 			"/docs/google-cloud-metadata-api",                // hyphenated words, not the hostname
 			"/colors?hex=0x7fddaa",                           // a hex color param, no "://"
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn ssrf_wildcard_dns_and_expanded_ipv6_loopback_match() {
+		// Wildcard-DNS rebinding services and the expanded/unspecified IPv6 loopback the literal `[::1]`
+		// rule misses.
+		let waf = Waf::starter();
+		// (Use a host with no literal loopback/metadata IP embedded, so this asserts the DNS rule and
+		// not the earlier IP/loopback rules that would shadow `127.0.0.1.nip.io`.)
+		assert_eq!(waf.inspect_str("url=http://internal-admin.nip.io/", "query").unwrap().rule_id, "ssrf_wildcard_dns");
+		assert_eq!(waf.inspect_str("u=http://internal.sslip.io/admin", "body").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("u=http://[0:0:0:0:0:0:0:1]:8080/", "query").unwrap().rule_id, "ssrf_ipv6_loopback_expanded");
+		assert_eq!(waf.inspect_str("u=http://[::]/metadata", "body").unwrap().rule_id, "ssrf_ipv6_loopback_expanded");
+	}
+
+	#[test]
+	fn ssrf_wildcard_dns_and_expanded_ipv6_keep_false_positives_low() {
+		// A hostname that merely ends in `.io` (not a wildcard-DNS service), and an ordinary expanded
+		// IPv6 that isn't loopback, both stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/redirect?to=https://myapp.io/home",     // `.io` TLD, not nip.io/sslip.io/xip.io
+			"/docs/ipv6-loopback-explained",           // prose about loopback
+			"/net?addr=[2001:0db8:0:0:0:0:0:1]",       // a documentation-range IPv6, not `::1`/`::`
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

@@ -102,11 +102,19 @@ pub enum WafCategory {
 	/// it *complements* the softer [`BotHeuristics`](crate::bot::BotHeuristics) score by hard
 	/// blocking the unambiguously-hostile tools rather than merely weighting them.
 	ScannerDetection,
+	/// XPath / XQuery injection: input that breaks out of, or is smuggled into, an XPath/XQuery
+	/// expression evaluated over server-side XML — an XPath *axis* step (`ancestor::`,
+	/// `following-sibling::`, …), an XQuery FLWOR (`for $x in … return …`), a namespace prolog
+	/// (`declare namespace`), or a node-set count (`count(//…)`). The peer of
+	/// [`LdapInjection`](Self::LdapInjection)/[`Xxe`](Self::Xxe) for the XML-query surface. The
+	/// malicious expression is a value in the request, so detection is IP-free and ports over Tor
+	/// unchanged.
+	XPathInjection,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 11] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection];
+	pub const ALL: [WafCategory; 12] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection, Self::XPathInjection];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -123,6 +131,7 @@ impl WafCategory {
 			Self::Xxe => "xxe",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 			Self::ScannerDetection => "scanner_detection",
+			Self::XPathInjection => "xpath_injection",
 		}
 	}
 
@@ -135,7 +144,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection | Self::XPathInjection => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -157,6 +166,7 @@ impl WafCategory {
 			Self::LdapInjection => 8,
 			Self::Xxe => 9,
 			Self::ScannerDetection => 10,
+			Self::XPathInjection => 11,
 		}
 	}
 }
@@ -1453,6 +1463,19 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xxe_entity_decl", category: WafCategory::Xxe, pattern: r"(?i)<!entity\b" },
 		Rule { id: "xxe_entity_external", category: WafCategory::Xxe, pattern: r"(?i)<!entity[\s\S]{0,200}\b(system|public)\b" },
 		Rule { id: "xxe_doctype_dtd", category: WafCategory::Xxe, pattern: r"(?i)<!doctype[\s\S]{0,200}\[" },
+		// --- XPath / XQuery injection (XML-query break-out; value inspection, no client IP) ---
+		// An XPath *axis step* — the `axisname::` navigation operator. Only the axes with no plausible
+		// benign collision are listed: `ancestor(-or-self)::`, `descendant(-or-self)::`, and the
+		// `following`/`preceding`(-sibling) family. Deliberately excludes `child::`/`self::`/`namespace::`,
+		// which collide with Rust/PHP `self::`/`Type::` and C++ `std::` in a posted code sample. The
+		// `axisname::` token essentially never occurs outside an XPath expression.
+		Rule { id: "xpathi_axis", category: WafCategory::XPathInjection, pattern: r"(?i)\b(ancestor(-or-self)?|descendant(-or-self)?|following(-sibling)?|preceding(-sibling)?)::" },
+		// XQuery / XPath structural injection: an XQuery FLWOR expression (`for $x in … return …`), a
+		// namespace/element prolog declaration (`declare namespace …` / `declare default element …`), or
+		// a node-set count over a location path (`count(//…)` / `count(/…)`). All three are XML-query
+		// idioms that do not appear in ordinary request input; the FLWOR rule requires both the `for $var
+		// in` head and a trailing `return` so a stray `for`/`return` in prose stays clean.
+		Rule { id: "xpathi_xquery", category: WafCategory::XPathInjection, pattern: r"(?i)(\bdeclare\s+(namespace|default\s+(element|function))\b|\bfor\s+\$\w+\s+in\b[\s\S]{0,80}\breturn\b|\bcount\s*\(\s*/)" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -3155,6 +3178,48 @@ mod tests {
 	}
 
 	#[test]
+	fn xpath_injection_rules_match() {
+		// The XPath/XQuery break-out idioms all attribute to the XPathInjection class.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("q=//user[name='x']/ancestor::account", "query").unwrap().rule_id, "xpathi_axis");
+		assert_eq!(waf.inspect_str("p=/root/descendant-or-self::node()", "body").unwrap().category, WafCategory::XPathInjection);
+		assert_eq!(waf.inspect_str("v=/a/following-sibling::secret", "query").unwrap().rule_id, "xpathi_axis");
+		assert_eq!(waf.inspect_str("q=for $u in /users/user return $u/password", "body").unwrap().rule_id, "xpathi_xquery");
+		assert_eq!(waf.inspect_str(r#"d=declare namespace evil = "http://x"#, "body").unwrap().rule_id, "xpathi_xquery");
+		assert_eq!(waf.inspect_str("n=count(//user)", "query").unwrap().category, WafCategory::XPathInjection);
+	}
+
+	#[test]
+	fn xpath_injection_keeps_false_positives_low() {
+		// Generic `::` scope operators from posted Rust/PHP/C++ code (not XPath axes), an "ancestor"
+		// word with no axis `::`, a `for`/`return` in prose without the FLWOR shape, and a `count(` that
+		// isn't over a location path all stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/code?snip=Foo::bar",                 // generic `::`, not an axis name
+			"/rust?use=std::collections::HashMap",  // `std::` scope op, excluded axis set
+			"/php?c=self::render",                  // `self::` deliberately excluded (PHP/Rust collision)
+			"/search?q=ancestor+of+the+node",       // "ancestor" prose, no `::`
+			"/blog/for-loops-and-return-values",    // "for"/"return" prose, no `$var in` FLWOR
+			"/calc?f=count(items)",                 // `count(` not over a `/` location path
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn xpath_category_metadata_is_stable() {
+		assert_eq!(WafCategory::XPathInjection.name(), "xpath_injection");
+		assert_eq!(WafCategory::XPathInjection.weight(), WafCategory::Sqli.weight());
+		assert_eq!(WafCategory::ALL.len(), 12);
+		// Appending the category kept the index a bijection.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+		assert_eq!(WafCategory::XPathInjection.index(), 11);
+	}
+
+	#[test]
 	fn crs_restricted_file_access_matches() {
 		// VCS trees, framework configs, secrets files, and backup/dump artifacts all attribute
 		// to the PathTraversal class.
@@ -3259,8 +3324,8 @@ mod tests {
 		assert_eq!(WafCategory::ScannerDetection.name(), "scanner_detection");
 		assert_eq!(WafCategory::ScannerDetection.weight(), WafCategory::Sqli.weight());
 		assert_eq!(WafCategory::ALL[WafCategory::ScannerDetection.index()], WafCategory::ScannerDetection);
-		// The index is still a bijection over every category (now eleven).
-		assert_eq!(WafCategory::ALL.len(), 11);
+		// The index is still a bijection over every category (now twelve, after XPathInjection).
+		assert_eq!(WafCategory::ALL.len(), 12);
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}

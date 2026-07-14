@@ -102,11 +102,19 @@ pub enum WafCategory {
 	/// it *complements* the softer [`BotHeuristics`](crate::bot::BotHeuristics) score by hard
 	/// blocking the unambiguously-hostile tools rather than merely weighting them.
 	ScannerDetection,
+	/// XPath / XQuery injection: input that breaks out of, or is smuggled into, an XPath/XQuery
+	/// expression evaluated over server-side XML — an XPath *axis* step (`ancestor::`,
+	/// `following-sibling::`, …), an XQuery FLWOR (`for $x in … return …`), a namespace prolog
+	/// (`declare namespace`), or a node-set count (`count(//…)`). The peer of
+	/// [`LdapInjection`](Self::LdapInjection)/[`Xxe`](Self::Xxe) for the XML-query surface. The
+	/// malicious expression is a value in the request, so detection is IP-free and ports over Tor
+	/// unchanged.
+	XPathInjection,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 11] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection];
+	pub const ALL: [WafCategory; 12] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection, Self::XPathInjection];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -123,6 +131,7 @@ impl WafCategory {
 			Self::Xxe => "xxe",
 			Self::ProtocolAnomaly => "protocol_anomaly",
 			Self::ScannerDetection => "scanner_detection",
+			Self::XPathInjection => "xpath_injection",
 		}
 	}
 
@@ -135,7 +144,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection | Self::XPathInjection => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -157,6 +166,7 @@ impl WafCategory {
 			Self::LdapInjection => 8,
 			Self::Xxe => 9,
 			Self::ScannerDetection => 10,
+			Self::XPathInjection => 11,
 		}
 	}
 }
@@ -1260,6 +1270,17 @@ pub fn starter_rules() -> Vec<Rule> {
 		// word-boundary tail instead. <https://github.com/coreruleset/coreruleset/blob/main/rules/ai-critical-artifacts.data>
 		Rule { id: "traversal_ai_assistant_artifacts", category: WafCategory::PathTraversal, pattern: r"(?i)(/\.(claude|cursor|continue|aider|roo|zed|cline|kiro|windsurf|rovodev|codex|opencode|a0proj|plandex|fabric|n8n|junie|gemini|openclaw|clawdbot|trustclaw|zeroclaw|warp)/|/\.(qwen_code|crush)\b)" },
 		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
+		// Overlong / invalid UTF-8 traversal (OWASP-CRS path-traversal evasion): the invalid multi-byte
+		// encodings of `.` and `/`/`\` — `%c0%ae` / `%e0%80%ae` (overlong `.`), `%c0%af` / `%e0%80%af`
+		// (overlong `/`), `%c1%9c` (overlong `\`). A conformant UTF-8 decoder rejects these, but a
+		// permissive one folds them back to the ASCII char, so they slip a literal-dot-slash filter.
+		// These byte sequences are illegal UTF-8, so they never occur in benign input. (Note: *double*
+		// URL-encoding — `%252e%252e` — is already handled, more generally, by the multiple-encoding
+		// guard [`MULTI_ENCODING_RULE_ID`], which flags any field that decodes in ≥2 passes regardless
+		// of the payload class; a dedicated traversal rule for it would only shadow that anomaly.
+		// Overlong UTF-8 is single-pass, so the guard does not see it — hence this rule.)
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf>
+		Rule { id: "traversal_overlong_utf8", category: WafCategory::PathTraversal, pattern: r"(?i)(%c0%a[ef]|%c1%9c|%e0%80%a[ef])" },
 		// --- OS command injection ---
 		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
@@ -1332,6 +1353,19 @@ pub fn starter_rules() -> Vec<Rule> {
 		// 169.254 IP but exposes metadata under `/opc/`, so the AWS `/latest/meta-data` path rule does
 		// not fire). Value-inspection, no client IP needed. <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery/cloud-ssrf>
 		Rule { id: "ssrf_vendor_metadata", category: WafCategory::Ssrf, pattern: r"(?i)(100\.100\.100\.200|/opc/v[12]/)" },
+		// Public wildcard-DNS ("magic DNS") resolvers abused to defeat a hostname allowlist / SSRF
+		// filter: `<anything>.127.0.0.1.nip.io` resolves straight back to 127.0.0.1, so a target that
+		// *looks* like an external hostname reaches an internal address. `nip.io`/`sslip.io`/`xip.io`
+		// are the canonical services; `1u.ms` and `traefik.me` are the current additions to the SSRF
+		// toolkit. These domains do not appear as a legitimate fetch target from an onion app; an
+		// operator who genuinely uses one can disable this rule.
+		// <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery>
+		Rule { id: "ssrf_wildcard_dns", category: WafCategory::Ssrf, pattern: r"(?i)\b(nip\.io|sslip\.io|xip\.io|1u\.ms|traefik\.me)\b" },
+		// Expanded / alternate IPv6 loopback + unspecified-address forms the literal `[::1]` in
+		// `ssrf_loopback_url` misses: the fully-written-out `[0:0:0:0:0:0:0:1]` (leading zeros per group
+		// tolerated) and the all-zeros `[::]` bind/unspecified address, which routes to loopback on many
+		// stacks. The IPv4-mapped `[::ffff:127.0.0.1]` is already covered by `ssrf_obfuscated_loopback`.
+		Rule { id: "ssrf_ipv6_loopback_expanded", category: WafCategory::Ssrf, pattern: r"(?i)(\[(?:0{1,4}:){7}0{0,3}1\]|\[::\])" },
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
@@ -1347,6 +1381,20 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_ssti_hash_delim", category: WafCategory::CodeInjection, pattern: r"#\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_razor", category: WafCategory::CodeInjection, pattern: r"@\(\s*\d+\s*[*]\s*\d+\s*\)" },
 		Rule { id: "code_ssti_thymeleaf", category: WafCategory::CodeInjection, pattern: r"\*\{\s*\d+\s*[*]\s*\d+\s*\}" },
+		// Java-template-engine RCE gadgets past the arithmetic *probes* above — the payloads that go from
+		// "SSTI confirmed" to code execution:
+		//   - Freemarker (`code_ssti_freemarker`): the canonical `freemarker.template.utility.Execute`
+		//     class, and the `?new("com.foo.Bar")` built-in that instantiates an arbitrary class (the
+		//     quote after `?new(` is the false-positive guard — a benign `?new=1` query never produces
+		//     `?new("`). The Freemarker directive syntax otherwise overlaps rich text too much to key on.
+		//   - Java reflection bridge (`code_java_reflection`): the `.getClass().forName(` /
+		//     `.getClass().getMethod(` chain Velocity, Freemarker, OGNL, and general Java SSTI all use to
+		//     pivot to an arbitrary class — the reflection form that `code_java_runtime_exec` (keyed on
+		//     `Runtime.getRuntime()` / `new ProcessBuilder`) misses when the payload reaches `Runtime`
+		//     through `''.getClass().forName('java.lang.Runtime')` instead. This exact chain never
+		//     appears in benign request input. <https://portswigger.net/research/server-side-template-injection>
+		Rule { id: "code_ssti_freemarker", category: WafCategory::CodeInjection, pattern: r#"(?i)(freemarker\.template\.utility\.execute|\?new\s*\(\s*["'])"# },
+		Rule { id: "code_java_reflection", category: WafCategory::CodeInjection, pattern: r"(?i)\.\s*getclass\s*\(\s*\)\s*\.\s*(forname|getmethod|getdeclaredmethod|getconstructor|getdeclaredconstructor)\b" },
 		// Java serialized-object stream smuggled base64 through a text field (cookie/header/body) — the
 		// delivery vehicle for a Commons-Collections-style gadget chain. `rO0AB…` is the base64 opener
 		// of the raw `\xac\xed\x00\x05` STREAM_MAGIC header (the raw bytes rarely survive as valid UTF-8
@@ -1354,6 +1402,21 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `Cs7QAF` gzip/variant openers OWASP-CRS rule 944210 lists alongside the raw one. Case-SENSITIVE
 		// (base64 is) — the exact openers do not occur in benign text. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
 		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"(?:rO0AB[A-Za-z0-9+/=]{2,}|KztAAU|Cs7QAF)" },
+		// .NET deserialization gadgets, the ysoserial.net analog of the Java rule above: the
+		// `AAEAAAD/////` base64 opener of a `BinaryFormatter` stream's `SerializationHeaderRecord`
+		// (case-sensitive, essentially zero-FP), the `ObjectDataProvider` gadget class that virtually
+		// every .NET chain routes through, and the Json.NET `TypeNameHandling` RCE vector — a JSON body
+		// carrying `"$type":"System.…"` that drives the deserializer to instantiate an attacker-named
+		// type. The base64 opener stays case-sensitive; the two textual gadgets are `(?i)`.
+		// <https://github.com/pwntester/ysoserial.net>
+		Rule { id: "code_dotnet_serialized", category: WafCategory::CodeInjection, pattern: r#"(?:AAEAAAD/////|(?i:objectdataprovider|windowsidentity|\$type"\s*:\s*"system\.))"# },
+		// PyYAML unsafe-load RCE tag (the `yaml.load`-without-`SafeLoader` gadget): an
+		// `!!python/object/apply:os.system` / `!!python/object/new:` / `!!python/module:` /
+		// `!!python/name:` YAML tag that instantiates or calls an arbitrary Python callable during
+		// deserialization. The `!!python/` tag prefix does not occur in benign request input, so no
+		// context anchor is needed. <https://pyyaml.org/wiki/PyYAMLDocumentation> (the `load` vs
+		// `safe_load` RCE class, CVE-2020-14343 and kin).
+		Rule { id: "code_python_yaml_deserialize", category: WafCategory::CodeInjection, pattern: r"(?i)!!python/(object|module|name)\b" },
 		// Double-extension upload filename (the file-upload RCE vector behind CVE-2026-33691): a
 		// benign-looking media/document/archive extension immediately followed by a *trailing*
 		// server-script extension — `avatar.jpg.php`, `report.pdf.jsp`, `notes.txt.phtml`. The
@@ -1405,6 +1468,20 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `.resources.context.parent.pipeline` tail (attackers vary the tail) — the head never occurs in
 		// benign HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
 		Rule { id: "code_spring4shell", category: WafCategory::CodeInjection, pattern: r"(?i)(class\.module\.classloader|springframework\.context\.support\.filesystemxmlapplicationcontext)" },
+		// OGNL expression-language injection (OWASP-CRS 944xxx / Apache Struts CVE-2017-5638 S2-045 and
+		// kin): the sandbox-escape gadgets a Struts OGNL payload carries — a static-method reference
+		// `@java.lang.Runtime@getRuntime()` (double-`@`-wrapped fully-qualified class, near-unique to
+		// OGNL), the `#_memberAccess` sandbox toggle, and the `#context[...]` OGNL context-map access.
+		// `code_spring4shell` catches only the Spring class-loader head; these are the OGNL evaluation
+		// gadgets it misses. The double-`@` FQN and `#_memberAccess` do not occur in benign HTTP.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_ognl_injection", category: WafCategory::CodeInjection, pattern: r"(?i)(@(?:java|javax|ognl|sun|com\.opensymphony)\.[\w.]+@|#_memberaccess\b|#context\s*\[|@ognl\.ognlcontext@)" },
+		// Spring Expression Language (SpEL) injection (OWASP-CRS 944xxx): the SpEL type-reference
+		// operator `T(java.lang.Runtime)` / `T(java.lang.ProcessBuilder)` that reaches a static class to
+		// pivot to RCE, plus the fully-qualified `new java.lang.ProcessBuilder(...)` / `new java.lang.
+		// Runtime` instantiation the FQN-less `code_java_runtime_exec` (keyed on `new ProcessBuilder`)
+		// misses. The `T(java.lang.…` type-operator form is essentially unique to SpEL. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_spel_injection", category: WafCategory::CodeInjection, pattern: r"(?i)(\bt\s*\(\s*java\.lang\.(?:runtime|processbuilder|system|class)\b|new\s+java\.lang\.(?:processbuilder|runtime)\b)" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -1425,6 +1502,19 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "xxe_entity_decl", category: WafCategory::Xxe, pattern: r"(?i)<!entity\b" },
 		Rule { id: "xxe_entity_external", category: WafCategory::Xxe, pattern: r"(?i)<!entity[\s\S]{0,200}\b(system|public)\b" },
 		Rule { id: "xxe_doctype_dtd", category: WafCategory::Xxe, pattern: r"(?i)<!doctype[\s\S]{0,200}\[" },
+		// --- XPath / XQuery injection (XML-query break-out; value inspection, no client IP) ---
+		// An XPath *axis step* — the `axisname::` navigation operator. Only the axes with no plausible
+		// benign collision are listed: `ancestor(-or-self)::`, `descendant(-or-self)::`, and the
+		// `following`/`preceding`(-sibling) family. Deliberately excludes `child::`/`self::`/`namespace::`,
+		// which collide with Rust/PHP `self::`/`Type::` and C++ `std::` in a posted code sample. The
+		// `axisname::` token essentially never occurs outside an XPath expression.
+		Rule { id: "xpathi_axis", category: WafCategory::XPathInjection, pattern: r"(?i)\b(ancestor(-or-self)?|descendant(-or-self)?|following(-sibling)?|preceding(-sibling)?)::" },
+		// XQuery / XPath structural injection: an XQuery FLWOR expression (`for $x in … return …`), a
+		// namespace/element prolog declaration (`declare namespace …` / `declare default element …`), or
+		// a node-set count over a location path (`count(//…)` / `count(/…)`). All three are XML-query
+		// idioms that do not appear in ordinary request input; the FLWOR rule requires both the `for $var
+		// in` head and a trailing `return` so a stray `for`/`return` in prose stays clean.
+		Rule { id: "xpathi_xquery", category: WafCategory::XPathInjection, pattern: r"(?i)(\bdeclare\s+(namespace|default\s+(element|function))\b|\bfor\s+\$\w+\s+in\b[\s\S]{0,80}\breturn\b|\bcount\s*\(\s*/)" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -1533,6 +1623,31 @@ mod tests {
 		let m = blocked(&v);
 		assert_eq!(m.category, WafCategory::PathTraversal);
 		assert_eq!(m.location, "target");
+	}
+
+	#[test]
+	fn traversal_overlong_utf8_is_blocked() {
+		// Overlong-UTF-8 encodings of `.`/`/`/`\` that the single-decode `traversal_encoded` (keyed on
+		// `%2e%2e`) does not see. (Double URL-encoding is handled separately by the multiple-encoding
+		// anomaly guard — see `double_encoded_input_is_blocked_as_anomaly`.)
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("/x?p=%c0%ae%c0%ae%c0%afetc", "target").unwrap().rule_id, "traversal_overlong_utf8");
+		assert_eq!(waf.inspect_str("/y?p=%e0%80%afboot.ini", "target").unwrap().category, WafCategory::PathTraversal);
+		assert_eq!(waf.inspect_str("/z?p=%c1%9cwindows", "target").unwrap().rule_id, "traversal_overlong_utf8");
+	}
+
+	#[test]
+	fn traversal_overlong_utf8_keeps_false_positives_low() {
+		// A once-encoded space (`%20`), a single-encoded `.`, and a `%c0` not part of an overlong
+		// sequence all stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/search?q=hello%20world",       // `%20`, an ordinary encoded space
+			"/img?name=photo%2ejpg",          // single-encoded `.`, not an overlong `%c0%ae`
+			"/theme?c=%c0ffee",               // `%c0` not followed by `%ae`/`%af`
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
 	}
 
 	#[test]
@@ -2750,6 +2865,33 @@ mod tests {
 	}
 
 	#[test]
+	fn ssrf_wildcard_dns_and_expanded_ipv6_loopback_match() {
+		// Wildcard-DNS rebinding services and the expanded/unspecified IPv6 loopback the literal `[::1]`
+		// rule misses.
+		let waf = Waf::starter();
+		// (Use a host with no literal loopback/metadata IP embedded, so this asserts the DNS rule and
+		// not the earlier IP/loopback rules that would shadow `127.0.0.1.nip.io`.)
+		assert_eq!(waf.inspect_str("url=http://internal-admin.nip.io/", "query").unwrap().rule_id, "ssrf_wildcard_dns");
+		assert_eq!(waf.inspect_str("u=http://internal.sslip.io/admin", "body").unwrap().category, WafCategory::Ssrf);
+		assert_eq!(waf.inspect_str("u=http://[0:0:0:0:0:0:0:1]:8080/", "query").unwrap().rule_id, "ssrf_ipv6_loopback_expanded");
+		assert_eq!(waf.inspect_str("u=http://[::]/metadata", "body").unwrap().rule_id, "ssrf_ipv6_loopback_expanded");
+	}
+
+	#[test]
+	fn ssrf_wildcard_dns_and_expanded_ipv6_keep_false_positives_low() {
+		// A hostname that merely ends in `.io` (not a wildcard-DNS service), and an ordinary expanded
+		// IPv6 that isn't loopback, both stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/redirect?to=https://myapp.io/home",     // `.io` TLD, not nip.io/sslip.io/xip.io
+			"/docs/ipv6-loopback-explained",           // prose about loopback
+			"/net?addr=[2001:0db8:0:0:0:0:0:1]",       // a documentation-range IPv6, not `::1`/`::`
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
 	fn ssrf_category_metadata_is_stable() {
 		assert_eq!(WafCategory::Ssrf.name(), "ssrf");
 		assert_eq!(WafCategory::ALL[WafCategory::Ssrf.index()], WafCategory::Ssrf);
@@ -2787,6 +2929,33 @@ mod tests {
 		// interpolation, an @-handle, a plain hash-braced variable.
 		let waf = Waf::starter();
 		for uri in ["/style?tpl=color:%23{$brand}", "/u/@(alice)", "/i18n?msg=%23{greeting}"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn java_template_rce_gadgets_match() {
+		// Java-template-engine RCE gadgets past the arithmetic probes: Freemarker `Execute`/`?new("…")`
+		// and the shared `.getClass().forName(` reflection bridge (Velocity/Freemarker/OGNL).
+		let waf = Waf::starter();
+		// (The `<#assign …=…>` directive form also reads as a SQL comment `#…=`, which sorts first —
+		// assert the Freemarker rule on the Execute-FQN and `?new("` forms, which carry no `#`.)
+		assert_eq!(waf.inspect_str(r#"x=freemarker.template.utility.Execute("id")"#, "body").unwrap().rule_id, "code_ssti_freemarker");
+		assert_eq!(waf.inspect_str(r#"v=?new("java.lang.ProcessBuilder")"#, "query").unwrap().rule_id, "code_ssti_freemarker");
+		assert_eq!(waf.inspect_str("p=''.getClass().forName('java.lang.Runtime')", "body").unwrap().rule_id, "code_java_reflection");
+		assert_eq!(waf.inspect_str("q=obj.getClass().getMethod('exec')", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn java_template_rce_gadgets_keep_false_positives_low() {
+		// A `?new=` query param (no quote), a Freemarker docs page, and a `.getClass()` type check that
+		// does not chain into reflection all stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/shop?new=1&sort=price",              // `?new=` param, not the `?new("` builtin
+			"/docs/freemarker-template-guide",     // "freemarker" prose, no Execute FQN
+			"/api?t=x.getClass().getName()",       // `.getClass()` then getName — not a reflect pivot
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}
@@ -2894,6 +3063,38 @@ mod tests {
 	}
 
 	#[test]
+	fn ognl_and_spel_injection_match() {
+		// OWASP-CRS 944xxx OGNL/SpEL evaluation gadgets `code_spring4shell` doesn't reach.
+		let waf = Waf::starter();
+		// OGNL: the double-@-wrapped static-method reference, the sandbox toggle, the context-map access.
+		assert_eq!(waf.inspect_str("x=@java.lang.Runtime@getRuntime().exec('id')", "query").unwrap().rule_id, "code_ognl_injection");
+		// (`#_memberAccess=` alone would also read as a SQL comment `#…=`, which sorts first; use the
+		// comma form so this asserts the OGNL rule specifically.)
+		assert_eq!(waf.inspect_str("q=(#_memberAccess,@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)", "body").unwrap().category, WafCategory::CodeInjection);
+		assert_eq!(waf.inspect_str("p=#context['xwork.MethodAccessor.denyMethodExecution']", "body").unwrap().rule_id, "code_ognl_injection");
+		// SpEL: the `T(...)` type operator and the FQN `new java.lang.ProcessBuilder`.
+		assert_eq!(waf.inspect_str("v=T(java.lang.Runtime).getRuntime().exec('id')", "query").unwrap().rule_id, "code_spel_injection");
+		assert_eq!(waf.inspect_str("v=new java.lang.ProcessBuilder('sh','-c','id')", "body").unwrap().rule_id, "code_spel_injection");
+	}
+
+	#[test]
+	fn ognl_and_spel_keep_false_positives_low() {
+		// A Java email address (single `@`), an OGNL/SpEL docs page, and prose naming `Runtime` all stay
+		// clean — the rules need the double-`@` FQN, the `T(java.lang.…` operator, or the `#_memberAccess`
+		// / `#context[` OGNL tokens.
+		let waf = Waf::starter();
+		for uri in [
+			"/contact?email=dev@java.example.com",   // single-@ address, not the @FQN@ static ref
+			"/docs/spring-expression-language",       // "spel" prose, no `T(java.lang` operator
+			"/blog/java-runtime-tuning",              // "runtime" word, no gadget
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+		// A plain `T(x)` generic-type mention without the `java.lang.` target stays clean.
+		assert!(waf.inspect_str("type=T(String)", "query").is_none(), "generic T( without java.lang should not trip");
+	}
+
+	#[test]
 	fn java_serialized_variant_markers_match() {
 		// The `rO0AB…` raw base64 opener was already covered; this asserts the CRS 944210 gzip/variant
 		// openers (`KztAAU` / `Cs7QAF`) added to the same `code_java_serialized` rule also trip.
@@ -2913,6 +3114,34 @@ mod tests {
 			"/files/ro0abstract-notes.txt",  // lowercase "ro0ab", not the case-sensitive marker
 			"/img/logo-rO0.png",             // partial, no full `rO0AB` opener
 			"/data/kztaau-lowercase.bin",    // lowercased variant opener stays clean
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn dotnet_and_python_deserialization_match() {
+		// The cross-language deserialization gadgets alongside the Java `rO0AB…` rule.
+		let waf = Waf::starter();
+		// .NET: BinaryFormatter base64 header, the ObjectDataProvider gadget, Json.NET type-handling.
+		assert_eq!(waf.inspect_str("state=AAEAAAD/////AAAAAAEAAAA", "body").unwrap().rule_id, "code_dotnet_serialized");
+		assert_eq!(waf.inspect_str("x=System.Windows.Data.ObjectDataProvider", "query").unwrap().rule_id, "code_dotnet_serialized");
+		assert_eq!(waf.inspect_str(r#"b={"$type":"System.Windows.Data.ObjectDataProvider"}"#, "body").unwrap().category, WafCategory::CodeInjection);
+		// PyYAML unsafe-load tags.
+		assert_eq!(waf.inspect_str("y=!!python/object/apply:os.system", "body").unwrap().rule_id, "code_python_yaml_deserialize");
+		assert_eq!(waf.inspect_str("y=!!python/name:subprocess.check_output", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn dotnet_and_python_deserialization_keep_false_positives_low() {
+		// The .NET base64 header is case-sensitive so a lowercased look-alike stays clean; ordinary
+		// prose mentioning YAML or a `$type` field without the `System.`/`!!python/` gadget passes.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("aaeaaad-lowercase-token", "query").is_none(), "lowercased .NET header should not trip");
+		for uri in [
+			"/docs/yaml-vs-json",                 // "yaml" prose, no `!!python/` tag
+			"/api?type=user",                      // a `type=` param, not Json.NET `$type":"System.`
+			"/blog/dotnet-serialization-guide",   // prose, no BinaryFormatter/ObjectDataProvider marker
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
@@ -3068,6 +3297,48 @@ mod tests {
 	}
 
 	#[test]
+	fn xpath_injection_rules_match() {
+		// The XPath/XQuery break-out idioms all attribute to the XPathInjection class.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("q=//user[name='x']/ancestor::account", "query").unwrap().rule_id, "xpathi_axis");
+		assert_eq!(waf.inspect_str("p=/root/descendant-or-self::node()", "body").unwrap().category, WafCategory::XPathInjection);
+		assert_eq!(waf.inspect_str("v=/a/following-sibling::secret", "query").unwrap().rule_id, "xpathi_axis");
+		assert_eq!(waf.inspect_str("q=for $u in /users/user return $u/password", "body").unwrap().rule_id, "xpathi_xquery");
+		assert_eq!(waf.inspect_str(r#"d=declare namespace evil = "http://x"#, "body").unwrap().rule_id, "xpathi_xquery");
+		assert_eq!(waf.inspect_str("n=count(//user)", "query").unwrap().category, WafCategory::XPathInjection);
+	}
+
+	#[test]
+	fn xpath_injection_keeps_false_positives_low() {
+		// Generic `::` scope operators from posted Rust/PHP/C++ code (not XPath axes), an "ancestor"
+		// word with no axis `::`, a `for`/`return` in prose without the FLWOR shape, and a `count(` that
+		// isn't over a location path all stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/code?snip=Foo::bar",                 // generic `::`, not an axis name
+			"/rust?use=std::collections::HashMap",  // `std::` scope op, excluded axis set
+			"/php?c=self::render",                  // `self::` deliberately excluded (PHP/Rust collision)
+			"/search?q=ancestor+of+the+node",       // "ancestor" prose, no `::`
+			"/blog/for-loops-and-return-values",    // "for"/"return" prose, no `$var in` FLWOR
+			"/calc?f=count(items)",                 // `count(` not over a `/` location path
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn xpath_category_metadata_is_stable() {
+		assert_eq!(WafCategory::XPathInjection.name(), "xpath_injection");
+		assert_eq!(WafCategory::XPathInjection.weight(), WafCategory::Sqli.weight());
+		assert_eq!(WafCategory::ALL.len(), 12);
+		// Appending the category kept the index a bijection.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+		assert_eq!(WafCategory::XPathInjection.index(), 11);
+	}
+
+	#[test]
 	fn crs_restricted_file_access_matches() {
 		// VCS trees, framework configs, secrets files, and backup/dump artifacts all attribute
 		// to the PathTraversal class.
@@ -3172,8 +3443,8 @@ mod tests {
 		assert_eq!(WafCategory::ScannerDetection.name(), "scanner_detection");
 		assert_eq!(WafCategory::ScannerDetection.weight(), WafCategory::Sqli.weight());
 		assert_eq!(WafCategory::ALL[WafCategory::ScannerDetection.index()], WafCategory::ScannerDetection);
-		// The index is still a bijection over every category (now eleven).
-		assert_eq!(WafCategory::ALL.len(), 11);
+		// The index is still a bijection over every category (now twelve, after XPathInjection).
+		assert_eq!(WafCategory::ALL.len(), 12);
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}

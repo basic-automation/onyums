@@ -1405,6 +1405,20 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `.resources.context.parent.pipeline` tail (attackers vary the tail) — the head never occurs in
 		// benign HTTP. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
 		Rule { id: "code_spring4shell", category: WafCategory::CodeInjection, pattern: r"(?i)(class\.module\.classloader|springframework\.context\.support\.filesystemxmlapplicationcontext)" },
+		// OGNL expression-language injection (OWASP-CRS 944xxx / Apache Struts CVE-2017-5638 S2-045 and
+		// kin): the sandbox-escape gadgets a Struts OGNL payload carries — a static-method reference
+		// `@java.lang.Runtime@getRuntime()` (double-`@`-wrapped fully-qualified class, near-unique to
+		// OGNL), the `#_memberAccess` sandbox toggle, and the `#context[...]` OGNL context-map access.
+		// `code_spring4shell` catches only the Spring class-loader head; these are the OGNL evaluation
+		// gadgets it misses. The double-`@` FQN and `#_memberAccess` do not occur in benign HTTP.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_ognl_injection", category: WafCategory::CodeInjection, pattern: r"(?i)(@(?:java|javax|ognl|sun|com\.opensymphony)\.[\w.]+@|#_memberaccess\b|#context\s*\[|@ognl\.ognlcontext@)" },
+		// Spring Expression Language (SpEL) injection (OWASP-CRS 944xxx): the SpEL type-reference
+		// operator `T(java.lang.Runtime)` / `T(java.lang.ProcessBuilder)` that reaches a static class to
+		// pivot to RCE, plus the fully-qualified `new java.lang.ProcessBuilder(...)` / `new java.lang.
+		// Runtime` instantiation the FQN-less `code_java_runtime_exec` (keyed on `new ProcessBuilder`)
+		// misses. The `T(java.lang.…` type-operator form is essentially unique to SpEL. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
+		Rule { id: "code_spel_injection", category: WafCategory::CodeInjection, pattern: r"(?i)(\bt\s*\(\s*java\.lang\.(?:runtime|processbuilder|system|class)\b|new\s+java\.lang\.(?:processbuilder|runtime)\b)" },
 		// --- NoSQL injection (MongoDB query-operator smuggling; value inspection, no client IP) ---
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
@@ -2891,6 +2905,38 @@ mod tests {
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn ognl_and_spel_injection_match() {
+		// OWASP-CRS 944xxx OGNL/SpEL evaluation gadgets `code_spring4shell` doesn't reach.
+		let waf = Waf::starter();
+		// OGNL: the double-@-wrapped static-method reference, the sandbox toggle, the context-map access.
+		assert_eq!(waf.inspect_str("x=@java.lang.Runtime@getRuntime().exec('id')", "query").unwrap().rule_id, "code_ognl_injection");
+		// (`#_memberAccess=` alone would also read as a SQL comment `#…=`, which sorts first; use the
+		// comma form so this asserts the OGNL rule specifically.)
+		assert_eq!(waf.inspect_str("q=(#_memberAccess,@ognl.OgnlContext@DEFAULT_MEMBER_ACCESS)", "body").unwrap().category, WafCategory::CodeInjection);
+		assert_eq!(waf.inspect_str("p=#context['xwork.MethodAccessor.denyMethodExecution']", "body").unwrap().rule_id, "code_ognl_injection");
+		// SpEL: the `T(...)` type operator and the FQN `new java.lang.ProcessBuilder`.
+		assert_eq!(waf.inspect_str("v=T(java.lang.Runtime).getRuntime().exec('id')", "query").unwrap().rule_id, "code_spel_injection");
+		assert_eq!(waf.inspect_str("v=new java.lang.ProcessBuilder('sh','-c','id')", "body").unwrap().rule_id, "code_spel_injection");
+	}
+
+	#[test]
+	fn ognl_and_spel_keep_false_positives_low() {
+		// A Java email address (single `@`), an OGNL/SpEL docs page, and prose naming `Runtime` all stay
+		// clean — the rules need the double-`@` FQN, the `T(java.lang.…` operator, or the `#_memberAccess`
+		// / `#context[` OGNL tokens.
+		let waf = Waf::starter();
+		for uri in [
+			"/contact?email=dev@java.example.com",   // single-@ address, not the @FQN@ static ref
+			"/docs/spring-expression-language",       // "spel" prose, no `T(java.lang` operator
+			"/blog/java-runtime-tuning",              // "runtime" word, no gadget
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+		// A plain `T(x)` generic-type mention without the `java.lang.` target stays clean.
+		assert!(waf.inspect_str("type=T(String)", "query").is_none(), "generic T( without java.lang should not trip");
 	}
 
 	#[test]

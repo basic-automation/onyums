@@ -1378,6 +1378,21 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `Cs7QAF` gzip/variant openers OWASP-CRS rule 944210 lists alongside the raw one. Case-SENSITIVE
 		// (base64 is) — the exact openers do not occur in benign text. <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-944-APPLICATION-ATTACK-JAVA.conf>
 		Rule { id: "code_java_serialized", category: WafCategory::CodeInjection, pattern: r"(?:rO0AB[A-Za-z0-9+/=]{2,}|KztAAU|Cs7QAF)" },
+		// .NET deserialization gadgets, the ysoserial.net analog of the Java rule above: the
+		// `AAEAAAD/////` base64 opener of a `BinaryFormatter` stream's `SerializationHeaderRecord`
+		// (case-sensitive, essentially zero-FP), the `ObjectDataProvider` gadget class that virtually
+		// every .NET chain routes through, and the Json.NET `TypeNameHandling` RCE vector — a JSON body
+		// carrying `"$type":"System.…"` that drives the deserializer to instantiate an attacker-named
+		// type. The base64 opener stays case-sensitive; the two textual gadgets are `(?i)`.
+		// <https://github.com/pwntester/ysoserial.net>
+		Rule { id: "code_dotnet_serialized", category: WafCategory::CodeInjection, pattern: r#"(?:AAEAAAD/////|(?i:objectdataprovider|windowsidentity|\$type"\s*:\s*"system\.))"# },
+		// PyYAML unsafe-load RCE tag (the `yaml.load`-without-`SafeLoader` gadget): an
+		// `!!python/object/apply:os.system` / `!!python/object/new:` / `!!python/module:` /
+		// `!!python/name:` YAML tag that instantiates or calls an arbitrary Python callable during
+		// deserialization. The `!!python/` tag prefix does not occur in benign request input, so no
+		// context anchor is needed. <https://pyyaml.org/wiki/PyYAMLDocumentation> (the `load` vs
+		// `safe_load` RCE class, CVE-2020-14343 and kin).
+		Rule { id: "code_python_yaml_deserialize", category: WafCategory::CodeInjection, pattern: r"(?i)!!python/(object|module|name)\b" },
 		// Double-extension upload filename (the file-upload RCE vector behind CVE-2026-33691): a
 		// benign-looking media/document/archive extension immediately followed by a *trailing*
 		// server-script extension — `avatar.jpg.php`, `report.pdf.jsp`, `notes.txt.phtml`. The
@@ -3023,6 +3038,34 @@ mod tests {
 			"/files/ro0abstract-notes.txt",  // lowercase "ro0ab", not the case-sensitive marker
 			"/img/logo-rO0.png",             // partial, no full `rO0AB` opener
 			"/data/kztaau-lowercase.bin",    // lowercased variant opener stays clean
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn dotnet_and_python_deserialization_match() {
+		// The cross-language deserialization gadgets alongside the Java `rO0AB…` rule.
+		let waf = Waf::starter();
+		// .NET: BinaryFormatter base64 header, the ObjectDataProvider gadget, Json.NET type-handling.
+		assert_eq!(waf.inspect_str("state=AAEAAAD/////AAAAAAEAAAA", "body").unwrap().rule_id, "code_dotnet_serialized");
+		assert_eq!(waf.inspect_str("x=System.Windows.Data.ObjectDataProvider", "query").unwrap().rule_id, "code_dotnet_serialized");
+		assert_eq!(waf.inspect_str(r#"b={"$type":"System.Windows.Data.ObjectDataProvider"}"#, "body").unwrap().category, WafCategory::CodeInjection);
+		// PyYAML unsafe-load tags.
+		assert_eq!(waf.inspect_str("y=!!python/object/apply:os.system", "body").unwrap().rule_id, "code_python_yaml_deserialize");
+		assert_eq!(waf.inspect_str("y=!!python/name:subprocess.check_output", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn dotnet_and_python_deserialization_keep_false_positives_low() {
+		// The .NET base64 header is case-sensitive so a lowercased look-alike stays clean; ordinary
+		// prose mentioning YAML or a `$type` field without the `System.`/`!!python/` gadget passes.
+		let waf = Waf::starter();
+		assert!(waf.inspect_str("aaeaaad-lowercase-token", "query").is_none(), "lowercased .NET header should not trip");
+		for uri in [
+			"/docs/yaml-vs-json",                 // "yaml" prose, no `!!python/` tag
+			"/api?type=user",                      // a `type=` param, not Json.NET `$type":"System.`
+			"/blog/dotnet-serialization-guide",   // prose, no BinaryFormatter/ObjectDataProvider marker
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

@@ -1347,6 +1347,20 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "code_ssti_hash_delim", category: WafCategory::CodeInjection, pattern: r"#\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_razor", category: WafCategory::CodeInjection, pattern: r"@\(\s*\d+\s*[*]\s*\d+\s*\)" },
 		Rule { id: "code_ssti_thymeleaf", category: WafCategory::CodeInjection, pattern: r"\*\{\s*\d+\s*[*]\s*\d+\s*\}" },
+		// Java-template-engine RCE gadgets past the arithmetic *probes* above — the payloads that go from
+		// "SSTI confirmed" to code execution:
+		//   - Freemarker (`code_ssti_freemarker`): the canonical `freemarker.template.utility.Execute`
+		//     class, and the `?new("com.foo.Bar")` built-in that instantiates an arbitrary class (the
+		//     quote after `?new(` is the false-positive guard — a benign `?new=1` query never produces
+		//     `?new("`). The Freemarker directive syntax otherwise overlaps rich text too much to key on.
+		//   - Java reflection bridge (`code_java_reflection`): the `.getClass().forName(` /
+		//     `.getClass().getMethod(` chain Velocity, Freemarker, OGNL, and general Java SSTI all use to
+		//     pivot to an arbitrary class — the reflection form that `code_java_runtime_exec` (keyed on
+		//     `Runtime.getRuntime()` / `new ProcessBuilder`) misses when the payload reaches `Runtime`
+		//     through `''.getClass().forName('java.lang.Runtime')` instead. This exact chain never
+		//     appears in benign request input. <https://portswigger.net/research/server-side-template-injection>
+		Rule { id: "code_ssti_freemarker", category: WafCategory::CodeInjection, pattern: r#"(?i)(freemarker\.template\.utility\.execute|\?new\s*\(\s*["'])"# },
+		Rule { id: "code_java_reflection", category: WafCategory::CodeInjection, pattern: r"(?i)\.\s*getclass\s*\(\s*\)\s*\.\s*(forname|getmethod|getdeclaredmethod|getconstructor|getdeclaredconstructor)\b" },
 		// Java serialized-object stream smuggled base64 through a text field (cookie/header/body) — the
 		// delivery vehicle for a Commons-Collections-style gadget chain. `rO0AB…` is the base64 opener
 		// of the raw `\xac\xed\x00\x05` STREAM_MAGIC header (the raw bytes rarely survive as valid UTF-8
@@ -2801,6 +2815,33 @@ mod tests {
 		// interpolation, an @-handle, a plain hash-braced variable.
 		let waf = Waf::starter();
 		for uri in ["/style?tpl=color:%23{$brand}", "/u/@(alice)", "/i18n?msg=%23{greeting}"] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn java_template_rce_gadgets_match() {
+		// Java-template-engine RCE gadgets past the arithmetic probes: Freemarker `Execute`/`?new("…")`
+		// and the shared `.getClass().forName(` reflection bridge (Velocity/Freemarker/OGNL).
+		let waf = Waf::starter();
+		// (The `<#assign …=…>` directive form also reads as a SQL comment `#…=`, which sorts first —
+		// assert the Freemarker rule on the Execute-FQN and `?new("` forms, which carry no `#`.)
+		assert_eq!(waf.inspect_str(r#"x=freemarker.template.utility.Execute("id")"#, "body").unwrap().rule_id, "code_ssti_freemarker");
+		assert_eq!(waf.inspect_str(r#"v=?new("java.lang.ProcessBuilder")"#, "query").unwrap().rule_id, "code_ssti_freemarker");
+		assert_eq!(waf.inspect_str("p=''.getClass().forName('java.lang.Runtime')", "body").unwrap().rule_id, "code_java_reflection");
+		assert_eq!(waf.inspect_str("q=obj.getClass().getMethod('exec')", "query").unwrap().category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn java_template_rce_gadgets_keep_false_positives_low() {
+		// A `?new=` query param (no quote), a Freemarker docs page, and a `.getClass()` type check that
+		// does not chain into reflection all stay clean.
+		let waf = Waf::starter();
+		for uri in [
+			"/shop?new=1&sort=price",              // `?new=` param, not the `?new("` builtin
+			"/docs/freemarker-template-guide",     // "freemarker" prose, no Execute FQN
+			"/api?t=x.getClass().getName()",       // `.getClass()` then getName — not a reflect pivot
+		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
 	}

@@ -61,8 +61,10 @@ Onyums is a library — add it to an async binary. No external Tor daemon is
 required: the [Arti](https://gitlab.torproject.org/tpo/core/arti) Tor client is
 embedded, so the first run downloads Tor consensus data over the network and
 creates the keystore/cache under `./tor/onyums/` itself. It uses Rust **edition
-2024**, so a recent stable toolchain (Rust 1.85 or newer) is required; a pinned,
-CI-enforced MSRV is still on the roadmap.
+2024** and its MSRV is **Rust 1.90**, declared as `rust-version` in the manifest
+and enforced in CI. The floor comes from the embedded arti 0.43 stack, not the
+edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate, which
+carries none of arti, is usable on **1.89**.
 
 ## Features
 

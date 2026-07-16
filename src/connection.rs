@@ -20,6 +20,28 @@ use hyper::{body::Incoming, Request};
 /// connection"), which is the handle for per-circuit isolation of application state. Use
 /// the typed helpers ([`is_over_tor`](Self::is_over_tor), [`circuit`](Self::circuit),
 /// [`same_circuit`](Self::same_circuit)) rather than matching on the raw fields.
+///
+/// # A circuit id is not an identity
+///
+/// It is tempting to reach for this as "the user", because it is the only per-client
+/// thing Tor leaves you. Do not. The id is **synthetic and short-lived**: onyums mints it
+/// per rendezvous circuit (arti exposes no durable circuit identifier), it is forgotten
+/// when the circuit's streams drain, and a client can open a new circuit whenever it
+/// likes — an attacker most of all. Concretely:
+///
+/// - **It is not stable for a user.** The same person gets a new id on reconnect, and
+///   nothing links the two. Session state keyed on it silently evaporates.
+/// - **It is not a limit.** Anything you ration per circuit — a rate limit, a ban, a
+///   quota — is rotated around by opening another circuit. It raises cost; it does not
+///   deny.
+/// - **It is not authentication.** It says two requests shared a circuit, nothing about
+///   *who* is on the other end.
+///
+/// So use it for what it is: isolating per-connection state (a scratch buffer, a
+/// per-connection cache) and cheap correlation within one circuit's lifetime. Anything
+/// that must outlive a circuit or resist an adversary belongs on something durable — a
+/// Skin clearance token (signed, and what Skin's own rate limiting keys on), a
+/// restricted-discovery client key, or your application's own session/auth.
 #[derive(Clone, Debug, Default)]
 pub struct ConnectionInfo {
 	pub circuit_id: Option<String>,

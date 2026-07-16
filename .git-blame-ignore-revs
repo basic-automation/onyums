@@ -1,0 +1,13 @@
+# Commits that are pure formatting/mechanical churn — `git blame` should look through
+# them to the change that actually wrote the line.
+#
+# Enable locally (once):
+#     git config blame.ignoreRevsFile .git-blame-ignore-revs
+#
+# GitHub honours this file automatically. Only add a commit here if it changed *no*
+# behaviour — a reformat, a mass rename — never a real change.
+
+# style: reformat the workspace and add a pinned-nightly `cargo fmt --check` job
+# (2026-07-16). `cargo +nightly-2026-07-13 fmt --all` over 32 files; no behaviour change,
+# test counts identical before and after.
+9c5837653650ce2296a38eab866ee8d1f3141334

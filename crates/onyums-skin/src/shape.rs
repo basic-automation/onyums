@@ -19,9 +19,7 @@
 //! emits a fixed canonical set; a bot's set differs) and stable across requests.
 
 use std::{
-	collections::HashMap,
-	sync::Mutex,
-	time::{Duration, Instant},
+	collections::HashMap, sync::Mutex, time::{Duration, Instant}
 };
 
 use axum::http::request::Parts;
@@ -82,14 +80,7 @@ impl RequestShape {
 			ua
 		});
 
-		Self {
-			method: parts.method.as_str().to_ascii_uppercase(),
-			path_depth,
-			path_has_extension,
-			header_names,
-			has_cookie,
-			ua,
-		}
+		Self { method: parts.method.as_str().to_ascii_uppercase(), path_depth, path_has_extension, header_names, has_cookie, ua }
 	}
 
 	/// A stable, canonical string key over the shape's dimensions — the fingerprint a
@@ -100,15 +91,7 @@ impl RequestShape {
 	/// key for in-process frequency counting, not a wire format.
 	#[must_use]
 	pub fn fingerprint(&self) -> String {
-		format!(
-			"m={}|d={}|x={}|c={}|h={}|u={}",
-			self.method,
-			self.path_depth,
-			u8::from(self.path_has_extension),
-			u8::from(self.has_cookie),
-			self.header_names.join(","),
-			self.ua.as_deref().unwrap_or("-"),
-		)
+		format!("m={}|d={}|x={}|c={}|h={}|u={}", self.method, self.path_depth, u8::from(self.path_has_extension), u8::from(self.has_cookie), self.header_names.join(","), self.ua.as_deref().unwrap_or("-"),)
 	}
 }
 
@@ -166,13 +149,7 @@ impl ShapeBaseline {
 	/// 20-observation learning floor.
 	#[must_use]
 	pub fn new() -> Self {
-		Self {
-			window: DEFAULT_WINDOW,
-			decay: DEFAULT_DECAY,
-			min_observations: DEFAULT_MIN_OBSERVATIONS,
-			clock: Box::new(SystemClock),
-			state: Mutex::new(BaselineState::default()),
-		}
+		Self { window: DEFAULT_WINDOW, decay: DEFAULT_DECAY, min_observations: DEFAULT_MIN_OBSERVATIONS, clock: Box::new(SystemClock), state: Mutex::new(BaselineState::default()) }
 	}
 
 	/// Set the decay window — the period over which learned weights are multiplied by the
@@ -303,8 +280,9 @@ impl Default for ShapeBaseline {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use axum::http::Request;
+
+	use super::*;
 
 	fn parts(builder: axum::http::request::Builder) -> Parts {
 		builder.body(()).unwrap().into_parts().0
@@ -336,9 +314,7 @@ mod tests {
 
 	#[test]
 	fn header_names_are_sorted_lowercased_and_unique() {
-		let s = RequestShape::from_parts(&parts(
-			Request::builder().uri("/").header("User-Agent", "x").header("Accept", "*/*").header("Cookie", "skin=1"),
-		));
+		let s = RequestShape::from_parts(&parts(Request::builder().uri("/").header("User-Agent", "x").header("Accept", "*/*").header("Cookie", "skin=1")));
 		assert_eq!(s.header_names, vec!["accept".to_owned(), "cookie".to_owned(), "user-agent".to_owned()]);
 		assert!(s.has_cookie);
 		assert_eq!(s.ua.as_deref(), Some("x"));

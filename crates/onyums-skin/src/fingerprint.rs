@@ -27,7 +27,7 @@
 
 use std::fmt;
 
-use axum::http::{header, request::Parts, Version};
+use axum::http::{Version, header, request::Parts};
 use sha2::{Digest, Sha256};
 
 /// The sentinel emitted for an empty hash component (no headers, or no cookie). Twelve
@@ -72,12 +72,7 @@ impl Ja4hFingerprint {
 		let has_referer = parts.headers.contains_key(header::REFERER);
 
 		// Header-name set, excluding the two names whose presence is already encoded as flags.
-		let mut names: Vec<String> = parts
-			.headers
-			.keys()
-			.filter(|name| *name != header::COOKIE && *name != header::REFERER)
-			.map(|name| name.as_str().to_ascii_lowercase())
-			.collect();
+		let mut names: Vec<String> = parts.headers.keys().filter(|name| *name != header::COOKIE && *name != header::REFERER).map(|name| name.as_str().to_ascii_lowercase()).collect();
 		names.sort_unstable();
 		names.dedup();
 
@@ -98,12 +93,7 @@ impl Ja4hFingerprint {
 			_ => "00",
 		};
 		let count = names.len().min(99);
-		let a = format!(
-			"{method}{version}{cookie}{referer}{count:02}{lang}",
-			cookie = if has_cookie { 'c' } else { 'n' },
-			referer = if has_referer { 'r' } else { 'n' },
-			lang = primary_language(parts),
-		);
+		let a = format!("{method}{version}{cookie}{referer}{count:02}{lang}", cookie = if has_cookie { 'c' } else { 'n' }, referer = if has_referer { 'r' } else { 'n' }, lang = primary_language(parts),);
 
 		let b = if names.is_empty() { EMPTY_HASH.to_owned() } else { hash12(&names.join(",")) };
 
@@ -200,9 +190,7 @@ mod tests {
 
 	#[test]
 	fn metadata_prefix_encodes_method_version_flags_and_count() {
-		let fp = Ja4hFingerprint::from_parts(&parts(
-			Request::builder().method("POST").uri("/").header("accept", "*/*").header("user-agent", "x").header("accept-language", "en-US,fr;q=0.8"),
-		));
+		let fp = Ja4hFingerprint::from_parts(&parts(Request::builder().method("POST").uri("/").header("accept", "*/*").header("user-agent", "x").header("accept-language", "en-US,fr;q=0.8")));
 		// po(method) 11(HTTP/1.1) n(no cookie) n(no referer) 02(two headers: accept, user-agent
 		// — accept-language counts too → three) enus(language).
 		assert_eq!(&fp.a[0..2], "po");
@@ -215,9 +203,7 @@ mod tests {
 
 	#[test]
 	fn cookie_and_referer_set_their_flags_and_are_excluded_from_the_count() {
-		let with = Ja4hFingerprint::from_parts(&parts(
-			Request::builder().uri("/").header("accept", "*/*").header("cookie", "skin=1").header("referer", "http://x.onion/"),
-		));
+		let with = Ja4hFingerprint::from_parts(&parts(Request::builder().uri("/").header("accept", "*/*").header("cookie", "skin=1").header("referer", "http://x.onion/")));
 		// c(cookie) r(referer), and only `accept` counts toward the header count.
 		assert_eq!(&with.a[4..5], "c");
 		assert_eq!(&with.a[5..6], "r");
@@ -271,9 +257,7 @@ mod tests {
 	#[test]
 	fn distinct_clients_get_distinct_fingerprints() {
 		// A Tor-Browser-shaped request vs a curl-shaped one cluster apart.
-		let browser = Ja4hFingerprint::from_parts(&parts(
-			Request::builder().method("GET").uri("/").header("accept", "text/html").header("accept-language", "en-US,en").header("user-agent", "Mozilla/5.0").header("cookie", "skin=abc"),
-		));
+		let browser = Ja4hFingerprint::from_parts(&parts(Request::builder().method("GET").uri("/").header("accept", "text/html").header("accept-language", "en-US,en").header("user-agent", "Mozilla/5.0").header("cookie", "skin=abc")));
 		let curl = Ja4hFingerprint::from_parts(&parts(Request::builder().method("GET").uri("/").header("accept", "*/*").header("user-agent", "curl/8.0")));
 		assert_ne!(browser.raw(), curl.raw());
 		assert_eq!(&curl.a[8..12], "0000", "curl sends no Accept-Language");

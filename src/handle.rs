@@ -25,7 +25,7 @@ use tor_hsservice::RunningOnionService;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 
 use crate::{
-	address::OnionAddress, metrics::{service_metrics_prometheus, CircuitMetrics, ServiceMetrics}, status::{await_status, project_service_problem, project_service_status, ServiceHealth, ServiceProblem, ServiceStatus}, tor_client::{spawn_ephemeral_cleanup, EphemeralIdentity}
+	address::OnionAddress, metrics::{CircuitMetrics, ServiceMetrics, service_metrics_prometheus}, status::{ServiceHealth, ServiceProblem, ServiceStatus, await_status, project_service_problem, project_service_status}, tor_client::{EphemeralIdentity, spawn_ephemeral_cleanup}
 };
 
 /// A running onion service plus its controls.
@@ -66,15 +66,7 @@ impl OnionServiceHandle {
 	/// loop task; the metrics counters are the ones *that* loop increments). Taking the
 	/// raw parts and doing the `Mutex` wrapping here keeps those fields private to this
 	/// module rather than exposing seven of them to lib.rs.
-	pub(crate) const fn new(
-		address: OnionAddress,
-		service: Arc<RunningOnionService>,
-		client: Arc<TorClient<TokioNativeTlsRuntime>>,
-		cancel: CancellationToken,
-		task: JoinHandle<()>,
-		metrics: Arc<CircuitMetrics>,
-		ephemeral: Option<EphemeralIdentity>,
-	) -> Self {
+	pub(crate) const fn new(address: OnionAddress, service: Arc<RunningOnionService>, client: Arc<TorClient<TokioNativeTlsRuntime>>, cancel: CancellationToken, task: JoinHandle<()>, metrics: Arc<CircuitMetrics>, ephemeral: Option<EphemeralIdentity>) -> Self {
 		Self { address, service, client, cancel, task: Mutex::new(Some(task)), metrics, ephemeral: Mutex::new(ephemeral) }
 	}
 
@@ -325,4 +317,3 @@ impl Drop for OnionServiceHandle {
 		}
 	}
 }
-

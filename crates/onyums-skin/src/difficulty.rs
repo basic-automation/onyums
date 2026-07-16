@@ -13,17 +13,13 @@
 //! with [`ManualClock`](crate::circuit::ManualClock) and never needs to sleep.
 
 use std::{
-	sync::{Arc, Mutex},
-	time::{Duration, Instant},
+	sync::{Arc, Mutex}, time::{Duration, Instant}
 };
 
 use axum::http::request::Parts;
 
 use crate::{
-	bot::BotHeuristics,
-	circuit::{Clock, SystemClock},
-	observe::{SecurityEvent, SecurityEventSink},
-	shape::{RequestShape, ShapeBaseline},
+	bot::BotHeuristics, circuit::{Clock, SystemClock}, observe::{SecurityEvent, SecurityEventSink}, shape::{RequestShape, ShapeBaseline}
 };
 
 /// Default rate window.
@@ -69,15 +65,7 @@ impl AdaptiveDifficulty {
 	#[must_use]
 	pub fn new(baseline: u32, max: u32) -> Self {
 		let max = max.max(baseline);
-		Self {
-			baseline,
-			max,
-			low_rate: 0,
-			high_rate: (u64::from(max) * 8).max(1),
-			window: DEFAULT_WINDOW,
-			clock: Box::new(SystemClock),
-			state: Mutex::new(RateWindow::default()),
-		}
+		Self { baseline, max, low_rate: 0, high_rate: (u64::from(max) * 8).max(1), window: DEFAULT_WINDOW, clock: Box::new(SystemClock), state: Mutex::new(RateWindow::default()) }
 	}
 
 	/// Set the request-rate band: at or below `low` requests/window difficulty is
@@ -202,15 +190,7 @@ impl ShapeDifficulty {
 	/// default [`ShapeBaseline`].
 	#[must_use]
 	pub fn new(baseline: u32, max: u32) -> Self {
-		Self {
-			baseline,
-			max: max.max(baseline),
-			low_dev: DEFAULT_LOW_DEV,
-			high_dev: DEFAULT_HIGH_DEV,
-			emit_threshold: DEFAULT_EMIT_THRESHOLD,
-			shapes: ShapeBaseline::new(),
-			sink: None,
-		}
+		Self { baseline, max: max.max(baseline), low_dev: DEFAULT_LOW_DEV, high_dev: DEFAULT_HIGH_DEV, emit_threshold: DEFAULT_EMIT_THRESHOLD, shapes: ShapeBaseline::new(), sink: None }
 	}
 
 	/// Set the deviation band: at or below `low` deviation difficulty is `baseline`, at or
@@ -324,15 +304,7 @@ impl BotDifficulty {
 	/// `>= 0.5`. `max` is clamped to at least `baseline`. Uses a default [`BotHeuristics`].
 	#[must_use]
 	pub fn new(baseline: u32, max: u32) -> Self {
-		Self {
-			baseline,
-			max: max.max(baseline),
-			low_score: DEFAULT_LOW_BOT,
-			high_score: DEFAULT_HIGH_BOT,
-			emit_threshold: DEFAULT_BOT_EMIT_THRESHOLD,
-			heuristics: BotHeuristics::new(),
-			sink: None,
-		}
+		Self { baseline, max: max.max(baseline), low_score: DEFAULT_LOW_BOT, high_score: DEFAULT_HIGH_BOT, emit_threshold: DEFAULT_BOT_EMIT_THRESHOLD, heuristics: BotHeuristics::new(), sink: None }
 	}
 
 	/// Set the suspicion band: at or below `low` difficulty is `baseline`, at or above `high` it
@@ -419,10 +391,7 @@ mod tests {
 
 	fn with_manual(baseline: u32, max: u32) -> (AdaptiveDifficulty, Arc<ManualClock>) {
 		let clock = Arc::new(ManualClock::new());
-		let ctrl = AdaptiveDifficulty::new(baseline, max)
-			.rate_band(2, 10)
-			.window(Duration::from_secs(1))
-			.with_clock(Box::new(ArcClock(clock.clone())));
+		let ctrl = AdaptiveDifficulty::new(baseline, max).rate_band(2, 10).window(Duration::from_secs(1)).with_clock(Box::new(ArcClock(clock.clone())));
 		(ctrl, clock)
 	}
 
@@ -483,9 +452,7 @@ mod tests {
 	fn rate_band_high_clamped_above_low() {
 		// A degenerate band (high <= low) must not divide by zero.
 		let clock = Arc::new(ManualClock::new());
-		let ctrl = AdaptiveDifficulty::new(0, 8)
-			.rate_band(5, 5)
-			.with_clock(Box::new(ArcClock(clock.clone())));
+		let ctrl = AdaptiveDifficulty::new(0, 8).rate_band(5, 5).with_clock(Box::new(ArcClock(clock.clone())));
 		for _ in 0..6 {
 			ctrl.record_request();
 		}
@@ -580,18 +547,7 @@ mod tests {
 	// --- BotDifficulty (bot-suspicion-driven) ---
 
 	fn browser_parts() -> Parts {
-		Request::builder()
-			.uri("/")
-			.header("host", "x.onion")
-			.header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0")
-			.header("accept", "text/html")
-			.header("accept-language", "en-US,en")
-			.header("accept-encoding", "gzip, deflate, br")
-			.header("connection", "keep-alive")
-			.body(())
-			.unwrap()
-			.into_parts()
-			.0
+		Request::builder().uri("/").header("host", "x.onion").header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0").header("accept", "text/html").header("accept-language", "en-US,en").header("accept-encoding", "gzip, deflate, br").header("connection", "keep-alive").body(()).unwrap().into_parts().0
 	}
 
 	fn curl_parts() -> Parts {

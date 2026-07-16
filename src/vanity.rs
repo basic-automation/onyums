@@ -21,7 +21,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use rand::RngCore;
 use safelog::DisplayRedacted;
 use tor_hscrypto::pk::{HsId, HsIdKey};
@@ -236,11 +236,7 @@ fn try_one(rng: &mut impl RngCore, prefix: &str) -> Option<VanityKey> {
 	let mut seed = [0_u8; 32];
 	rng.fill_bytes(&mut seed);
 	let (address, rendered) = address_for_seed(&seed);
-	if rendered.starts_with(prefix) {
-		Some(VanityKey { address, secret_key: seed })
-	} else {
-		None
-	}
+	if rendered.starts_with(prefix) { Some(VanityKey { address, secret_key: seed }) } else { None }
 }
 
 /// Mine an onion address whose base32 part starts with `prefix`, drawing fresh

@@ -24,9 +24,7 @@
 //! redirect; the host decides where it applies.
 
 use axum::{
-	body::Body,
-	http::{header, request::Parts, HeaderMap, HeaderName, HeaderValue, Method, StatusCode},
-	response::Response,
+	body::Body, http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode, header, request::Parts}, response::Response
 };
 
 /// One edge rule: a [matcher](EdgeMatch) and the [action](EdgeAction) to take when it fires.
@@ -329,9 +327,7 @@ mod tests {
 
 	#[test]
 	fn path_and_prefix_matchers() {
-		let rules = EdgeRules::new()
-			.push(EdgeMatch::Path("/exact".into()), EdgeAction::Block(StatusCode::FORBIDDEN))
-			.push(EdgeMatch::PathPrefix("/api/".into()), EdgeAction::Block(StatusCode::NOT_FOUND));
+		let rules = EdgeRules::new().push(EdgeMatch::Path("/exact".into()), EdgeAction::Block(StatusCode::FORBIDDEN)).push(EdgeMatch::PathPrefix("/api/".into()), EdgeAction::Block(StatusCode::NOT_FOUND));
 		assert_eq!(rules.evaluate(&parts(Request::builder().uri("/exact"))), EdgeDecision::Block(StatusCode::FORBIDDEN));
 		// A prefix sibling that is not an exact match falls through to the prefix rule.
 		assert_eq!(rules.evaluate(&parts(Request::builder().uri("/api/users"))), EdgeDecision::Block(StatusCode::NOT_FOUND));
@@ -341,25 +337,18 @@ mod tests {
 
 	#[test]
 	fn first_short_circuit_wins_and_later_rules_are_skipped() {
-		let rules = EdgeRules::new()
-			.push(EdgeMatch::Any, EdgeAction::Block(StatusCode::FORBIDDEN))
-			.push(EdgeMatch::Any, EdgeAction::Block(StatusCode::IM_A_TEAPOT));
+		let rules = EdgeRules::new().push(EdgeMatch::Any, EdgeAction::Block(StatusCode::FORBIDDEN)).push(EdgeMatch::Any, EdgeAction::Block(StatusCode::IM_A_TEAPOT));
 		assert_eq!(rules.evaluate(&parts(Request::builder().uri("/"))), EdgeDecision::Block(StatusCode::FORBIDDEN));
 	}
 
 	#[test]
 	fn header_transforms_accumulate_in_order_then_forward() {
-		let rules = EdgeRules::new()
-			.push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")))
-			.push(EdgeMatch::Any, EdgeAction::RemoveHeader(HeaderName::from_static("server")));
+		let rules = EdgeRules::new().push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY"))).push(EdgeMatch::Any, EdgeAction::RemoveHeader(HeaderName::from_static("server")));
 		let decision = rules.evaluate(&parts(Request::builder().uri("/")));
 		assert_eq!(
 			decision,
 			EdgeDecision::Forward {
-				response_headers: vec![
-					HeaderMutation::Set(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")),
-					HeaderMutation::Remove(HeaderName::from_static("server")),
-				],
+				response_headers: vec![HeaderMutation::Set(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")), HeaderMutation::Remove(HeaderName::from_static("server")),],
 			}
 		);
 	}
@@ -367,19 +356,14 @@ mod tests {
 	#[test]
 	fn a_short_circuit_drops_buffered_transforms() {
 		// A transform before a block never reaches the response — the block ends the request.
-		let rules = EdgeRules::new()
-			.push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-test"), HeaderValue::from_static("1")))
-			.push(EdgeMatch::Path("/blocked".into()), EdgeAction::Block(StatusCode::FORBIDDEN));
+		let rules = EdgeRules::new().push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-test"), HeaderValue::from_static("1"))).push(EdgeMatch::Path("/blocked".into()), EdgeAction::Block(StatusCode::FORBIDDEN));
 		assert_eq!(rules.evaluate(&parts(Request::builder().uri("/blocked"))), EdgeDecision::Block(StatusCode::FORBIDDEN));
 	}
 
 	#[test]
 	fn method_and_combinator_matchers() {
 		// Block POST to /admin specifically; GET /admin and POST elsewhere pass.
-		let rules = EdgeRules::new().push(
-			EdgeMatch::All(vec![EdgeMatch::Method(Method::POST), EdgeMatch::PathPrefix("/admin".into())]),
-			EdgeAction::Block(StatusCode::FORBIDDEN),
-		);
+		let rules = EdgeRules::new().push(EdgeMatch::All(vec![EdgeMatch::Method(Method::POST), EdgeMatch::PathPrefix("/admin".into())]), EdgeAction::Block(StatusCode::FORBIDDEN));
 		assert!(rules.evaluate(&parts(Request::builder().method("POST").uri("/admin/x"))).is_short_circuit());
 		assert!(!rules.evaluate(&parts(Request::builder().method("GET").uri("/admin/x"))).is_short_circuit());
 		assert!(!rules.evaluate(&parts(Request::builder().method("POST").uri("/public"))).is_short_circuit());
@@ -410,10 +394,7 @@ mod tests {
 	fn expr_matcher_uses_the_full_filter_language() {
 		use crate::filter::Field;
 		// A condition richer than the dedicated variants: POST whose query contains `debug`.
-		let rules = EdgeRules::new().push(
-			EdgeMatch::Expr(Field::method().eq("POST").and(Field::query().contains("debug"))),
-			EdgeAction::Block(StatusCode::FORBIDDEN),
-		);
+		let rules = EdgeRules::new().push(EdgeMatch::Expr(Field::method().eq("POST").and(Field::query().contains("debug"))), EdgeAction::Block(StatusCode::FORBIDDEN));
 		assert!(rules.evaluate(&parts(Request::builder().method("POST").uri("/x?debug=1"))).is_short_circuit());
 		assert!(!rules.evaluate(&parts(Request::builder().method("POST").uri("/x?ok=1"))).is_short_circuit());
 		assert!(!rules.evaluate(&parts(Request::builder().method("GET").uri("/x?debug=1"))).is_short_circuit());
@@ -474,13 +455,7 @@ mod tests {
 	fn apply_response_headers_sets_and_removes() {
 		let mut headers = HeaderMap::new();
 		headers.insert(HeaderName::from_static("server"), HeaderValue::from_static("onyums"));
-		apply_response_headers(
-			&[
-				HeaderMutation::Set(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")),
-				HeaderMutation::Remove(HeaderName::from_static("server")),
-			],
-			&mut headers,
-		);
+		apply_response_headers(&[HeaderMutation::Set(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")), HeaderMutation::Remove(HeaderName::from_static("server"))], &mut headers);
 		assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
 		assert!(!headers.contains_key("server"));
 	}

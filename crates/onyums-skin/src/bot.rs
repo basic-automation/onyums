@@ -25,10 +25,7 @@ use axum::http::{header, request::Parts};
 /// Substrings (matched case-insensitively against the `User-Agent`) that name a non-browser
 /// HTTP client. Conservative and high-signal: each is a tool that self-identifies, never a
 /// token a real Tor Browser UA contains.
-const NON_BROWSER_UA_TOKENS: &[&str] = &[
-	"curl/", "wget/", "python-requests", "python-urllib", "go-http-client", "java/", "libwww", "scrapy",
-	"httpclient", "okhttp", "axios", "node-fetch", "got (", "aiohttp", "httpx", "powershell", "winhttp", "lwp::",
-];
+const NON_BROWSER_UA_TOKENS: &[&str] = &["curl/", "wget/", "python-requests", "python-urllib", "go-http-client", "java/", "libwww", "scrapy", "httpclient", "okhttp", "axios", "node-fetch", "got (", "aiohttp", "httpx", "powershell", "winhttp", "lwp::"];
 
 /// Substrings (matched case-insensitively against the `User-Agent`) that name a browser
 /// **automation / headless** framework. Distinct from [`NON_BROWSER_UA_TOKENS`]: these often
@@ -204,15 +201,7 @@ mod tests {
 
 	/// A conventional browser-shaped request (the kind Tor Browser sends, JS on or off).
 	fn browser() -> axum::http::request::Builder {
-		Request::builder()
-			.method("GET")
-			.uri("/")
-			.header("host", "x.onion")
-			.header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0")
-			.header("accept", "text/html,application/xhtml+xml")
-			.header("accept-language", "en-US,en;q=0.5")
-			.header("accept-encoding", "gzip, deflate, br")
-			.header("connection", "keep-alive")
+		Request::builder().method("GET").uri("/").header("host", "x.onion").header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0").header("accept", "text/html,application/xhtml+xml").header("accept-language", "en-US,en;q=0.5").header("accept-encoding", "gzip, deflate, br").header("connection", "keep-alive")
 	}
 
 	#[test]
@@ -290,20 +279,9 @@ mod tests {
 		// HeadlessChrome rides a full browser-shaped UA + header set, so the only thing that
 		// gives it away is the automation token — and it must be AutomationUserAgent, not the
 		// CLI-tool NonBrowserUserAgent.
-		let a = BotHeuristics::new().assess(&parts(
-			browser().header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/120.0.0.0 Safari/537.36"),
-		));
+		let a = BotHeuristics::new().assess(&parts(browser().header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) HeadlessChrome/120.0.0.0 Safari/537.36")));
 		// browser() already set a UA; appending leaves the original first — assess a fresh request.
-		let fresh = BotHeuristics::new().assess(&parts(
-			Request::builder()
-				.uri("/")
-				.header("host", "x.onion")
-				.header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 HeadlessChrome/120.0 Safari/537.36")
-				.header("accept", "text/html")
-				.header("accept-language", "en-US")
-				.header("accept-encoding", "gzip")
-				.header("connection", "keep-alive"),
-		));
+		let fresh = BotHeuristics::new().assess(&parts(Request::builder().uri("/").header("host", "x.onion").header("user-agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 HeadlessChrome/120.0 Safari/537.36").header("accept", "text/html").header("accept-language", "en-US").header("accept-encoding", "gzip").header("connection", "keep-alive")));
 		assert!(fresh.signals.contains(&BotSignal::AutomationUserAgent));
 		assert!(!fresh.signals.contains(&BotSignal::NonBrowserUserAgent));
 		// Otherwise browser-shaped, so automation is essentially the sole driver.
@@ -315,9 +293,7 @@ mod tests {
 	#[test]
 	fn automation_frameworks_are_detected() {
 		for ua in ["PhantomJS/2.1", "selenium webdriver", "Playwright/1.40", "Mozilla/5.0 Cypress", "Splash/3.5"] {
-			let assessed = BotHeuristics::new().assess(&parts(
-				Request::builder().uri("/").header("host", "x.onion").header("user-agent", ua).header("accept", "*/*").header("accept-language", "en").header("accept-encoding", "gzip").header("connection", "keep-alive"),
-			));
+			let assessed = BotHeuristics::new().assess(&parts(Request::builder().uri("/").header("host", "x.onion").header("user-agent", ua).header("accept", "*/*").header("accept-language", "en").header("accept-encoding", "gzip").header("connection", "keep-alive")));
 			assert!(assessed.signals.contains(&BotSignal::AutomationUserAgent), "{ua} not detected");
 		}
 	}
@@ -326,9 +302,7 @@ mod tests {
 	fn known_tool_uas_are_detected() {
 		// A fresh request per UA (appending to browser() would leave the original UA first).
 		for ua in ["python-requests/2.31", "Go-http-client/1.1", "Wget/1.21", "okhttp/4.9", "Scrapy/2.5"] {
-			let a = BotHeuristics::new().assess(&parts(
-				Request::builder().uri("/").header("host", "x.onion").header("user-agent", ua).header("accept", "*/*").header("accept-language", "en").header("accept-encoding", "gzip").header("connection", "keep-alive"),
-			));
+			let a = BotHeuristics::new().assess(&parts(Request::builder().uri("/").header("host", "x.onion").header("user-agent", ua).header("accept", "*/*").header("accept-language", "en").header("accept-encoding", "gzip").header("connection", "keep-alive")));
 			assert!(a.signals.contains(&BotSignal::NonBrowserUserAgent), "{ua} not detected");
 		}
 	}

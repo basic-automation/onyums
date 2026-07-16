@@ -11,12 +11,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use arti_client::{config::TorClientConfigBuilder, TorClient, TorClientConfig};
+use arti_client::{TorClient, TorClientConfig, config::TorClientConfigBuilder};
 use tokio::task::JoinHandle;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
-use crate::keystore_perms::{harden_state_tree, Hardening};
+use crate::keystore_perms::{Hardening, harden_state_tree};
 
 /// The default persistent onyums state directory — home of the Arti keystore that
 /// holds the onion service's v3 identity key, so the `.onion` address is stable
@@ -66,9 +66,7 @@ pub fn storage_dirs(ephemeral: bool) -> (String, String) {
 /// # Errors
 /// Returns an error if Arti rejects the directory configuration.
 fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig> {
-	TorClientConfigBuilder::from_directories(state_dir, cache_dir)
-		.build()
-		.map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))
+	TorClientConfigBuilder::from_directories(state_dir, cache_dir).build().map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))
 }
 
 /// Sets up and bootstraps a Tor client for the given state/cache directories.
@@ -179,6 +177,29 @@ impl EphemeralIdentity {
 		drop(self.claim);
 		self.dir
 	}
+}
+
+/// Create, harden, and **claim** an ephemeral state dir — before the Tor bootstrap
+/// (onyums ROADMAP Phase 2).
+///
+/// The ordering is the whole point, and getting it wrong is a live-service data race:
+/// [`setup_tor_client`] creates the directory and *then* bootstraps, which takes a
+/// minute or more. If the claim were taken after that call, the directory would sit
+/// unclaimed for the entire bootstrap — and a second ephemeral service launching in that
+/// window would run [`sweep_stale_ephemeral_dirs`], see a lockfile-less directory, judge
+/// it abandoned, and delete a live service's keystore out from under it while it booted.
+///
+/// Claiming first closes the window: the directory is never observable by a sweep in an
+/// unclaimed state. `setup_tor_client` hardens the tree again afterwards, which is
+/// idempotent and also tightens the lockfile itself to `0600`.
+///
+/// # Errors
+/// Returns an error if the directory cannot be created, hardened, or claimed.
+pub fn prepare_ephemeral_dir(state_dir: &str) -> Result<EphemeralIdentity> {
+	let dir = std::path::PathBuf::from(state_dir);
+	harden_state_tree(&dir).map_err(|e| anyhow::anyhow!("failed to create the ephemeral state dir {}: {e}", dir.display()))?;
+	let claim = claim_ephemeral_dir(&dir)?;
+	Ok(EphemeralIdentity::new(dir, claim))
 }
 
 /// Take ownership of a freshly minted ephemeral state dir by locking a file inside it.
@@ -511,6 +532,35 @@ mod tests {
 		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 1);
 		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 0, "a second pass has nothing to do");
 		assert_eq!(sweep_stale_ephemeral_dirs(&scratch.join("does-not-exist")), 0, "a missing temp tree is not an error");
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	#[test]
+	fn a_prepared_dir_is_claimed_before_bootstrap_so_a_concurrent_launch_cannot_sweep_it() {
+		// Regression test for a real race (found by watching a live `--ignored` run: the
+		// service's ephemeral dir sat lockfile-less for the whole ~30min bootstrap).
+		//
+		// The launch order is: sweep -> create dir -> **bootstrap, which takes minutes** ->
+		// claim. With the claim last, the dir is unclaimed for the entire bootstrap, and a
+		// second ephemeral service launching in that window sweeps it as abandoned —
+		// deleting a live service's keystore while it boots. `prepare_ephemeral_dir`
+		// creates+hardens+claims as one step, before bootstrap, so the window never exists.
+		let scratch = sweep_scratch("prepare");
+		let state_dir = scratch.join(format!("{EPHEMERAL_DIR_PREFIX}{}-{:016x}", std::process::id(), rand::random::<u64>()));
+
+		let identity = prepare_ephemeral_dir(&state_dir.to_string_lossy()).expect("prepare");
+		assert!(state_dir.exists(), "the dir must be created");
+		assert!(state_dir.join(EPHEMERAL_LOCK_FILE).exists(), "and claimed in the same step");
+
+		// This is what the *other* service's launch would run while ours is still
+		// bootstrapping. It must leave ours alone.
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 0, "a bootstrapping service's dir must survive a concurrent launch's sweep");
+		assert!(state_dir.join("hs_ed25519_secret_key").exists() || state_dir.exists(), "the keystore must still be there");
+
+		// And once the service is gone, the same sweep reclaims it.
+		drop(identity);
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 1, "once released, it is swept normally");
+		assert!(!state_dir.exists());
 		std::fs::remove_dir_all(&scratch).ok();
 	}
 

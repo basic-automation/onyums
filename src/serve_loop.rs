@@ -24,7 +24,7 @@ use axum::Router;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http_body_util::Empty;
-use hyper::{body::Incoming, Request, Response, StatusCode};
+use hyper::{Request, Response, StatusCode, body::Incoming};
 use hyper_util::{
 	rt::{TokioExecutor, TokioIo}, service::TowerToHyperService
 };
@@ -33,7 +33,7 @@ use tokio_rustls::TlsAcceptor;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{RendRequest, StreamRequest};
 use tower_service::Service;
-use tracing::{event, span, Level};
+use tracing::{Level, event, span};
 
 use crate::{
 	address::OnionAddress, circuit_gate::{self, CircuitDisposition, CircuitIdAllocator, StreamDisposition}, connection::ConnectionInfo, metrics::CircuitMetrics, port_router::{PortDispatch, PortRouter, StreamHandler}, tls_policy
@@ -251,4 +251,3 @@ pub async fn handle_raw_stream(stream_request: StreamRequest, handler: Arc<dyn S
 	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 	handler.serve(Box::pin(onion_service_stream)).await
 }
-

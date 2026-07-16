@@ -21,14 +21,12 @@
 //! `no_run`: `serve` binds the live Tor network and runs until stopped, so the
 //! example is compiled and type-checked but never executed under `cargo test`.
 
-
 // With the Phase 0 split complete, lib.rs is the crate's front door and nothing else:
 // the crate docs above, the module list, and the public surface re-exported from the
 // focused modules that implement it. Anything with logic in it belongs in one of them.
 
 pub use axum::*;
 pub use onyums_skin::{self, AccountingCircuitPolicy, CircuitPolicy, ClientAuthKey, RestrictedDiscovery, SecurityEvent, SecurityEventSink, Skin};
-
 /// Re-export the arti stack onyums is built on, so downstream crates can depend on the
 /// *exact* versions onyums uses without a version skew — the same reason `axum` is
 /// re-exported above. If you need arti's `TorClient`, the onion-service config, or the
@@ -59,18 +57,18 @@ mod tor_client;
 mod vanity;
 
 pub use address::OnionAddress;
-pub use builder::{serve, OnionService, OnionServiceBuilder};
-pub use client_auth::{provision_client, ClientAuthKeypair, ClientAuthKeypairError};
+pub use builder::{OnionService, OnionServiceBuilder, serve};
+pub use client_auth::{ClientAuthKeypair, ClientAuthKeypairError, provision_client};
 pub use connection::ConnectionInfo;
 pub use connection_limit::ConnectionLimit;
 pub use handle::OnionServiceHandle;
-pub use metrics::{fleet_prometheus, ServiceMetrics};
-pub use port_router::{well_known_sensitive_service, AsyncStream, OnionStream, PortDispatch, PortRouter, RawPortExposure, ServeFuture, StreamHandler};
+pub use metrics::{ServiceMetrics, fleet_prometheus};
+pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, RawPortExposure, ServeFuture, StreamHandler, well_known_sensitive_service};
 pub use provided_cert::ProvidedCert;
 pub use raw_tcp::RawTcpHandler;
 pub use status::{ServiceHealth, ServiceProblem, ServiceProblemKind, ServiceStatus};
 pub use tls_policy::Tls;
-pub use vanity::{address_from_expanded_secret, address_from_secret_seed, address_from_tor_secret_key_file, expanded_secret_from_tor_file, mine, mine_parallel, mine_within, tor_secret_key_file_from_expanded, validate_prefix, VanityKey};
+pub use vanity::{VanityKey, address_from_expanded_secret, address_from_secret_seed, address_from_tor_secret_key_file, expanded_secret_from_tor_file, mine, mine_parallel, mine_within, tor_secret_key_file_from_expanded, validate_prefix};
 
 #[cfg(test)]
 mod tests {
@@ -80,14 +78,13 @@ mod tests {
 	// that cannot belong to any single module.
 	use anyhow::Result;
 	use arti_client::TorClient;
-	use axum::{routing::get, Router};
+	use axum::{Router, routing::get};
 	use tokio_rustls::rustls;
 	use tor_rtcompat::tokio::TokioNativeTlsRuntime;
-	use tracing::{event, Level};
-
-	use crate::tor_client::storage_dirs;
+	use tracing::{Level, event};
 
 	use super::*;
+	use crate::tor_client::storage_dirs;
 
 	#[test]
 	fn arti_stack_is_reexported() {

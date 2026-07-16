@@ -30,7 +30,9 @@ use tower_layer::Layer;
 use tower_service::Service;
 
 use crate::{
-	cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_cacheable_method}, challenge::{Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
+	cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_cacheable_method}, challenge::{
+		Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}
+	}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -100,13 +102,7 @@ impl Skin {
 		let mut pow_secret = [0u8; 32];
 		rand::rng().fill_bytes(&mut pow_secret);
 		let rate = SkinRateLimit::per_second(NonZeroU32::new(DEFAULT_RATE_PER_SEC).expect("DEFAULT_RATE_PER_SEC is nonzero"));
-		Skin::builder()
-			.store(Arc::new(store.clone()))
-			.challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY)))
-			.challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY)))
-			.rate_limit(rate)
-			.waf(Waf::starter())
-			.build()
+		Skin::builder().store(Arc::new(store.clone())).challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY))).challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY))).rate_limit(rate).waf(Waf::starter()).build()
 	}
 
 	/// Turn this gate into a [`SkinLayer`] for `Router::layer`.
@@ -272,9 +268,9 @@ where
 	S: Service<axum::extract::Request, Response = Response> + Clone + Send + 'static,
 	S::Future: Send + 'static,
 {
-	type Response = Response;
 	type Error = S::Error;
 	type Future = Pin<Box<dyn Future<Output = Result<Response, S::Error>> + Send>>;
+	type Response = Response;
 
 	fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
 		self.inner.poll_ready(cx)
@@ -374,7 +370,20 @@ pub struct SkinBuilder {
 
 impl Default for SkinBuilder {
 	fn default() -> Self {
-		Self { store: None, challenges: Vec::new(), ratelimit: None, waf: None, edge: None, cache: None, sink: None, cookie_name: DEFAULT_COOKIE.to_owned(), submit_path: DEFAULT_SUBMIT_PATH.to_owned(), return_path: DEFAULT_RETURN_PATH.to_owned(), clearance_ttl: DEFAULT_CLEARANCE_TTL, client_has_js: true }
+		Self {
+			store: None,
+			challenges: Vec::new(),
+			ratelimit: None,
+			waf: None,
+			edge: None,
+			cache: None,
+			sink: None,
+			cookie_name: DEFAULT_COOKIE.to_owned(),
+			submit_path: DEFAULT_SUBMIT_PATH.to_owned(),
+			return_path: DEFAULT_RETURN_PATH.to_owned(),
+			clearance_ttl: DEFAULT_CLEARANCE_TTL,
+			client_has_js: true,
+		}
 	}
 }
 
@@ -494,7 +503,20 @@ impl SkinBuilder {
 	/// Finish building the gate.
 	#[must_use]
 	pub fn build(self) -> Skin {
-		Skin { store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())), challenge: ChallengeChain::new(self.challenges), ratelimit: self.ratelimit, waf: self.waf, edge: self.edge, cache: self.cache, sink: self.sink.unwrap_or_else(|| Arc::new(TracingSink)), cookie_name: self.cookie_name, submit_path: self.submit_path, return_path: self.return_path, clearance_ttl: self.clearance_ttl, client_has_js: self.client_has_js }
+		Skin {
+			store: self.store.unwrap_or_else(|| Arc::new(HmacClearanceStore::generate())),
+			challenge: ChallengeChain::new(self.challenges),
+			ratelimit: self.ratelimit,
+			waf: self.waf,
+			edge: self.edge,
+			cache: self.cache,
+			sink: self.sink.unwrap_or_else(|| Arc::new(TracingSink)),
+			cookie_name: self.cookie_name,
+			submit_path: self.submit_path,
+			return_path: self.return_path,
+			clearance_ttl: self.clearance_ttl,
+			client_has_js: self.client_has_js,
+		}
 	}
 }
 
@@ -506,7 +528,9 @@ mod tests {
 
 	use super::*;
 	use crate::{
-		challenge::{patience::PatienceChallenge, pow::{Hashcash, PowChallenge, Puzzle}}, clearance::ClearanceStore, observe::CapturingSink, ratelimit::SkinRateLimit
+		challenge::{
+			patience::PatienceChallenge, pow::{Hashcash, PowChallenge, Puzzle}
+		}, clearance::ClearanceStore, observe::CapturingSink, ratelimit::SkinRateLimit
 	};
 
 	/// Test difficulty kept low so the in-test PoW solve returns instantly.
@@ -688,11 +712,7 @@ mod tests {
 	/// A gate with the starter WAF and a PoW challenge over a known store.
 	fn waf_gate() -> (Skin, Arc<HmacClearanceStore>) {
 		let store = Arc::new(HmacClearanceStore::new(b"waf-test-secret".to_vec()));
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter())
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter()).build();
 		(skin, store)
 	}
 
@@ -734,11 +754,7 @@ mod tests {
 	/// A gate whose WAF also inspects request bodies up to `cap` bytes, over a known store.
 	fn waf_body_gate(cap: usize) -> (Skin, Arc<HmacClearanceStore>) {
 		let store = Arc::new(HmacClearanceStore::new(b"waf-body-secret".to_vec()));
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter().inspect_body_up_to(cap))
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter().inspect_body_up_to(cap)).build();
 		(skin, store)
 	}
 
@@ -812,13 +828,7 @@ mod tests {
 	fn observed_gate(rate: u32) -> (Skin, Arc<HmacClearanceStore>, CapturingSink) {
 		let store = Arc::new(HmacClearanceStore::new(b"observe-secret".to_vec()));
 		let sink = CapturingSink::new();
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter())
-			.rate_limit(SkinRateLimit::per_second(std::num::NonZeroU32::new(rate).unwrap()))
-			.events(Arc::new(sink.clone()))
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter()).rate_limit(SkinRateLimit::per_second(std::num::NonZeroU32::new(rate).unwrap())).events(Arc::new(sink.clone())).build();
 		(skin, store, sink)
 	}
 
@@ -845,12 +855,7 @@ mod tests {
 		// the emitted event carries the aggregate score, and the 403 body names it.
 		let store = Arc::new(HmacClearanceStore::new(b"observe-score-secret".to_vec()));
 		let sink = CapturingSink::new();
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter().scoring_threshold(8))
-			.events(Arc::new(sink.clone()))
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter().scoring_threshold(8)).events(Arc::new(sink.clone())).build();
 		let mut svc = skin.into_layer().layer(Router::new().route("/", get(|| async { "app" })));
 
 		// Uncleared is fine: WAF inspection runs first, before the clearance gate.
@@ -877,12 +882,7 @@ mod tests {
 
 		// Baseline: default XSS weight 4 < threshold 8 → WAF does not block.
 		let base_sink = CapturingSink::new();
-		let base = Skin::builder()
-			.store(Arc::new(HmacClearanceStore::new(b"tune-base-secret".to_vec())))
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter().scoring_threshold(8))
-			.events(Arc::new(base_sink.clone()))
-			.build();
+		let base = Skin::builder().store(Arc::new(HmacClearanceStore::new(b"tune-base-secret".to_vec()))).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter().scoring_threshold(8)).events(Arc::new(base_sink.clone())).build();
 		let mut base_svc = base.into_layer().layer(Router::new().route("/", get(|| async { "app" })));
 		let base_resp = base_svc.call(xss_req()).await.unwrap();
 		assert_ne!(base_resp.status(), StatusCode::FORBIDDEN, "below threshold, the WAF does not block");
@@ -890,12 +890,7 @@ mod tests {
 
 		// Tuned: XSS weight 8 >= threshold 8 → the same request is now blocked.
 		let tuned_sink = CapturingSink::new();
-		let tuned = Skin::builder()
-			.store(Arc::new(HmacClearanceStore::new(b"tune-secret".to_vec())))
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter().scoring_threshold(8).set_category_weight(crate::waf::WafCategory::Xss, 8))
-			.events(Arc::new(tuned_sink.clone()))
-			.build();
+		let tuned = Skin::builder().store(Arc::new(HmacClearanceStore::new(b"tune-secret".to_vec()))).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter().scoring_threshold(8).set_category_weight(crate::waf::WafCategory::Xss, 8)).events(Arc::new(tuned_sink.clone())).build();
 		let mut tuned_svc = tuned.into_layer().layer(Router::new().route("/", get(|| async { "app" })));
 		let tuned_resp = tuned_svc.call(xss_req()).await.unwrap();
 		assert_eq!(tuned_resp.status(), StatusCode::FORBIDDEN);
@@ -940,12 +935,7 @@ mod tests {
 		// A signature in the request body (inspected after the gate clears) also emits.
 		let store = Arc::new(HmacClearanceStore::new(b"observe-body-secret".to_vec()));
 		let sink = CapturingSink::new();
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter().inspect_body_up_to(64 * 1024))
-			.events(Arc::new(sink.clone()))
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter().inspect_body_up_to(64 * 1024)).events(Arc::new(sink.clone())).build();
 		let mut svc = skin.into_layer().layer(Router::new().route("/post", get(|| async { "app" })));
 
 		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
@@ -981,12 +971,7 @@ mod tests {
 		// and emits ChallengeUnavailable.
 		let store = Arc::new(HmacClearanceStore::new(b"unavail-secret".to_vec()));
 		let sink = CapturingSink::new();
-		let skin = Skin::builder()
-			.store(store.clone())
-			.client_has_js(false)
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
-			.events(Arc::new(sink.clone()))
-			.build();
+		let skin = Skin::builder().store(store.clone()).client_has_js(false).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).events(Arc::new(sink.clone())).build();
 		match skin.decide(&bare_parts("/")) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN),
 			Decision::Forward { .. } => panic!("a no-JS client against a JS-only chain must be rejected"),
@@ -1060,8 +1045,9 @@ mod tests {
 
 	#[test]
 	fn edge_header_transform_forwards_and_rides_out_on_the_response() {
-		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
 		use axum::http::{HeaderName, HeaderValue};
+
+		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
 		// A SetHeader edge rule does not short-circuit — a cleared request forwards carrying
 		// the mutation.
 		let rules = EdgeRules::new().push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")));
@@ -1075,11 +1061,10 @@ mod tests {
 
 	#[tokio::test]
 	async fn edge_header_transform_is_applied_to_the_app_response() {
-		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
 		use axum::http::{HeaderName, HeaderValue};
-		let rules = EdgeRules::new()
-			.push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY")))
-			.push(EdgeMatch::Any, EdgeAction::RemoveHeader(HeaderName::from_static("server")));
+
+		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
+		let rules = EdgeRules::new().push(EdgeMatch::Any, EdgeAction::SetHeader(HeaderName::from_static("x-frame-options"), HeaderValue::from_static("DENY"))).push(EdgeMatch::Any, EdgeAction::RemoveHeader(HeaderName::from_static("server")));
 		let (skin, store) = edge_gate(rules);
 		let app = Router::new().route("/", get(|| async { ([(HeaderName::from_static("server"), "onyums")], "hello") }));
 		let mut svc = skin.into_layer().layer(app);
@@ -1117,12 +1102,7 @@ mod tests {
 		// by the WAF: inspection runs before edge evaluation, so an edge rule can never carry
 		// a signature attack past the WAF.
 		let store = Arc::new(HmacClearanceStore::new(b"edge-waf-secret".to_vec()));
-		let skin = Skin::builder()
-			.store(store)
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY)))
-			.waf(crate::waf::Waf::starter())
-			.edge_rules(EdgeRules::https_upgrade())
-			.build();
+		let skin = Skin::builder().store(store).challenge(Box::new(PowChallenge::new(Hashcash, b"puzzle-secret".to_vec(), TEST_DIFFICULTY))).waf(crate::waf::Waf::starter()).edge_rules(EdgeRules::https_upgrade()).build();
 		let parts = Request::builder().uri("/files/../../etc/passwd").header(header::HOST, "svc.onion").body(()).unwrap().into_parts().0;
 		match skin.decide(&parts) {
 			Decision::Respond(resp) => assert_eq!(resp.status(), StatusCode::FORBIDDEN, "the WAF block wins over the edge redirect"),
@@ -1195,10 +1175,16 @@ mod tests {
 		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).response_cache(ResponseCache::new(8)).build();
 		let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 		let counter = hits.clone();
-		let app = Router::new().route("/", get(move || {
-			let counter = counter.clone();
-			async move { counter.fetch_add(1, Ordering::SeqCst); "uncacheable" }
-		}));
+		let app = Router::new().route(
+			"/",
+			get(move || {
+				let counter = counter.clone();
+				async move {
+					counter.fetch_add(1, Ordering::SeqCst);
+					"uncacheable"
+				}
+			}),
+		);
 		let mut svc = skin.into_layer().layer(app);
 
 		let _ = svc.call(cleared_get(&store)).await.unwrap();
@@ -1228,8 +1214,9 @@ mod tests {
 
 	#[tokio::test]
 	async fn cache_hit_still_gets_edge_header_transforms() {
-		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
 		use axum::http::{HeaderName, HeaderValue};
+
+		use crate::edge::{EdgeAction, EdgeMatch, EdgeRules};
 		// A cached hit is served with the request's edge transforms freshly applied (they are
 		// not part of the stored entry).
 		let store = Arc::new(HmacClearanceStore::new(b"cache-edge-secret".to_vec()));

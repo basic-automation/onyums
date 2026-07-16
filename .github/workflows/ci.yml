@@ -5,12 +5,6 @@
 # NOT run — it needs the real Tor network, takes minutes, and would make CI flaky on
 # a network hiccup rather than on a code defect. It stays a local/manual tier
 # (`cargo test -- --ignored`).
-#
-# Deliberately absent: a `cargo fmt --check` job. The repo's rustfmt.toml enables
-# unstable options, so formatting requires a *nightly* rustfmt whose output drifts
-# between releases — the tree as committed does not match current nightly rustfmt, so
-# the job would fail on arrival for reasons unrelated to any given change. Landing it
-# needs a repo-wide reformat pinned to one toolchain first (tracked on the ROADMAP).
 
 name: CI
 
@@ -56,6 +50,24 @@ jobs:
       # actually execute against a real filesystem.
       - name: Test (keystore permissions, Unix path)
         run: cargo test -p onyums --lib keystore_perms -- --nocapture
+
+  fmt:
+    name: rustfmt (pinned nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The toolchain is PINNED, and that pin is the whole point of this job. rustfmt.toml
+      # enables unstable options, so formatting needs nightly — and nightly rustfmt's output
+      # drifts between releases. An unpinned `@nightly` would reformat the tree out from
+      # under us on some random Tuesday and fail this job for reasons no contributor caused.
+      # The pin is the same toolchain the tree was formatted with (2026-07-13); bumping it
+      # means re-running `cargo +nightly-<date> fmt --all` in the same commit, never alone.
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-07-13
+          components: rustfmt
+      - name: Check formatting
+        run: cargo fmt --all --check
 
   clippy:
     name: clippy (-D warnings)

@@ -8,8 +8,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::OnionAddress;
-use crate::circuit_gate;
+use crate::{OnionAddress, circuit_gate};
 
 /// A point-in-time snapshot of a service's cumulative circuit/stream counters.
 ///
@@ -288,8 +287,7 @@ impl CircuitMetrics {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::OnionAddress;
-	use crate::circuit_gate;
+	use crate::{OnionAddress, circuit_gate};
 
 	#[test]
 	fn circuit_metrics_snapshot_reflects_recorded_events() {
@@ -387,14 +385,7 @@ mod tests {
 		assert_eq!(text.lines().count(), 18, "6 counters × (HELP, TYPE, value)");
 
 		// Each counter appears as a typed counter carrying its snapshot value, unlabeled.
-		for (name, value) in [
-			("onyums_circuits_offered_total", 15),
-			("onyums_circuits_accepted_total", 10),
-			("onyums_circuits_rejected_total", 5),
-			("onyums_streams_served_total", 26),
-			("onyums_streams_rejected_total", 4),
-			("onyums_streams_shutdown_total", 2),
-		] {
+		for (name, value) in [("onyums_circuits_offered_total", 15), ("onyums_circuits_accepted_total", 10), ("onyums_circuits_rejected_total", 5), ("onyums_streams_served_total", 26), ("onyums_streams_rejected_total", 4), ("onyums_streams_shutdown_total", 2)] {
 			assert!(text.contains(&format!("# TYPE {name} counter\n")), "{name} declared as a counter");
 			assert!(text.contains(&format!("\n{name} {value}\n")), "{name} carries value {value} with no label block");
 		}

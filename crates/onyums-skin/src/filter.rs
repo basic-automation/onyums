@@ -21,7 +21,7 @@
 //! of never matching on data that is not there. To match "header absent or not `x`", combine
 //! `Not(exists)` with the comparison via [`FilterExpr::or`].
 
-use axum::http::{request::Parts, HeaderName};
+use axum::http::{HeaderName, request::Parts};
 use regex::Regex;
 
 /// A request field an expression can test. Limited to the dimensions that survive Tor.
@@ -561,11 +561,7 @@ impl Parser {
 	}
 
 	fn parse_not(&mut self) -> Result<FilterExpr, ParseError> {
-		if self.eat_keyword_or_symbol("not", &Token::Bang) {
-			Ok(!self.parse_not()?)
-		} else {
-			self.parse_primary()
-		}
+		if self.eat_keyword_or_symbol("not", &Token::Bang) { Ok(!self.parse_not()?) } else { self.parse_primary() }
 	}
 
 	fn parse_primary(&mut self) -> Result<FilterExpr, ParseError> {
@@ -904,15 +900,7 @@ mod display_tests {
 		// Whatever Display emits, parse accepts, and re-serializing is identical — proving the
 		// parser is the inverse of the serializer across the operator and connective surface.
 		let canon = |input: &str| FilterExpr::parse(input).unwrap().to_string();
-		for input in [
-			r#"method eq "POST""#,
-			r#"path ~ "^/admin/\w+$""#,
-			r#"method != "GET" && path starts_with "/api""#,
-			r#"query exists || header[x-token] eq "v""#,
-			r#"not (method eq "GET" and (path eq "/a" or path eq "/b"))"#,
-			"true",
-			"false",
-		] {
+		for input in [r#"method eq "POST""#, r#"path ~ "^/admin/\w+$""#, r#"method != "GET" && path starts_with "/api""#, r#"query exists || header[x-token] eq "v""#, r#"not (method eq "GET" and (path eq "/a" or path eq "/b"))"#, "true", "false"] {
 			let once = canon(input);
 			let twice = canon(&once);
 			assert_eq!(once, twice, "canonical form of `{input}` must re-parse to itself");

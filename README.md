@@ -201,7 +201,7 @@ cover every row below.
 | Host-global concurrency/backpressure caps | 🔵 | Per-circuit limits exist via `CircuitPolicy`; total circuit/stream semaphores do not. |
 | CLI binary, framework layer (Phase 5) | 🔵 | Library only today. |
 | Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.44. |
-| arti-sourced gauges (intro-point health, …) | 🔵 | Unblocked by the 0.44 bump: `tor-hsservice` 0.44 carries the optional `metrics` feature; wiring it up is open work, not an upstream block. |
+| arti-sourced gauges (intro-point health, …) | 🔵 | Reachable but not taken: `tor-hsservice` 0.44's `metrics` feature is marked `__is_experimental` (non-semver), the same category as the intro-layer PoW feature. A decision, not a flag. |
 
 Full detail, including what each slice covers, lives in [ROADMAP.md](ROADMAP.md).
 

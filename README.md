@@ -677,6 +677,32 @@ Bring your own protocol by implementing the `StreamHandler` trait (one method: `
 > (rejected, not served ungated) since there is no HTTP surface to render a challenge
 > on.
 
+**Cap the concurrency.** Nothing on the HTTP defence path bounds how many connections
+reach a raw backend, so the only limit is how fast an attacker can open rendezvous
+circuits. `ConnectionLimit` wraps any handler and refuses a stream once the port is at
+capacity:
+
+```rust
+use onyums::{ConnectionLimit, OnionService, RawTcpHandler, routing::get, Router};
+
+let ssh = ConnectionLimit::new(RawTcpHandler::new("127.0.0.1:22"), 4)?;
+
+let handle = OnionService::builder()
+	.router(Router::new().route("/", get(|| async { "hi" })))
+	.nickname("my_onion")
+	.route_port(2222, ssh)  // at most 4 concurrent SSH connections
+	.serve()
+	.await?;
+```
+
+At capacity the stream is **closed immediately, not queued** — queueing would turn a
+connection flood into unbounded memory growth and a latency cliff for the clients
+already connected, which is the failure a limit exists to prevent. A refused client can
+retry; one parked in an invisible queue cannot tell slow from dead. The cap is per
+wrapper, so each port gets its own budget, and `in_flight()` / `is_saturated()` expose
+the current state for a health endpoint. A limit of `0` is rejected at construction
+rather than becoming a port that silently accepts nothing.
+
 ****
 
 ## Identity & address helpers

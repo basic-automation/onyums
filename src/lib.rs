@@ -65,6 +65,7 @@ mod metrics;
 mod port_router;
 mod connection;
 mod http_stack;
+pub mod keystore_perms;
 mod raw_tcp;
 mod provided_cert;
 mod service_config;

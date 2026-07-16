@@ -16,6 +16,8 @@ use tokio::task::JoinHandle;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tracing::{event, Level};
 
+use crate::keystore_perms::{harden_state_tree, Hardening};
+
 /// The default persistent onyums state directory — home of the Arti keystore that
 /// holds the onion service's v3 identity key, so the `.onion` address is stable
 /// across restarts (onyums ROADMAP Phase 1). Kept under `./tor/onyums` rather than
@@ -83,10 +85,38 @@ fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig
 /// bootstrap a client (e.g. the network is unreachable).
 pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	event!(Level::INFO, "Creating Tor client...");
+	harden_keystore(std::path::Path::new(state_dir))?;
 	let config = tor_client_config(state_dir, cache_dir)?;
 	let runtime = TokioNativeTlsRuntime::current().map_err(|e| anyhow::anyhow!("Failed to get current tokio runtime: {e}"))?;
 	let client = TorClient::with_runtime(runtime);
 	client.config(config).create_bootstrapped().await.map_err(|e| anyhow::anyhow!("Failed to create bootstrapped Tor client: {e}"))
+}
+
+/// Create the state directory hardened, and repair a lax one, before arti opens it
+/// (onyums ROADMAP Phase 2 — enforce filesystem permissions for the keystore).
+///
+/// The state tree holds the v3 identity key: whoever can read it can impersonate the
+/// `.onion` address. This runs on every bootstrap — persistent *and* ephemeral, since a
+/// throwaway identity is still an identity while it lives — and fails closed if the
+/// tree cannot be made owner-only. Off Unix the control does not exist; it is logged
+/// once at launch so an operator is never told a false "hardened" (see
+/// [`keystore_perms`](crate::keystore_perms)).
+///
+/// # Errors
+/// Returns an error if the state directory cannot be created, walked, or hardened.
+fn harden_keystore(state_dir: &std::path::Path) -> Result<()> {
+	match harden_state_tree(state_dir).map_err(|e| anyhow::anyhow!("Failed to harden the onion-service keystore at {}: {e}", state_dir.display()))? {
+		Hardening::Enforced { tightened, inspected } if tightened > 0 => {
+			event!(Level::WARN, "Hardened {tightened} of {inspected} path(s) in the keystore {state_dir:?} to owner-only (0700/0600): the onion-service identity key was readable by other local users.");
+		}
+		Hardening::Enforced { inspected, .. } => {
+			event!(Level::DEBUG, "Keystore {state_dir:?} permissions verified owner-only across {inspected} path(s).");
+		}
+		Hardening::Unsupported => {
+			event!(Level::DEBUG, "Keystore permission hardening is a no-op on this platform (no Unix mode model); {state_dir:?} is protected only by the platform's ACLs.");
+		}
+	}
+	Ok(())
 }
 
 /// The unique prefix every ephemeral state directory carries (see [`storage_dirs`]).

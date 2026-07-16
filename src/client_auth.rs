@@ -360,7 +360,7 @@ mod tests {
 		let line = pair.auth_private_line(&address);
 		let (host, rest) = line.split_once(':').expect("host:descriptor split");
 		assert_eq!(host, "abcdefghij");
-		assert!(!host.ends_with(".onion"));
+		assert!(!line.contains(".onion"), "the .onion suffix must be stripped from the auth_private host");
 		assert_eq!(rest, pair.secret_descriptor_line());
 	}
 

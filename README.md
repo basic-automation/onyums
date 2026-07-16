@@ -706,6 +706,9 @@ warning for public users.
 | A raw `route_port(...)` backend is unreachable | The local TCP backend isn't listening on the address you forwarded to. |
 | `serve()` returns a port error | Ports 80/443 are reserved for the built-in HTTP handler, and a port can't be registered twice or as `0` — this is a clean startup error, not a runtime surprise. |
 | Address changed after a restart | You used `.ephemeral()` (throwaway identity by design); drop it to keep the persistent keystore's stable address. |
+| Startup fails: "could not be tightened" / "refusing to launch with a locally-readable onion-service identity" | A path in `./tor/onyums/state` is group/other-accessible and this process can't `chmod` it — almost always because the directory is owned by *another* user (ran as root once, now as a service account?). `chown` the tree to the service user. Fail-closed is deliberate: the alternative is serving an identity your other local users can read. See [Keystore permissions](#deployment). |
+| Startup fails: "refusing to harden the symlink …" | Something in the state tree is a symlink. Identity material must be a real file — replace the link, or point the working directory at the real location instead. |
+| `WARN … Hardened N of M path(s) … to owner-only` | Not an error: onyums repaired a keystore that was readable by other local users (a restore that dropped modes, or a pre-hardening onyums). Worth asking who could read the key before it was fixed. |
 
 ****
 
@@ -769,6 +772,32 @@ launch — the address is derived from the key inside it. Confirm a restored key
 the address you expect *before* wiring it up with `address_from_tor_secret_key_file(...)`
 (see [Identity & address helpers](#identity--address-helpers)). Treat this directory as
 a secret: it *is* the service's identity.
+
+**Keystore permissions.** Whoever can read the state directory can impersonate your
+`.onion` — the address authenticates the key-holder, and that is the key. On Unix,
+onyums enforces the convention for private key material on every launch: **`0700` on
+directories, `0600` on files**, across the whole state tree. This is not advisory —
+it is applied before arti opens the keystore, and it **fails closed**: if a path
+cannot be made owner-only, the service refuses to start rather than serve an identity
+your other local users can read.
+
+- A tree that is already correct is left alone. A lax one — restored from a `tar`
+  that carried `0755`, or created under `umask 022` by an older onyums — is repaired
+  in place, with a `WARN` naming how many paths were tightened.
+- A *stricter* choice of yours is preserved: a `0400` key stays `0400`.
+- A symlink inside the state tree is refused rather than followed.
+- **This does not apply on Windows**, which has no Unix mode model (its access
+  control is ACL-based and Rust's standard library exposes only a read-only bit).
+  There the keystore is protected by whatever the filesystem's ACLs say, and onyums
+  logs that the control is not in force rather than claiming a hardening it did not
+  perform.
+
+Two operational consequences worth planning for: **your backups must preserve modes**
+(`tar -p`, or re-`chmod` on restore — a restore that widens them is repaired but
+logged loudly), and **the service must own its state directory**, since a file owned
+by another user cannot be tightened by this process and will fail the check. The
+systemd unit above gets this right by construction: `DynamicUser=yes` +
+`StateDirectory=` hands the service a private directory it owns.
 
 ****
 

@@ -738,7 +738,7 @@ impl OnionServiceBuilder {
 	/// By default onyums keeps its onion identity key in a persistent keystore
 	/// (`./tor/onyums/state`), so the `.onion` address is stable across restarts with
 	/// zero configuration. Calling `ephemeral()` instead points the keystore at a
-	/// unique, throwaway directory under the system temp dir (see [`storage_dirs`]):
+	/// unique, throwaway directory under the system temp dir (see `storage_dirs`):
 	/// each launch starts with an empty keystore, Arti mints a fresh identity key, and
 	/// the service comes up on a new, disposable address that is never written into the
 	/// persistent tree.

@@ -7,7 +7,7 @@
 //! exhaustively without a wildcard and without breaking when arti adds a variant.
 //! [`ServiceHealth`] bundles the two from a single arti read. `project_service_status` /
 //! `project_service_problem` are the pure, offline-testable mappings, and `await_status`
-//! is the stream-wait helper behind [`OnionServiceHandle::ready`](crate::OnionServiceHandle)
+//! is the stream-wait helper behind [`OnionServiceHandle::ready`](crate::OnionServiceHandle::ready)
 //! and its timeout/settle siblings. Extracted from `lib.rs` as a slice of the Phase 0
 //! module split.
 
@@ -17,19 +17,19 @@ use futures::{Stream, StreamExt};
 /// (onyums ROADMAP Phase 4 — observability).
 ///
 /// This is onyums' own projection of arti's `#[non_exhaustive]`
-/// [`tor_hsservice::status::State`], the same way [`OnionAddress`] and
-/// [`ConnectionInfo`] are typed projections of arti primitives: downstreams match on
+/// [`tor_hsservice::status::State`], the same way [`OnionAddress`](crate::OnionAddress) and
+/// [`ConnectionInfo`](crate::ConnectionInfo) are typed projections of arti primitives: downstreams match on
 /// this exhaustively without a wildcard and without breaking when arti adds a state,
 /// and read reachability through [`is_reachable`](Self::is_reachable) rather than
 /// re-deriving arti's `is_fully_reachable` semantics. Read the current value from a
-/// running service via [`OnionServiceHandle::status`].
+/// running service via [`OnionServiceHandle::status`](crate::OnionServiceHandle::status).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ServiceStatus {
 	/// Not launched, or shut down. Not reachable.
 	Shutdown,
 	/// Building introduction points and publishing the descriptor; no significant
 	/// problems yet, but not yet reachable. This is the state a freshly launched
-	/// service passes through before [`OnionServiceHandle::ready`] resolves.
+	/// service passes through before [`OnionServiceHandle::ready`](crate::OnionServiceHandle::ready) resolves.
 	Bootstrapping,
 	/// Believed fully reachable: satisfied with its introduction points and its
 	/// descriptor is up to date.
@@ -79,7 +79,7 @@ impl ServiceStatus {
 	/// The complement of the states a service passes through or recovers from —
 	/// [`Bootstrapping`](Self::Bootstrapping), [`Unreachable`](Self::Unreachable), and the
 	/// reachable states — so a caller watching the lifecycle knows when further waiting
-	/// is pointless. See [`OnionServiceHandle::wait_until_settled`], which resolves once
+	/// is pointless. See [`OnionServiceHandle::wait_until_settled`](crate::OnionServiceHandle::wait_until_settled), which resolves once
 	/// the service is either reachable or terminal.
 	#[must_use]
 	pub const fn is_terminal(self) -> bool {
@@ -120,9 +120,9 @@ impl ServiceStatus {
 
 	/// The worst (least healthy) status across several services — the aggregate health
 	/// of, say, N onion services sharing one Tor client (see
-	/// [`OnionServiceBuilder::tor_client`]). Returns `None` for an empty iterator.
+	/// [`OnionServiceBuilder::tor_client`](crate::OnionServiceBuilder::tor_client)). Returns `None` for an empty iterator.
 	///
-	/// Folds by [`severity`](Self::severity), so a single unhealthy service in a fleet is
+	/// Folds by `severity`, so a single unhealthy service in a fleet is
 	/// never masked by its healthy siblings: `worst_of([Reachable, Broken])` is
 	/// [`Broken`](Self::Broken).
 	#[must_use]
@@ -206,7 +206,7 @@ impl ServiceProblemKind {
 /// [`ServiceStatus`]: downstreams match on the stable [`kind`](Self::kind) without a
 /// wildcard, and read the operator-facing diagnostic through [`detail`](Self::detail)
 /// or [`Display`](std::fmt::Display). Read the current value from a running service via
-/// [`OnionServiceHandle::problem`].
+/// [`OnionServiceHandle::problem`](crate::OnionServiceHandle::problem).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServiceProblem {
 	/// A fatal runtime error the service could not recover from — the reason behind a
@@ -296,10 +296,10 @@ pub fn project_service_problem(problem: &tor_hsservice::status::Problem) -> Serv
 /// Phase 4 — observability).
 ///
 /// Bundles the [`ServiceStatus`] and, when the service is not fully healthy, the
-/// [`ServiceProblem`] explaining why. Read via [`OnionServiceHandle::health`]. The value is derived from a **single** read
+/// [`ServiceProblem`] explaining why. Read via [`OnionServiceHandle::health`](crate::OnionServiceHandle::health). The value is derived from a **single** read
 /// of arti's status, so the `status` and `problem` are always mutually consistent —
-/// unlike calling [`status`](OnionServiceHandle::status) and
-/// [`problem`](OnionServiceHandle::problem) separately, which reads arti twice and can
+/// unlike calling [`status`](crate::OnionServiceHandle::status) and
+/// [`problem`](crate::OnionServiceHandle::problem) separately, which reads arti twice and can
 /// straddle a state transition (e.g. read `Reachable` then a just-arrived problem).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServiceHealth {
@@ -309,7 +309,7 @@ pub struct ServiceHealth {
 
 impl ServiceHealth {
 	/// Bundle a status and its (optional) problem into a snapshot. Crate-internal — the
-	/// handle builds this from a single arti read (see [`OnionServiceHandle::health`]) so
+	/// handle builds this from a single arti read (see [`OnionServiceHandle::health`](crate::OnionServiceHandle::health)) so
 	/// the two halves are mutually consistent; downstreams read it, never construct it.
 	pub(crate) const fn new(status: ServiceStatus, problem: Option<ServiceProblem>) -> Self {
 		Self { status, problem }
@@ -361,7 +361,7 @@ impl std::fmt::Display for ServiceHealth {
 /// that status — or `None` if the stream ends first (the underlying service was
 /// dropped before the condition was met).
 ///
-/// Extracted from [`OnionServiceHandle::ready`] and its timeout/settle siblings so the
+/// Extracted from [`OnionServiceHandle::ready`](crate::OnionServiceHandle::ready) and its timeout/settle siblings so the
 /// wait logic is unit-testable offline over a constructed stream, with no live Tor
 /// service (the projection that feeds it is already covered by
 /// `service_status_projects_every_arti_state`). Takes the stream by value and pins it

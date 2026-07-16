@@ -63,13 +63,13 @@ pub trait StreamHandler: Send + Sync {
 }
 
 /// What the rendezvous loop should do with a BEGIN cell for a given port — the
-/// pure routing decision, generalizing [`PortAction`] with the caller-registered
+/// pure routing decision, generalizing `PortAction` with the caller-registered
 /// raw handlers.
 pub enum PortDispatch<'a> {
 	/// Serve over the built-in TLS + HTTP handler (the axum app). Port 443.
 	ServeHttp,
 	/// Answer with a `301` redirect to HTTPS. Port 80 under
-	/// [`PlaintextPolicy::Upgrade`].
+	/// `PlaintextPolicy::Upgrade`.
 	RedirectToHttps,
 	/// Serve with a caller-registered raw [`StreamHandler`].
 	Raw(&'a Arc<dyn StreamHandler>),
@@ -95,7 +95,7 @@ impl std::fmt::Debug for PortDispatch<'_> {
 /// TLS-first decision (serve / upgrade / reject) always wins for them.
 pub const RESERVED_HTTP_PORTS: [u16; 2] = [80, 443];
 
-/// Whether `port` is one of the [`RESERVED_HTTP_PORTS`] (80/443) served by the built-in
+/// Whether `port` is one of the `RESERVED_HTTP_PORTS` (80/443) served by the built-in
 /// TLS-enforced HTTP handler — the only ports where the Skin HTTP gate can render a
 /// challenge page. A raw port has no such surface, so a circuit-policy `Challenge` there
 /// must fail closed rather than serve the stream ungated (see
@@ -116,7 +116,7 @@ pub const fn is_reserved_http_port(port: u16) -> bool {
 /// reserved ports 80/443, and caller-registered raw [`StreamHandler`]s on any
 /// other (otherwise-rejected) port.
 ///
-/// The TLS-first port decision is delegated to [`tls_policy::port_action`], so
+/// The TLS-first port decision is delegated to `tls_policy::port_action`, so
 /// there is one source of truth for the built-in behaviour; raw handlers only
 /// fill the ports that decision would otherwise reject. An empty router
 /// reproduces today's HTTP-only behaviour exactly.
@@ -161,7 +161,7 @@ const SENSITIVE_PORTS: &[(u16, &str)] = &[
 ];
 
 /// The well-known name of a sensitive service on `port`, if it has one
-/// (see [`SENSITIVE_PORTS`]).
+/// (see `SENSITIVE_PORTS`).
 ///
 /// Pure lookup, so it is unit-testable with no live Tor network.
 #[must_use]
@@ -180,7 +180,7 @@ pub struct RawPortExposure {
 }
 
 impl RawPortExposure {
-	/// Is this a well-known administrative/datastore port (see [`SENSITIVE_PORTS`])?
+	/// Is this a well-known administrative/datastore port (see `SENSITIVE_PORTS`)?
 	#[must_use]
 	pub const fn is_sensitive(&self) -> bool {
 		self.service.is_some()
@@ -213,7 +213,7 @@ impl PortRouter {
 	/// Register `handler` to serve `port`.
 	///
 	/// # Errors
-	/// Returns an error if `port` is `0`, is one of the [`RESERVED_HTTP_PORTS`]
+	/// Returns an error if `port` is `0`, is one of the `RESERVED_HTTP_PORTS`
 	/// (80/443, reserved for the built-in TLS-enforced HTTP handler), or already
 	/// has a registered handler.
 	pub fn register(&mut self, port: u16, handler: Arc<dyn StreamHandler>) -> Result<()> {
@@ -240,7 +240,7 @@ impl PortRouter {
 	///
 	/// # Errors
 	/// Returns the first [`register`](Self::register) error (port `0`, a
-	/// [`RESERVED_HTTP_PORTS`] entry, or a duplicate port).
+	/// `RESERVED_HTTP_PORTS` entry, or a duplicate port).
 	pub fn from_registrations(handlers: Vec<(u16, Arc<dyn StreamHandler>)>) -> Result<Self> {
 		let mut router = Self::new();
 		for (port, handler) in handlers {
@@ -290,7 +290,7 @@ impl PortRouter {
 	/// Decide what to do with a stream for `port` under the chosen plaintext
 	/// policy.
 	///
-	/// The built-in TLS-first decision (via [`tls_policy::port_action`]) wins for
+	/// The built-in TLS-first decision (via `tls_policy::port_action`) wins for
 	/// ports 80/443; only a port that decision would *reject* can resolve to a
 	/// registered raw handler, falling back to [`PortDispatch::Reject`] when none
 	/// is registered.

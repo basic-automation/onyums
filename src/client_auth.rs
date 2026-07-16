@@ -133,7 +133,7 @@ impl ClientAuthKeypair {
 	/// `<host>:descriptor:x25519:<BASE32-secret>` — the inverse of
 	/// [`auth_private_line`](Self::auth_private_line) — returning the derived keypair
 	/// and the [`OnionAddress`] it is scoped to. The host is taken verbatim (with a
-	/// `.onion` suffix normalized on) exactly as [`auth_private_line`] wrote it; like
+	/// `.onion` suffix normalized on) exactly as [`auth_private_line`](Self::auth_private_line) wrote it; like
 	/// [`OnionAddress::normalized`] it is not re-validated as a real v3 address.
 	///
 	/// # Errors

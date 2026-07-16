@@ -41,7 +41,7 @@ const ONION_ADDRESS_LEN: usize = 56;
 const HS_ED25519_SECRET_TAG: &[u8; 32] = b"== ed25519v1-secret: type0 ==\x00\x00\x00";
 
 /// Total length of a Tor `hs_ed25519_secret_key` file: the 32-byte
-/// [`HS_ED25519_SECRET_TAG`] followed by the 64-byte *expanded* secret key.
+/// `HS_ED25519_SECRET_TAG` followed by the 64-byte *expanded* secret key.
 const HS_ED25519_SECRET_FILE_LEN: usize = HS_ED25519_SECRET_TAG.len() + 64;
 
 /// A mined keypair together with the `.onion` address it produces.
@@ -163,9 +163,9 @@ pub fn address_from_expanded_secret(bytes: [u8; 64]) -> Result<OnionAddress> {
 /// Tor `hs_ed25519_secret_key` file.
 ///
 /// This is the on-disk identity format both C tor and arti's `CTorServiceKeystore`
-/// use: a 32-byte [`HS_ED25519_SECRET_TAG`] tag followed by the 64-byte expanded
+/// use: a 32-byte `HS_ED25519_SECRET_TAG` tag followed by the 64-byte expanded
 /// secret key (secret scalar || hash prefix), for a total of
-/// [`HS_ED25519_SECRET_FILE_LEN`] bytes. Reading this file is the first step of
+/// `HS_ED25519_SECRET_FILE_LEN` bytes. Reading this file is the first step of
 /// migrating an existing onion service into onyums without changing its address.
 ///
 /// The bytes are validated fully: the exact length, the exact tag, and that the
@@ -214,7 +214,7 @@ pub fn address_from_tor_secret_key_file(bytes: &[u8]) -> Result<OnionAddress> {
 /// `hs_ed25519_secret_key` file.
 ///
 /// The inverse of [`expanded_secret_from_tor_file`]: prepends the 32-byte
-/// [`HS_ED25519_SECRET_TAG`] to the expanded key, yielding the exact 96-byte blob C
+/// `HS_ED25519_SECRET_TAG` to the expanded key, yielding the exact 96-byte blob C
 /// tor and arti's keystore expect. Use it to export an onyums-held identity (e.g. a
 /// [`mined`](VanityKey) one) into the standard on-disk format — for a backup, or to
 /// seed another service — so a key can round-trip out of and back into any Tor

@@ -14,17 +14,17 @@ anyhow = "1.0.103"
 hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 futures = "0.3.32"
-arti-client = { version = "0.43.0", features = ["full", "static"] }
-tor-cell = { version = "0.43.0", features = ["full"] }
-tor-hsservice = { version = "0.43.0", features = ["full"] }
-tor-proto = { version = "0.43.0", features = ["full", "stream-ctrl"] }
-tor-rtcompat = { version = "0.43.0", features = ["full"] }
-tor-cert = "0.43.0"
+arti-client = { version = "0.44.0", features = ["full", "static"] }
+tor-cell = { version = "0.44.0", features = ["full"] }
+tor-hsservice = { version = "0.44.0", features = ["full"] }
+tor-proto = { version = "0.44.0", features = ["full", "stream-ctrl"] }
+tor-rtcompat = { version = "0.44.0", features = ["full"] }
+tor-cert = "0.44.0"
 # Low-level arti crypto + onion-service identity types. Used by the Phase 1
 # vanity-address miner to derive the *exact* `.onion` address arti will serve
 # from a candidate ed25519 key (no second, divergent encoding). Pure Rust.
-tor-llcrypto = "0.43.0"
-tor-hscrypto = "0.43.0"
+tor-llcrypto = "0.44.0"
+tor-hscrypto = "0.44.0"
 # Phase 1 identity — pure-Rust QR encoding for the `.onion` address (terminal +
 # SVG renderers). `default-features = false` drops the `image` renderer (and its
 # heavy `image`/`png` tree); only the always-available unicode renderer and the
@@ -44,7 +44,7 @@ zeroize = "1.8"
 tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
 http-body-util = "0.1.3"
 bytes = "1.12.0"
-safelog = "0.8.2"
+safelog = "0.9.0"
 tracing-subscriber = "0.3.23"
 # Dev-only: request-level tests of the served Router without a live Tor network.
 tower = { version = "0.5.2", features = ["util"] }
@@ -75,13 +75,13 @@ equix = { version = "0.6.2", default-features = false }
 name = "onyums"
 version = "0.3.1"
 edition = "2024"
-# Minimum supported Rust version. Not a guess: 1.90 is the floor cargo's own
-# resolver enforces — `typed-index-collections@3.5.0` (a transitive arti 0.43
-# dependency) declares `rust-version = 1.90.0`, so 1.89 is refused outright, and
-# the rest of the arti 0.43 stack declares 1.89. Verified by building the lib on
-# each toolchain: 1.90 green, 1.89 refused. Edition 2024 alone would only need
-# 1.85 — the arti stack, not the edition, sets this floor. Enforced in CI.
-rust-version = "1.90"
+# Minimum supported Rust version. Not a guess: 1.91 is the floor cargo's own
+# resolver enforces — `arti-client@0.44.0`, `caret@0.10.0`, and `fs-mistrust@0.15.0`
+# all declare `rust-version = 1.91`, so 1.90 is refused outright. Verified by
+# building the lib on each toolchain: 1.91 green, 1.90 refused. Edition 2024 alone
+# would only need 1.85 — the arti stack, not the edition, sets this floor, and the
+# 0.43 -> 0.44 bump is what moved it from 1.90. Enforced in CI.
+rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
 readme = "README.md"

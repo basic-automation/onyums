@@ -122,8 +122,8 @@ Almost nothing — which is much of the point:
 - **A clock that is roughly right.** Tor is sensitive to clock skew; a badly wrong
   system time is a common cause of a bootstrap that never finishes.
 
-**Toolchain:** Rust **edition 2024**, MSRV **1.90** — declared as `rust-version` in
-the manifest and enforced in CI. The floor comes from the embedded arti 0.43 stack,
+**Toolchain:** Rust **edition 2024**, MSRV **1.91** — declared as `rust-version` in
+the manifest and enforced in CI. The floor comes from the embedded arti 0.44 stack,
 not the edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate,
 which carries none of arti, is usable on **1.89**.
 
@@ -200,8 +200,8 @@ cover every row below.
 | Intro-layer PoW (Tor's Equi-X) | 🔵 | Needs arti's experimental `hs-pow-full`. Skin's PoW is HTTP-layer only. |
 | Host-global concurrency/backpressure caps | 🔵 | Per-circuit limits exist via `CircuitPolicy`; total circuit/stream semaphores do not. |
 | CLI binary, framework layer (Phase 5) | 🔵 | Library only today. |
-| Single-onion-service mode | 🔴 | The `anonymity` field is commented out in the pinned tor-hsservice 0.43. |
-| arti-sourced gauges (intro-point health, …) | 🔴 | Arrives with arti ≥ 1.4.3's `metrics` feature; onyums pins 0.43. |
+| Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.44. |
+| arti-sourced gauges (intro-point health, …) | 🔵 | Unblocked by the 0.44 bump: `tor-hsservice` 0.44 carries the optional `metrics` feature; wiring it up is open work, not an upstream block. |
 
 Full detail, including what each slice covers, lives in [ROADMAP.md](ROADMAP.md).
 

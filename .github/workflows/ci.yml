@@ -77,13 +77,13 @@ jobs:
     strategy:
       fail-fast: false
       # The two crates have different floors on purpose: onyums is pinned by the
-      # embedded arti 0.43 stack, while onyums-skin carries none of arti and stays a
-      # minor lower. Checking them together at one version would silently let skin's
+      # embedded arti 0.44 stack, while onyums-skin carries none of arti and stays two
+      # minors lower. Checking them together at one version would silently let skin's
       # floor drift up to the server's. See the `rust-version` comments in each manifest.
       matrix:
         include:
           - crate: onyums
-            rust: "1.90"
+            rust: "1.91"
           - crate: onyums-skin
             rust: "1.89"
     steps:

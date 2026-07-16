@@ -17,7 +17,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onyums_skin::{CircuitAction, CircuitId, StreamTarget};
-use tor_proto::client::stream::IncomingStreamRequest;
+use tor_proto::stream::IncomingStreamRequest;
 
 /// Allocates monotonic, process-unique [`CircuitId`]s — one per offered rendezvous
 /// circuit, minted at the `RendRequest` boundary (see the module docs for why the id is

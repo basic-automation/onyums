@@ -28,7 +28,7 @@ use hyper::{body::Incoming, Request, Response, StatusCode};
 use hyper_util::{
 	rt::{TokioExecutor, TokioIo}, service::TowerToHyperService
 };
-use onyums_skin::{CircuitId, CircuitPolicy};
+use onyums_skin::{AdaptiveDifficulty, CircuitId, CircuitPolicy};
 use tokio_rustls::TlsAcceptor;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{RendRequest, StreamRequest};
@@ -56,6 +56,9 @@ pub struct ServeContext {
 	pub plaintext: tls_policy::PlaintextPolicy,
 	pub port_router: Arc<PortRouter>,
 	pub metrics: Arc<CircuitMetrics>,
+	/// Optional Skin adaptive-PoW controller, shared with the caller's `Skin`. Each
+	/// offered circuit is recorded here (see `circuit_gate::observe_circuit`).
+	pub adaptive: Option<Arc<AdaptiveDifficulty>>,
 }
 
 /// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
@@ -78,6 +81,10 @@ pub async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> +
 		let _circuit_guard = circuit_span.enter();
 		let id = allocator.next_id();
 		ctx.metrics.record_circuit_offered();
+		// Record the circuit as load *before* the policy verdict: a rejected circuit is
+		// still evidence of an attack, and only counting accepted ones would let an
+		// attacker hold the PoW difficulty down by ensuring their circuits get rejected.
+		circuit_gate::observe_circuit(ctx.adaptive.as_deref());
 
 		// Consult the policy at the circuit boundary before accepting.
 		if circuit_gate::circuit_disposition(policy.on_new_circuit(&id)) == CircuitDisposition::Drop {

@@ -192,7 +192,7 @@ mod tests {
 
 		// Bound the launch — bootstrap is unbounded on a blocked network — so this
 		// tier fails in minutes rather than hanging the way its predecessor did.
-		let handle = tokio::time::timeout(std::time::Duration::from_secs(300), launch).await.expect("Tor bootstrap + service launch should finish within 5 minutes").expect("live launch should yield a service handle");
+		let handle = tokio::time::timeout(std::time::Duration::from_mins(5), launch).await.expect("Tor bootstrap + service launch should finish within 5 minutes").expect("live launch should yield a service handle");
 
 		// The minted address must be a valid v3 onion address, not just non-empty.
 		OnionAddress::parse(handle.onion_address().as_str()).expect("launched service must expose a valid v3 onion address");
@@ -200,7 +200,7 @@ mod tests {
 		// Soft signal only (see the doc comment): give full reachability a short
 		// window and record the outcome, but do not fail on arti's conservative
 		// both-rings readiness.
-		let ready = handle.ready_timeout(std::time::Duration::from_secs(60)).await;
+		let ready = handle.ready_timeout(std::time::Duration::from_mins(1)).await;
 		event!(Level::INFO, "live tier: ready_timeout(60s) = {ready}, status = {:?}", handle.status());
 
 		// A second client that is allowed to dial `.onion` addresses. It shares the
@@ -211,13 +211,13 @@ mod tests {
 		fetch_cfg.address_filter().allow_onion_addrs(true);
 		let fetch_cfg = fetch_cfg.build().expect("fetch-client config should build");
 		let runtime = TokioNativeTlsRuntime::current().expect("current tokio runtime");
-		let fetch_client = tokio::time::timeout(std::time::Duration::from_secs(300), TorClient::with_runtime(runtime).config(fetch_cfg).create_bootstrapped()).await.expect("fetch-client bootstrap should finish within 5 minutes").expect("fetch client should bootstrap");
+		let fetch_client = tokio::time::timeout(std::time::Duration::from_mins(5), TorClient::with_runtime(runtime).config(fetch_cfg).create_bootstrapped()).await.expect("fetch-client bootstrap should finish within 5 minutes").expect("fetch client should bootstrap");
 
 		// The authoritative live signal: the app's body comes back through a real
 		// rendezvous. Retry across HsDir propagation lag right after first publish.
 		let mut served_body = None;
 		for attempt in 1..=8 {
-			match tokio::time::timeout(std::time::Duration::from_secs(60), live_fetch_once(&fetch_client, handle.onion_address())).await {
+			match tokio::time::timeout(std::time::Duration::from_mins(1), live_fetch_once(&fetch_client, handle.onion_address())).await {
 				Ok(Ok(response)) if response.contains("Hello, World!") => {
 					event!(Level::INFO, "live tier: fetch attempt {attempt} served the app body");
 					served_body = Some(response);
@@ -238,6 +238,6 @@ mod tests {
 		// Graceful teardown must return — the missing half of the old test. Bounded
 		// like every other phase, so a wedged accept loop fails the run instead of
 		// hanging it.
-		tokio::time::timeout(std::time::Duration::from_secs(60), handle.shutdown()).await.expect("graceful shutdown should complete within 60 seconds");
+		tokio::time::timeout(std::time::Duration::from_mins(1), handle.shutdown()).await.expect("graceful shutdown should complete within 60 seconds");
 	}
 }

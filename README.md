@@ -421,6 +421,7 @@ async fn main() {
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits (custom CircuitPolicy)
 		// .under_attack(true)                   // force EVERY new circuit through the gate (flood mode)
 		// .circuit_events(my_sink)              // observe circuit rejects/teardowns/challenges
+		// .adaptive_difficulty(controller)      // feed circuit-flood load into Skin's adaptive PoW
 		// .authorized_clients(allowlist)        // restricted discovery — only listed clients can reach it
 		// .tls(Tls::Strict)                     // make TLS non-negotiable (reject plaintext, emit HSTS)
 		// .tls(Tls::Provided(my_cert))          // serve your own CA-signed cert instead of self-signed

@@ -22,7 +22,7 @@ use anyhow::{bail, Result};
 use arti_client::TorClient;
 use axum::Router;
 use futures::Stream;
-use onyums_skin::{AccountingCircuitPolicy, CircuitPolicy, RestrictedDiscovery, SecurityEventSink, Skin};
+use onyums_skin::{AccountingCircuitPolicy, AdaptiveDifficulty, CircuitPolicy, RestrictedDiscovery, SecurityEventSink, Skin};
 use safelog::DisplayRedacted;
 use tokio_util::sync::CancellationToken;
 use tor_hsservice::{
@@ -121,6 +121,10 @@ pub struct OnionServiceBuilder {
 	circuit_policy: Option<Arc<dyn CircuitPolicy>>,
 	under_attack: bool,
 	circuit_events: Option<Arc<dyn SecurityEventSink>>,
+	// Shared with the caller's `Skin`: the accept loop records each offered rendezvous
+	// circuit here so the PoW difficulty reacts to circuit floods skin cannot see
+	// (Phase 2 — feed the adaptive-difficulty signal from onyums-observed circuit rate).
+	adaptive_difficulty: Option<Arc<AdaptiveDifficulty>>,
 	restricted_discovery: Option<RestrictedDiscovery>,
 	raw_handlers: Vec<(u16, Arc<dyn StreamHandler>)>,
 	ephemeral: bool,
@@ -202,6 +206,38 @@ impl OnionServiceBuilder {
 	#[must_use]
 	pub const fn under_attack(mut self, on: bool) -> Self {
 		self.under_attack = on;
+		self
+	}
+
+	/// Feed onyums-observed rendezvous-circuit arrivals into a Skin
+	/// [`AdaptiveDifficulty`] controller (onyums ROADMAP Phase 2).
+	///
+	/// Skin raises its proof-of-work difficulty from the request rate it observes — but it
+	/// only sees requests that reached the HTTP gate. A flood of rendezvous circuits that
+	/// never speak HTTP, or that the circuit policy rejects outright, costs you real work
+	/// while skin's counter reads zero and its difficulty stays dormant. onyums sits at the
+	/// circuit boundary and sees them, so pass the *same* controller here that you gave your
+	/// challenge, and both signals drive one difficulty.
+	///
+	/// ```rust,no_run
+	/// # fn f() -> anyhow::Result<()> {
+	/// use std::sync::Arc;
+	/// use onyums::{onyums_skin::AdaptiveDifficulty, OnionService};
+	///
+	/// // One controller, shared: the challenge reads it, the accept loop feeds it.
+	/// let difficulty = Arc::new(AdaptiveDifficulty::new(8, 22));
+	/// let builder = OnionService::builder()
+	///     .nickname("my_onion")
+	///     .adaptive_difficulty(Arc::clone(&difficulty));
+	/// // ...and give `difficulty` to your PowChallenge via `with_adaptive_difficulty`.
+	/// # Ok(())
+	/// # }
+	/// ```
+	///
+	/// Optional: with no controller the loop records nothing, which is today's behaviour.
+	#[must_use]
+	pub fn adaptive_difficulty(mut self, controller: Arc<AdaptiveDifficulty>) -> Self {
+		self.adaptive_difficulty = Some(controller);
 		self
 	}
 
@@ -440,7 +476,7 @@ impl OnionServiceBuilder {
 		// cheaply-cloned context (see [`ServeContext`]). The metrics counters are shared
 		// with the handle so `metrics()` reads what the loop increments.
 		let metrics = Arc::new(CircuitMetrics::default());
-		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics) };
+		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics), adaptive: self.adaptive_difficulty };
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();

@@ -16,7 +16,7 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use onyums_skin::{CircuitAction, CircuitId, StreamTarget};
+use onyums_skin::{AdaptiveDifficulty, CircuitAction, CircuitId, StreamTarget};
 use tor_proto::stream::IncomingStreamRequest;
 
 /// Allocates monotonic, process-unique [`CircuitId`]s — one per offered rendezvous
@@ -125,6 +125,31 @@ pub fn requested_port(request: &IncomingStreamRequest) -> u16 {
 	}
 }
 
+/// Feed one observed rendezvous circuit into skin's adaptive proof-of-work controller
+/// (onyums ROADMAP Phase 2 — feed the adaptive-difficulty signal from onyums-observed
+/// circuit rate).
+///
+/// Skin raises proof-of-work difficulty from the request rate *it* observes, but it only
+/// ever sees requests that reached the HTTP gate. That leaves a blind spot only the host
+/// can fill:
+/// a flood of rendezvous circuits that send no HTTP — or that the circuit policy rejects
+/// before any HTTP exists — costs the attacker circuits and costs the service work, while
+/// skin's rate counter reads zero and its difficulty stays dormant. onyums sits at the
+/// `RendRequest` boundary and sees exactly those.
+///
+/// So each offered circuit is recorded as one unit of load. Deliberately counted at the
+/// *offer*, before the policy verdict: a rejected circuit is still evidence of an attack
+/// in progress, and refusing to count it would let an attacker hold difficulty down by
+/// ensuring their circuits are rejected.
+///
+/// A no-op when no controller is wired up, which is the default — the signal only exists
+/// if the caller shares an [`AdaptiveDifficulty`] with both their `Skin` and the builder.
+pub fn observe_circuit(adaptive: Option<&AdaptiveDifficulty>) {
+	if let Some(adaptive) = adaptive {
+		adaptive.record_request();
+	}
+}
+
 /// Build skin's [`StreamTarget`] from a BEGIN cell's port. Onion-service BEGIN cells are
 /// gated on port (443 TLS / 80 → HTTPS redirect); the host is not consulted by current
 /// policy, so it is left `None`.
@@ -182,6 +207,34 @@ mod tests {
 		let begin_dir = IncomingStreamRequest::BeginDir(tor_cell::relaycell::msg::BeginDir::default());
 		assert_eq!(requested_port(&begin_dir), 0, "BEGIN_DIR must not resolve to a servable port");
 		assert!(!crate::port_router::is_reserved_http_port(requested_port(&begin_dir)), "port 0 is not a reserved HTTP port, so it is refused");
+	}
+
+	#[test]
+	fn observing_circuits_raises_the_adaptive_pow_difficulty() {
+		// The integration contract this exists for: circuits onyums observes must move
+		// skin's difficulty. No sleeping and no clock injection needed — the 100 records
+		// below land far inside the controller's rate window, so the window cannot roll
+		// mid-test and the counts are exact.
+		let adaptive = AdaptiveDifficulty::new(4, 20).rate_band(10, 100);
+
+		assert_eq!(adaptive.observed_rate(), 0);
+		assert_eq!(adaptive.current_difficulty(), 4, "dormant at the baseline with no load");
+
+		// A rendezvous flood: circuits arrive, none of them ever speaks HTTP, so skin's
+		// own request counter would never see them.
+		for _ in 0..100 {
+			observe_circuit(Some(&adaptive));
+		}
+
+		assert_eq!(adaptive.observed_rate(), 100, "every offered circuit counts as load");
+		assert!(adaptive.current_difficulty() > 4, "difficulty must climb off the baseline under a circuit flood, got {}", adaptive.current_difficulty());
+		assert_eq!(adaptive.current_difficulty(), 20, "at the top of the band the difficulty is the configured max");
+	}
+
+	#[test]
+	fn observing_a_circuit_without_a_controller_is_a_noop() {
+		// The default: no controller is wired up, and the loop must not care.
+		observe_circuit(None); // must not panic
 	}
 
 	#[test]

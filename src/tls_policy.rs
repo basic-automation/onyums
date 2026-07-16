@@ -21,7 +21,7 @@
 ///
 /// This enum carries a (non-`Copy`) certificate in the [`Tls::Provided`] case;
 /// the rendezvous loop never sees it — it threads only the small [`Copy`]
-/// [`PlaintextPolicy`] returned by [`Tls::plaintext_policy`].
+/// `PlaintextPolicy` returned by [`Tls::plaintext_policy`].
 #[derive(Clone, Debug, Default)]
 pub enum Tls {
 	/// Default — auto self-signed cert, and plaintext HTTP on port 80 is
@@ -80,7 +80,7 @@ pub enum PlaintextPolicy {
 }
 
 /// What the rendezvous loop should do with a BEGIN cell for a given port under a
-/// given [`PlaintextPolicy`]. The pure, offline-testable counterpart to the live
+/// given `PlaintextPolicy`. The pure, offline-testable counterpart to the live
 /// port dispatch in `handle_stream_request`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PortAction {

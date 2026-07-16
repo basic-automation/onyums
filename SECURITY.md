@@ -74,10 +74,29 @@ behavior:
   application-level auth for access control.
 - **Raw-port handlers bypass the HTTP gate.** Traffic routed via
   `.route_port(...)` does not pass through the Skin WAF / rate limiter; secure
-  those services independently.
+  those services independently. `serve()` logs a warning naming each raw port and
+  what does not apply to it, and `ConnectionLimit` caps a port's concurrency, but
+  the backend's own authentication is the only thing standing between a client and
+  it.
 - **Intro-layer Proof-of-Work is not implemented.** Skin's PoW is HTTP-layer
   only; onyums does not currently provide Tor introduction-point flood protection
   (blocked on experimental Arti features).
+- **Keystore permission hardening is Unix-only.** The state directory holds the
+  onion service's identity key — whoever can read it can impersonate the address.
+  On Unix, onyums enforces `0700`/`0600` across the tree on every launch and
+  refuses to start if a path cannot be made owner-only. **On Windows it does
+  nothing**: access control there is ACL-based with no Unix mode equivalent, so the
+  keystore is protected only by whatever the filesystem's ACLs say. If you run
+  onyums on Windows, securing that directory is yours to do.
+- **A circuit id is not an identity.** `ConnectionInfo::circuit_id` is synthetic
+  and per-circuit; a client — an attacker most of all — can open a new circuit at
+  will. Anything durable or adversarial belongs on a clearance token, a
+  restricted-discovery key, or your own auth, not on the circuit id.
+- **The dependency tree is not FFI-free.** onyums' and onyums-skin's own
+  dependency choices are pure Rust, but the embedded Tor client links three
+  vendored C libraries: OpenSSL (arti's TLS runtime), SQLite (arti's directory
+  cache), and LZMA (directory compression). `cargo deny` gates each to the exact
+  path it arrives on so a new one cannot appear unnoticed.
 
 See the [README](README.md) and [ROADMAP.md](ROADMAP.md) for the full picture of
 what is implemented, what needs live-Tor verification, and what is planned.

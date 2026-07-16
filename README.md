@@ -51,18 +51,81 @@ redirecting, `no_skin()` drops the abuse gate, `under_attack(true)` forces every
 circuit through the gate, and `route_port(...)` adds a raw-TCP branch. See the
 sections below for each.
 
-## Installation
+## Quick start
+
+From nothing to a live onion service:
 
 ```sh
+cargo new my-onion-app && cd my-onion-app
 cargo add onyums tokio --features tokio/full
 ```
 
-Onyums is a library — add it to an async binary. No external Tor daemon is
-required: the [Arti](https://gitlab.torproject.org/tpo/core/arti) Tor client is
-embedded, so the first run downloads Tor consensus data over the network and
-creates the keystore/cache under `./tor/onyums/` itself. It uses Rust **edition
-2024**, so a recent stable toolchain (Rust 1.85 or newer) is required; a pinned,
-CI-enforced MSRV is still on the roadmap.
+`src/main.rs` — complete, and it is the whole program:
+
+```rust
+use onyums::{OnionService, routing::get, Router};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let app = Router::new().route("/", get(|| async { "Hello from Tor!" }));
+
+	let handle = OnionService::builder()
+		.router(app)
+		.nickname("my_onion")   // names the identity key in the keystore
+		.serve()
+		.await?;
+
+	// The address is stable across restarts (the keystore is persisted).
+	println!("serving on https://{}", handle.onion_address());
+
+	// Resolves when the descriptor is published and the service is reachable.
+	handle.ready().await;
+	println!("reachable — open that URL in Tor Browser");
+
+	// Run until Ctrl-C, then stop cleanly.
+	tokio::signal::ctrl_c().await?;
+	handle.shutdown().await;
+	Ok(())
+}
+```
+
+```sh
+cargo run
+```
+
+That is the entire secure stack: a self-signed TLS certificate for the address, the
+Skin abuse-defense gate, and the WAF are all already on. Expect the first run to
+take a minute or two (see [First launch & troubleshooting](#first-launch--troubleshooting)),
+and expect a certificate warning in Tor Browser — that one is normal, and
+[TLS-first transport](#tls-first-transport) explains why.
+
+### What it needs from the outside
+
+Almost nothing — which is much of the point:
+
+- **No external Tor daemon, no `torrc`, no system service.** The
+  [Arti](https://gitlab.torproject.org/tpo/core/arti) Tor client is compiled *into*
+  your binary. If you have deployed an onion service behind C-tor before, the thing
+  you are looking for to configure is not there, by design.
+- **Outbound network access is required** — to reach Tor directory authorities and
+  relays. Onyums opens no inbound listener and needs no port forwarded, no public
+  IP, and no firewall hole: rendezvous circuits are established *outbound*. A host
+  that can make outbound TCP connections can serve an onion service.
+- **The first run downloads the Tor network consensus**, which is why it is slower
+  than later ones. It is cached (see below) and refreshed as needed.
+- **Two directories are created under the process's working directory**:
+  `./tor/onyums/state` — the keystore holding the service's identity key. **This is
+  the service's identity**: back it up, keep it owner-only (onyums enforces
+  `0700`/`0600` on Unix — see [Deployment](#deployment)), and it is what makes the
+  address stable across restarts. And `./tor/onyums/cache` — the network consensus,
+  disposable and refetched if deleted.
+- **A clock that is roughly right.** Tor is sensitive to clock skew; a badly wrong
+  system time is a common cause of a bootstrap that never finishes.
+
+**Toolchain:** Rust **edition 2024**, MSRV **1.91** — declared as `rust-version` in
+the manifest and enforced in CI. The floor comes from the embedded arti 0.44 stack,
+not the edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate,
+which carries none of arti, is usable on **1.89**.
 
 ## Features
 
@@ -74,7 +137,7 @@ CI-enforced MSRV is still on the roadmap.
 - **Multiple services on one bootstrap** — bootstrap once with `OnionService::shared_client()` (or reuse a running handle's `tor_client()`), pass it to several builders via `.tor_client(...)`, and aggregate fleet health with `ServiceStatus::worst_of([...])`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
-- **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, bring-your-own-key migration from a Tor `hs_ed25519_secret_key` file, and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
+- **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, offline inspection of a Tor `hs_ed25519_secret_key` file (derive the address a key serves — launching *from* an imported key is not yet supported), and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
 - **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity (typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers for per-circuit isolation); see [Websocket example](#websocket-example).
 - **Version-skew-proof arti** — the arti stack is re-exported (`onyums::arti_client`, `onyums::tor_hsservice`, `onyums::tor_hscrypto`, …) so downstreams use the exact versions onyums does, just like `axum`.
 
@@ -99,6 +162,48 @@ defense you would otherwise assemble yourself.
 Reach for **raw Arti** when you want to build the stack yourself, **tor-hsrproxy** to
 front an existing local service with no app code, and **onyums** when you want the
 secure-by-default axum→onion path in one library.
+
+## Feature status — how much to trust each of these
+
+Pre-1.0, and the honest answer differs per feature, so here it is per feature. The
+distinction that matters most is the middle row group: onyums' automated tests are
+**offline** (a `tower`-level harness with no Tor network), so a feature can be fully
+unit-tested and still never have been exercised against real Tor by CI. The live
+tier exists — `live_service_serves_over_the_tor_network_and_shuts_down`, run
+manually with `cargo test -- --ignored` — but it is not part of CI and does not
+cover every row below.
+
+| Status | Meaning |
+|---|---|
+| 🟢 **Tested offline** | Implemented, with automated tests that CI runs on every push. No live Tor involved. |
+| 🟡 **Needs live verification** | Implemented and compiles; its logic is unit-tested where it could be isolated, but the code path only truly runs against the real Tor network, which CI does not do. |
+| 🔵 **Planned** | Not implemented. |
+| 🔴 **Blocked upstream** | Cannot be implemented from here until arti changes. |
+
+| Feature | Status | Notes |
+|---|---|---|
+| `serve()` / builder API, config validation | 🟢 | Nickname, port, TLS, and client-choice validation all fail offline before any bootstrap. |
+| TLS policy (`Upgrade` / `Strict` / `Provided`) | 🟢 | Composition (gate + HSTS + app) is `oneshot`-tested; `ProvidedCert` parses/validates up front. |
+| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 428 unit tests in `onyums-skin`, no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
+| Restricted discovery / client-auth keys | 🟢 | Key generation, `.auth` rendering/parsing, and allowlist assembly are offline-tested and byte-checked against Tor's file format. Descriptor encryption itself is arti's. |
+| Identity: persistent + `.ephemeral()` keystore | 🟢 | Directory resolution, uniqueness, and cleanup tested offline. |
+| Keystore permission hardening (0700/0600) | 🟢 | Unix-only; the syscall path runs on CI's Linux runner. A no-op on Windows (see [Deployment](#deployment)). |
+| Vanity mining, address helpers, QR | 🟢 | Pure computation; derives the exact address arti serves. |
+| `ServiceStatus` / `ServiceProblem` projection | 🟢 | Mapping tested against every arti state. The *emission* of transitions is 🟡. |
+| Host-side metrics + Prometheus exposition | 🟢 | Counter mechanics and text format tested offline; the accept loop's increment sites are 🟡. |
+| **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path. Covered by the manual `--ignored` live test, not by CI. |
+| Raw-port serving (`route_port`) | 🟡 | The routing table and the `RawTcpHandler` proxy are offline-tested against a loopback backend; the live path is not. |
+| Circuit-policy gate, Under Attack mode | 🟡 | Decision logic is offline-tested; it is driven from the live rendezvous loop. |
+| Multiple services on one shared client | 🟡 | The offline surface (`shared_client()`, conflict rejection, fleet status) is tested; N-services-actually-reachable is not verified. |
+| `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
+| Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
+| Intro-layer PoW (Tor's Equi-X) | 🔵 | Needs arti's experimental `hs-pow-full`. Skin's PoW is HTTP-layer only. |
+| Host-global concurrency/backpressure caps | 🔵 | Per-circuit limits exist via `CircuitPolicy`; total circuit/stream semaphores do not. |
+| CLI binary, framework layer (Phase 5) | 🔵 | Library only today. |
+| Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.44. |
+| arti-sourced gauges (intro-point health, …) | 🔵 | Reachable but not taken: `tor-hsservice` 0.44's `metrics` feature is marked `__is_experimental` (non-semver), the same category as the intro-layer PoW feature. A decision, not a flag. |
+
+Full detail, including what each slice covers, lives in [ROADMAP.md](ROADMAP.md).
 
 ## Hello world example
 
@@ -275,6 +380,32 @@ Onyums bundles [`onyums-skin`](crates/onyums-skin), a "Cloudflare for Tor" abuse
 
 The posture is *secure and complete by default*: the gate is on unless you turn it off, and you opt **down** (`no_skin`) or **across** (a custom `Skin`), never up.
 
+### What the gate does *not* do
+
+"Abuse defense on by default" is a floor, not a guarantee. Three limits are worth
+stating plainly, because assuming otherwise is how a service gets hurt:
+
+- **The WAF is best-effort and non-authoritative.** It is a *starter signature
+  ruleset* — pattern matching over the request. Signature WAFs are bypassable, and
+  a determined attacker with time to iterate will get a payload past this one. It
+  exists to cut background noise and raise the cost of drive-by scanning; it is
+  **not** a substitute for a secure application. Parameterise your queries, encode
+  your output, and authorise every request as if the WAF were not there. Treat a
+  WAF block as telemetry, not as proof you were safe.
+- **The proof-of-work is HTTP-layer only — there is no Tor introduction-point
+  PoW.** The challenge is served by the Skin gate *after* a rendezvous circuit has
+  already been established, so it raises the cost of hammering your *application*.
+  It does nothing about a flood aimed at your introduction points, which is the
+  attack Tor's own onion-service PoW (Equi-X, `tor-hspow`) addresses. That lives
+  in arti behind an experimental feature and is **not** wired up here (ROADMAP
+  Phase 2). If you are being flooded at the intro layer, onyums does not currently
+  help.
+- **The gate keys on the circuit and the clearance token, not on an identity.**
+  There are no client IPs over Tor, so a `CircuitId` is synthetic and an attacker
+  can rotate circuits at will. Per-circuit limits are therefore a speed bump, not
+  a ban. Bind anything that must be durable to a clearance token, a restricted-
+  discovery key, or your own application auth.
+
 ```rust
 use onyums::{OnionService, Skin, routing::get, Router};
 
@@ -290,6 +421,7 @@ async fn main() {
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits (custom CircuitPolicy)
 		// .under_attack(true)                   // force EVERY new circuit through the gate (flood mode)
 		// .circuit_events(my_sink)              // observe circuit rejects/teardowns/challenges
+		// .adaptive_difficulty(controller)      // feed circuit-flood load into Skin's adaptive PoW
 		// .authorized_clients(allowlist)        // restricted discovery — only listed clients can reach it
 		// .tls(Tls::Strict)                     // make TLS non-negotiable (reject plaintext, emit HSTS)
 		// .tls(Tls::Provided(my_cert))          // serve your own CA-signed cert instead of self-signed
@@ -313,6 +445,44 @@ The full Skin API (clearance tokens, the challenge chain, the WAF, per-circuit `
 ## Restricted discovery — v3 client authorization
 
 For a service with a known, small set of users, `.authorized_clients(...)` enables Tor's **restricted discovery** (v3 client authorization): the service descriptor — its introduction points and keys — is encrypted to the listed clients' x25519 keys, so an *unlisted* client cannot even discover the service. This is DoS resistance enforced in descriptor crypto, upstream of the Skin HTTP gate rather than in place of it.
+
+> **Restricted discovery is not authentication.** It controls who can *find* the
+> service, not who may *do* what once they arrive. Read it as an unlisted phone
+> number, not a lock on the door:
+>
+> - **Removing a client does not revoke it.** The allowlist gates descriptor
+>   *decryption*, so a removed client keeps working until the descriptor is
+>   republished and its existing circuits die — and anyone who already learned the
+>   introduction points can keep reaching you meanwhile. There is no session kill.
+> - **The key is a bearer credential.** It identifies a *client entry*, not a
+>   person; a leaked or shared `.auth_private` is indistinguishable from the real
+>   client, and nothing binds it to a request.
+> - **Every authorized client is equal.** There are no roles, no per-route
+>   permissions, and no audit trail of who did what.
+>
+> So layer real authentication *inside* the app and treat discovery as the outer
+> shell. The two compose — restricted discovery keeps strangers from ever opening a
+> circuit, the Skin gate absorbs abuse from those who do, and app auth decides what
+> an authenticated user may actually do:
+>
+> ```rust
+> // Restricted discovery says WHO CAN FIND the service.
+> // Your app still says WHO THIS IS and WHAT THEY MAY DO.
+> let app = Router::new()
+> 	.route("/admin", get(admin_page))
+> 	.layer(middleware::from_fn(require_login)); // sessions/tokens/mTLS — your call
+>
+> let handle = OnionService::builder()
+> 	.router(app)
+> 	.nickname("private_service")
+> 	.authorized_clients(allowlist) // outer shell: strangers cannot even discover it
+> 	.serve()
+> 	.await?;
+> ```
+>
+> A useful test: if leaking one client's `.auth_private` file would be a breach
+> rather than an inconvenience, you are relying on restricted discovery for
+> authentication and need app auth underneath it.
 
 The allowlist is an `onyums_skin::RestrictedDiscovery`, built from `.auth` files or by authorizing keys directly:
 
@@ -341,7 +511,7 @@ async fn main() {
 }
 ```
 
-This is an explicit opt-*down* in reachability (from "anyone with the address" to "only these clients"). Restricted discovery is a DoS-resistance mechanism, **not** a substitute for authentication: removing a client does not immediately revoke an already-connected one.
+This is an explicit opt-*down* in reachability (from "anyone with the address" to "only these clients") — and, per the note above, a discovery control rather than an authentication one.
 
 ### Provisioning a new client
 
@@ -384,6 +554,40 @@ Onyums treats encrypted transport as the standard, never as optional cruft to st
 - **`Tls::Upgrade` (default)** — an auto-generated self-signed cert, and plaintext HTTP on port 80 is transparently redirected (`301`) to HTTPS. A client that arrives over plain HTTP is pointed at the secure URL rather than refused.
 - **`Tls::Strict`** — TLS is non-negotiable. Plaintext circuits are **rejected outright** (there is no port-80 redirect handler at all), and every HTTPS response carries an `Strict-Transport-Security` header (`max-age=63072000; includeSubDomains`) so a conforming client never silently downgrades.
 - **`Tls::Provided(cert)`** — serve your **own** certificate chain and key instead of the auto-generated self-signed one, for CA-signed `.onion` certificates (e.g. [HARICA](https://www.harica.gr/)) that some clients and browsers prefer. Build the cert once with `ProvidedCert::from_pem(cert_pem, key_pem)` — it parses and validates the pair up front, so a bad cert/key is a clean error at startup, not a runtime surprise. Bringing your own cert is *orthogonal* to plaintext strictness: it keeps the forgiving `Upgrade` posture (port-80 → HTTPS redirect, no HSTS).
+
+### Why TLS *inside* Tor? ("double encryption")
+
+A fair question, since the Tor circuit is already encrypted and — unlike the
+public-internet case — an onion service has **no exit node**: the circuit is
+encrypted end to end, all the way to the service. So the inner TLS is not a second
+lock against a network eavesdropper; that threat is already handled. What it
+actually buys is:
+
+- **Secure-context semantics.** Browsers gate real capabilities on *the scheme in
+  the URL bar*, not on how the bytes travelled. Over `http://…onion` you lose
+  WebCrypto, service workers, `Secure` / `__Host-` cookie prefixes, HTTP/2, and you
+  invite mixed-content blocking. TLS is what makes an onion service a first-class
+  web origin.
+- **A correct view of the request.** The app sees the `https` scheme and the
+  headers it implies, so redirects, cookie flags, `Onion-Location`, and anything
+  else that reasons about the scheme behave the way they would anywhere else.
+- **Defence in depth against misconfiguration** — a stray plaintext listener, or a
+  future deployment where the router is *not* in this process, fails closed under
+  `Tls::Strict` rather than quietly serving cleartext.
+
+Being precise about what it does **not** buy, since "double encryption" invites
+overclaiming: arti runs in-process and TLS terminates in that same process, so the
+inner layer is **not** meaningful protection against an attacker who can read this
+process's memory — such an attacker holds the TLS keys *and* the plaintext. Nor is
+it protection against a malicious Tor relay, which is already outside the circuit's
+end-to-end encryption. And it does not apply to raw ports at all: a
+`route_port(...)` handler is deliberately not TLS-wrapped (the onion circuit
+already encrypts and authenticates it, and the backend protocol negotiates its own
+security).
+
+The honest summary: the onion address authenticates, the circuit encrypts, and the
+inner TLS is what makes the browser treat your service like the real web
+application it is.
 
 ```rust
 use onyums::{OnionService, ProvidedCert, Tls, routing::get, Router};
@@ -450,6 +654,56 @@ A raw port has no HTTP challenge surface, so when the circuit policy (e.g. Under
 
 Bring your own protocol by implementing the `StreamHandler` trait (one method: `serve(&self, stream: OnionStream) -> ServeFuture`). The TLS-first posture is preserved no matter what you register: ports **80 and 443 stay reserved for the built-in HTTP handler**, so a raw handler may only occupy another (otherwise-rejected) port — registering a reserved port, port 0, or the same port twice is a clean error from `serve()`, not a runtime surprise. This is an opt **up** in protocol reach, never a relaxation of the secure HTTP defaults.
 
+> **A raw port is unguarded — know what you are opening.** The HTTP defaults are
+> untouched, but nothing on the HTTP defence path reaches a raw stream: **no Skin
+> gate, no PoW/challenge, no WAF, no rate limiting, and no built-in TLS**. The onion
+> circuit still encrypts and authenticates the channel, and Tor still makes the port
+> unscannable and unreachable without the address — but from the handler inward, the
+> backend protocol's own authentication is the only thing standing there.
+>
+> So `serve()` logs a `WARN` for every registered raw port, naming what does not
+> apply, and names the service when the port is a well-known administrative or
+> datastore one (SSH, PostgreSQL, Redis, MongoDB, Docker's API, …) — the protocols
+> normally bound to loopback *because* they are not built to face hostile traffic.
+> Publishing one over an onion service is a legitimate and rather good idea done
+> deliberately (a globally reachable admin port with no open firewall port and no IP
+> to scan); it is a bad one done by accident, and the log is where the two are told
+> apart. The same data is available programmatically via
+> `PortRouter::exposures()` / `well_known_sensitive_service(port)` if you would
+> rather assert on it in your own startup checks.
+>
+> Two things worth stating: restricted discovery controls who can *find* the service,
+> not who may use a raw port once found; and per-circuit `CircuitPolicy` limits still
+> apply at the circuit layer, but a `Challenge` verdict on a raw port **fails closed**
+> (rejected, not served ungated) since there is no HTTP surface to render a challenge
+> on.
+
+**Cap the concurrency.** Nothing on the HTTP defence path bounds how many connections
+reach a raw backend, so the only limit is how fast an attacker can open rendezvous
+circuits. `ConnectionLimit` wraps any handler and refuses a stream once the port is at
+capacity:
+
+```rust
+use onyums::{ConnectionLimit, OnionService, RawTcpHandler, routing::get, Router};
+
+let ssh = ConnectionLimit::new(RawTcpHandler::new("127.0.0.1:22"), 4)?;
+
+let handle = OnionService::builder()
+	.router(Router::new().route("/", get(|| async { "hi" })))
+	.nickname("my_onion")
+	.route_port(2222, ssh)  // at most 4 concurrent SSH connections
+	.serve()
+	.await?;
+```
+
+At capacity the stream is **closed immediately, not queued** — queueing would turn a
+connection flood into unbounded memory growth and a latency cliff for the clients
+already connected, which is the failure a limit exists to prevent. A refused client can
+retry; one parked in an invisible queue cannot tell slow from dead. The cap is per
+wrapper, so each port gets its own budget, and `in_flight()` / `is_saturated()` expose
+the current state for a health endpoint. A limit of `0` is rejected at construction
+rather than becoming a port that silently accepts nothing.
+
 ****
 
 ## Identity & address helpers
@@ -459,7 +713,18 @@ By default onyums keeps its onion identity key in a persistent keystore
 configuration. `.ephemeral()` is the explicit opt-**down** to a throwaway identity —
 the keystore lives in a unique temp directory, so each launch mints a fresh,
 disposable address, and that directory is removed when the handle drops so the
-disposable key does not linger on disk:
+disposable key does not linger on disk.
+
+That covers the graceful exits. It does **not** cover the process being `SIGKILL`ed,
+OOM-killed, or the machine losing power — no cleanup code of any kind runs then, and
+a signal handler cannot help (`SIGKILL` is uncatchable by definition). So a throwaway
+identity key would otherwise sit in your temp directory indefinitely. Instead, each
+ephemeral service holds an **owner lock** inside its state directory for as long as it
+runs, and each ephemeral launch first sweeps away any `onyums-ephemeral-*` directory
+whose lock is free — i.e. whose owning process is gone, however it went. A running
+service's keystore is never swept, no matter how long it has been up. In practice: a
+crash leaves litter only until your next ephemeral launch, and you never have to
+reason about which temp directory belonged to what.
 
 ```rust
 use onyums::{OnionService, routing::get, Router};
@@ -473,10 +738,9 @@ let handle = OnionService::builder()
 	.unwrap();
 ```
 
-**Bring your own identity.** To migrate an existing service into onyums without
-changing its address, read its Tor `hs_ed25519_secret_key` file and confirm the
-address *before* wiring anything up — onyums derives it with the same encoding arti
-serves, so the check is exact:
+**Bring your own identity — inspection only, for now.** Read an existing service's
+Tor `hs_ed25519_secret_key` file and derive the exact address it serves; onyums uses
+the same encoding arti serves, so the check is exact:
 
 ```rust
 use onyums::address_from_tor_secret_key_file;
@@ -488,8 +752,17 @@ println!("this key serves {address}"); // matches the service's existing address
 
 A mined vanity key can also be exported to the same on-disk format
 (`VanityKey::to_tor_secret_key_file()`) for backup or to load into any Tor
-implementation. (Loading a BYO key directly into the live keystore is a
-forthcoming slice — it rides on an arti experimental API.)
+implementation.
+
+> **This does not yet migrate a service.** What exists is **offline only**: parse a
+> key file, derive its address, render the inverse blob. There is no API that loads
+> a bring-your-own key into the live keystore and launches on it — so you cannot, in
+> onyums today, take an existing `.onion` address and serve it. Launching from an
+> imported key needs either arti's `launch_onion_service_with_hsid` (behind an
+> experimental, non-semver feature) or a port of arti's `hss ctor-migrate` utility;
+> both are open decisions on the ROADMAP (Phase 1). Until then, treat these helpers
+> as a *pre-flight check* — verify a key serves the address you expect, back it up,
+> confirm a restore — not as a migration path.
 
 `handle.onion_address()` returns a typed `OnionAddress`, not a bare string, with the helpers an onion app actually needs:
 
@@ -556,6 +829,9 @@ warning for public users.
 | A raw `route_port(...)` backend is unreachable | The local TCP backend isn't listening on the address you forwarded to. |
 | `serve()` returns a port error | Ports 80/443 are reserved for the built-in HTTP handler, and a port can't be registered twice or as `0` — this is a clean startup error, not a runtime surprise. |
 | Address changed after a restart | You used `.ephemeral()` (throwaway identity by design); drop it to keep the persistent keystore's stable address. |
+| Startup fails: "could not be tightened" / "refusing to launch with a locally-readable onion-service identity" | A path in `./tor/onyums/state` is group/other-accessible and this process can't `chmod` it — almost always because the directory is owned by *another* user (ran as root once, now as a service account?). `chown` the tree to the service user. Fail-closed is deliberate: the alternative is serving an identity your other local users can read. See [Keystore permissions](#deployment). |
+| Startup fails: "refusing to harden the symlink …" | Something in the state tree is a symlink. Identity material must be a real file — replace the link, or point the working directory at the real location instead. |
+| `WARN … Hardened N of M path(s) … to owner-only` | Not an error: onyums repaired a keystore that was readable by other local users (a restore that dropped modes, or a pre-hardening onyums). Worth asking who could read the key before it was fixed. |
 
 ****
 
@@ -619,6 +895,32 @@ launch — the address is derived from the key inside it. Confirm a restored key
 the address you expect *before* wiring it up with `address_from_tor_secret_key_file(...)`
 (see [Identity & address helpers](#identity--address-helpers)). Treat this directory as
 a secret: it *is* the service's identity.
+
+**Keystore permissions.** Whoever can read the state directory can impersonate your
+`.onion` — the address authenticates the key-holder, and that is the key. On Unix,
+onyums enforces the convention for private key material on every launch: **`0700` on
+directories, `0600` on files**, across the whole state tree. This is not advisory —
+it is applied before arti opens the keystore, and it **fails closed**: if a path
+cannot be made owner-only, the service refuses to start rather than serve an identity
+your other local users can read.
+
+- A tree that is already correct is left alone. A lax one — restored from a `tar`
+  that carried `0755`, or created under `umask 022` by an older onyums — is repaired
+  in place, with a `WARN` naming how many paths were tightened.
+- A *stricter* choice of yours is preserved: a `0400` key stays `0400`.
+- A symlink inside the state tree is refused rather than followed.
+- **This does not apply on Windows**, which has no Unix mode model (its access
+  control is ACL-based and Rust's standard library exposes only a read-only bit).
+  There the keystore is protected by whatever the filesystem's ACLs say, and onyums
+  logs that the control is not in force rather than claiming a hardening it did not
+  perform.
+
+Two operational consequences worth planning for: **your backups must preserve modes**
+(`tar -p`, or re-`chmod` on restore — a restore that widens them is repaired but
+logged loudly), and **the service must own its state directory**, since a file owned
+by another user cannot be tightened by this process and will fail the check. The
+systemd unit above gets this right by construction: `DynamicUser=yes` +
+`StateDirectory=` hands the service a private directory it owns.
 
 ****
 

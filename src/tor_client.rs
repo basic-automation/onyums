@@ -16,6 +16,8 @@ use tokio::task::JoinHandle;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tracing::{event, Level};
 
+use crate::keystore_perms::{harden_state_tree, Hardening};
+
 /// The default persistent onyums state directory — home of the Arti keystore that
 /// holds the onion service's v3 identity key, so the `.onion` address is stable
 /// across restarts (onyums ROADMAP Phase 1). Kept under `./tor/onyums` rather than
@@ -83,10 +85,38 @@ fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig
 /// bootstrap a client (e.g. the network is unreachable).
 pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
 	event!(Level::INFO, "Creating Tor client...");
+	harden_keystore(std::path::Path::new(state_dir))?;
 	let config = tor_client_config(state_dir, cache_dir)?;
 	let runtime = TokioNativeTlsRuntime::current().map_err(|e| anyhow::anyhow!("Failed to get current tokio runtime: {e}"))?;
 	let client = TorClient::with_runtime(runtime);
 	client.config(config).create_bootstrapped().await.map_err(|e| anyhow::anyhow!("Failed to create bootstrapped Tor client: {e}"))
+}
+
+/// Create the state directory hardened, and repair a lax one, before arti opens it
+/// (onyums ROADMAP Phase 2 — enforce filesystem permissions for the keystore).
+///
+/// The state tree holds the v3 identity key: whoever can read it can impersonate the
+/// `.onion` address. This runs on every bootstrap — persistent *and* ephemeral, since a
+/// throwaway identity is still an identity while it lives — and fails closed if the
+/// tree cannot be made owner-only. Off Unix the control does not exist; it is logged
+/// once at launch so an operator is never told a false "hardened" (see
+/// [`keystore_perms`](crate::keystore_perms)).
+///
+/// # Errors
+/// Returns an error if the state directory cannot be created, walked, or hardened.
+fn harden_keystore(state_dir: &std::path::Path) -> Result<()> {
+	match harden_state_tree(state_dir).map_err(|e| anyhow::anyhow!("Failed to harden the onion-service keystore at {}: {e}", state_dir.display()))? {
+		Hardening::Enforced { tightened, inspected } if tightened > 0 => {
+			event!(Level::WARN, "Hardened {tightened} of {inspected} path(s) in the keystore {state_dir:?} to owner-only (0700/0600): the onion-service identity key was readable by other local users.");
+		}
+		Hardening::Enforced { inspected, .. } => {
+			event!(Level::DEBUG, "Keystore {state_dir:?} permissions verified owner-only across {inspected} path(s).");
+		}
+		Hardening::Unsupported => {
+			event!(Level::DEBUG, "Keystore permission hardening is a no-op on this platform (no Unix mode model); {state_dir:?} is protected only by the platform's ACLs.");
+		}
+	}
+	Ok(())
 }
 
 /// The unique prefix every ephemeral state directory carries (see [`storage_dirs`]).
@@ -94,6 +124,139 @@ pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<To
 /// name does not start with this, so a bug that mis-threads a path can never remove
 /// a persistent or unrelated directory.
 const EPHEMERAL_DIR_PREFIX: &str = "onyums-ephemeral-";
+
+/// The lockfile every live ephemeral state dir holds open (see [`claim_ephemeral_dir`]).
+const EPHEMERAL_LOCK_FILE: &str = ".onyums-owner.lock";
+
+/// An ephemeral state dir's ownership claim: an open, **locked** file inside it, held
+/// for as long as the service lives (onyums ROADMAP Phase 2 — guaranteed ephemeral
+/// cleanup).
+///
+/// The lock is the liveness signal that makes [`sweep_stale_ephemeral_dirs`] safe. An
+/// advisory file lock is released by the operating system when the holding process
+/// exits — *however* it exits, including `SIGKILL`, the OOM killer, or a power loss, all
+/// of which no signal handler can catch. So "can this lock be acquired?" is a reliable
+/// proxy for "is the owner gone?" without needing a PID liveness check (which `std`
+/// cannot do without FFI, and which this workspace's no-FFI rule forbids).
+///
+/// Dropping this releases the lock and closes the file. Order matters at cleanup time:
+/// the file must be closed *before* the directory is removed, because Windows refuses to
+/// remove a directory that still contains an open handle.
+#[derive(Debug)]
+pub struct EphemeralClaim {
+	/// Held purely for its `Drop`: closing the file releases the OS-level lock. Never
+	/// read, hence the underscore — the value of this field *is* its lifetime.
+	_file: std::fs::File,
+}
+
+/// A live ephemeral identity: its throwaway state dir, and the claim proving this
+/// process still owns it.
+///
+/// Held by `OnionServiceHandle` for the service's lifetime. Bundling the two is what
+/// makes the teardown ordering unmissable — see [`release`](Self::release).
+#[derive(Debug)]
+pub struct EphemeralIdentity {
+	dir: std::path::PathBuf,
+	claim: EphemeralClaim,
+}
+
+impl EphemeralIdentity {
+	/// Pair a claimed dir with its claim.
+	#[must_use]
+	pub const fn new(dir: std::path::PathBuf, claim: EphemeralClaim) -> Self {
+		Self { dir, claim }
+	}
+
+	/// Give up the claim and hand back the directory to remove.
+	///
+	/// Dropping the claim *before* returning the path is the point, not incidental: the
+	/// lockfile lives inside the directory, and Windows refuses to remove a directory
+	/// that still holds an open file handle — so a removal that ran while the claim was
+	/// alive would silently fail there and leave the identity key on disk. Consuming
+	/// `self` means a caller cannot hold the claim and remove the directory at once.
+	#[must_use]
+	pub fn release(self) -> std::path::PathBuf {
+		drop(self.claim);
+		self.dir
+	}
+}
+
+/// Take ownership of a freshly minted ephemeral state dir by locking a file inside it.
+///
+/// Called once per ephemeral launch, before arti opens the keystore. The returned
+/// [`EphemeralClaim`] must be held for the service's lifetime — dropping it releases the
+/// claim, which tells a later [`sweep_stale_ephemeral_dirs`] that this directory is
+/// abandoned and may be removed.
+///
+/// # Errors
+/// Returns an error if the lockfile cannot be created or locked. A lock that is already
+/// held is a genuine error here rather than a race to tolerate: [`storage_dirs`] mints a
+/// unique path per launch (pid + a CSPRNG draw), so a *fresh* ephemeral dir whose lock is
+/// already taken means something is wrong with that assumption.
+pub fn claim_ephemeral_dir(dir: &std::path::Path) -> Result<EphemeralClaim> {
+	let path = dir.join(EPHEMERAL_LOCK_FILE);
+	let file = std::fs::File::create(&path).map_err(|e| anyhow::anyhow!("failed to create the ephemeral owner lockfile {}: {e}", path.display()))?;
+	file.try_lock().map_err(|e| anyhow::anyhow!("failed to lock the ephemeral owner lockfile {}: {e}", path.display()))?;
+	Ok(EphemeralClaim { _file: file })
+}
+
+/// Remove every abandoned ephemeral state dir left in the system temp tree by a previous
+/// run (onyums ROADMAP Phase 2), returning how many were removed.
+///
+/// The problem this solves: an ephemeral service's throwaway *identity key* is removed on
+/// `shutdown`/`Drop`, but neither runs if the process is `SIGKILL`ed, OOM-killed, or the
+/// machine loses power — so the key lingers on disk indefinitely. Signal trapping cannot
+/// fix that case: `SIGKILL` is by definition uncatchable, and it is the case that matters.
+///
+/// Instead this runs at *launch* and cleans up after whatever died last time. A directory
+/// is removed only if its [`EPHEMERAL_LOCK_FILE`] can be locked — i.e. no live process
+/// holds it — so a long-running sibling's keystore is never touched, however long it has
+/// been running. That makes this safe in a way an age-based heuristic would not be: "older
+/// than an hour" would happily delete the identity of a service that has been up for a
+/// week.
+///
+/// Best-effort by design, and never fatal: a directory that cannot be read or removed is
+/// skipped, since failing to tidy up a previous run is not a reason to refuse to start
+/// this one.
+pub fn sweep_stale_ephemeral_dirs(temp_dir: &std::path::Path) -> usize {
+	let Ok(entries) = std::fs::read_dir(temp_dir) else { return 0 };
+	let mut removed = 0;
+	for entry in entries.flatten() {
+		let path = entry.path();
+		let is_ephemeral = path.file_name().and_then(|n| n.to_str()).is_some_and(|n| n.starts_with(EPHEMERAL_DIR_PREFIX));
+		if !is_ephemeral || !path.is_dir() {
+			continue;
+		}
+		if claim_is_free(&path) {
+			// The claim was free, so no live process owns this dir. `claim_is_free` has
+			// already dropped its lock/handle, so the removal can take the whole tree
+			// (including the lockfile) on Windows too.
+			let before = path.exists();
+			remove_ephemeral_state_dir(&path);
+			if before && !path.exists() {
+				removed += 1;
+				event!(Level::INFO, "Removed the abandoned ephemeral keystore {path:?} left by a previous run.");
+			}
+		}
+	}
+	removed
+}
+
+/// Can this ephemeral dir's owner lock be taken — i.e. is its owning process gone?
+///
+/// A dir with no lockfile at all counts as free: it predates this mechanism, or the
+/// process died between creating the directory and claiming it. Either way nothing is
+/// holding it.
+fn claim_is_free(dir: &std::path::Path) -> bool {
+	let path = dir.join(EPHEMERAL_LOCK_FILE);
+	if !path.exists() {
+		return true;
+	}
+	let Ok(file) = std::fs::File::open(&path) else { return false };
+	// `try_lock` succeeding proves no other process holds it. The lock and the handle are
+	// both released as `file` drops at the end of this scope — before any removal.
+	file.try_lock().is_ok()
+}
 
 /// Best-effort removal of an ephemeral service's throwaway state directory, so the
 /// disposable identity key does not linger on disk after the service stops
@@ -237,6 +400,131 @@ mod tests {
 		let handle = spawn_ephemeral_cleanup(dir.clone()).expect("a live runtime offloads the removal to a task");
 		handle.await.expect("the offloaded cleanup task must not panic");
 		assert!(!dir.exists(), "the ephemeral dir must be gone after the offloaded cleanup");
+	}
+
+	// ---- Ephemeral ownership claims + the stale-dir sweep (Phase 2). ----
+
+	/// A private temp tree, so a sweep test never sees another test's (or another
+	/// process's) ephemeral dirs.
+	fn sweep_scratch(tag: &str) -> std::path::PathBuf {
+		let dir = std::env::temp_dir().join(format!("onyums-sweep-{}-{tag}-{:016x}", std::process::id(), rand::random::<u64>()));
+		std::fs::create_dir_all(&dir).expect("create sweep scratch");
+		dir
+	}
+
+	/// A directory shaped exactly like one `storage_dirs` mints, holding a fake key.
+	fn fake_ephemeral_dir(parent: &std::path::Path) -> std::path::PathBuf {
+		let dir = parent.join(format!("{EPHEMERAL_DIR_PREFIX}{}-{:016x}", std::process::id(), rand::random::<u64>()));
+		std::fs::create_dir_all(&dir).expect("create fake ephemeral dir");
+		std::fs::write(dir.join("hs_ed25519_secret_key"), b"fake identity").expect("write fake key");
+		dir
+	}
+
+	#[test]
+	fn a_claimed_dir_survives_the_sweep() {
+		// The case that must never regress: a *live* service's keystore. The claim is held
+		// (as it would be for the service's lifetime), so the sweep must leave it alone —
+		// no matter how old it is. An age-based heuristic would fail exactly here.
+		let scratch = sweep_scratch("live");
+		let dir = fake_ephemeral_dir(&scratch);
+		let claim = claim_ephemeral_dir(&dir).expect("claim a fresh ephemeral dir");
+
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 0, "a live, claimed dir must not be swept");
+		assert!(dir.exists(), "the live service's keystore must survive");
+		assert!(dir.join("hs_ed25519_secret_key").exists());
+		drop(claim);
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	#[test]
+	fn an_abandoned_dir_is_swept() {
+		// The case this exists for: the previous run was SIGKILLed, so its `Drop` never
+		// ran and the throwaway identity key is still on disk. Dropping the claim is what
+		// the OS does for us when a process dies, however it dies.
+		let scratch = sweep_scratch("abandoned");
+		let dir = fake_ephemeral_dir(&scratch);
+		let claim = claim_ephemeral_dir(&dir).expect("claim");
+		drop(claim); // <- the process died; the OS released its lock.
+
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 1, "an unclaimed dir must be swept");
+		assert!(!dir.exists(), "the abandoned identity key must be gone");
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	#[test]
+	fn the_sweep_leaves_unrelated_directories_alone() {
+		// The sweep runs over the shared system temp tree, so it must key strictly on the
+		// ephemeral prefix. Deleting someone else's temp dir would be a serious bug.
+		let scratch = sweep_scratch("unrelated");
+		let stranger = scratch.join("some-other-tool-cache");
+		std::fs::create_dir_all(&stranger).expect("create");
+		std::fs::write(stranger.join("data"), b"not ours").expect("write");
+		let loose_file = scratch.join(format!("{EPHEMERAL_DIR_PREFIX}not-a-directory"));
+		std::fs::write(&loose_file, b"a file, not a dir").expect("write");
+
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 0, "nothing here is a sweepable ephemeral dir");
+		assert!(stranger.exists(), "an unrelated directory must be untouched");
+		assert!(loose_file.exists(), "a file merely sharing the prefix is not a dir to remove");
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	#[test]
+	fn a_dir_with_no_lockfile_counts_as_abandoned() {
+		// Left by a pre-hardening onyums, or by a process that died between creating the
+		// directory and claiming it. Nothing holds it, so it is exactly the litter this
+		// sweep exists to remove.
+		let scratch = sweep_scratch("nolock");
+		let dir = fake_ephemeral_dir(&scratch);
+		assert!(!dir.join(EPHEMERAL_LOCK_FILE).exists());
+
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 1);
+		assert!(!dir.exists());
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	#[test]
+	fn the_sweep_distinguishes_live_from_abandoned_in_one_pass() {
+		// The realistic mixed state: this host has one service running and the corpses of
+		// two that were killed. One pass must remove exactly the corpses.
+		let scratch = sweep_scratch("mixed");
+		let live = fake_ephemeral_dir(&scratch);
+		let claim = claim_ephemeral_dir(&live).expect("claim the live one");
+		let dead_a = fake_ephemeral_dir(&scratch);
+		drop(claim_ephemeral_dir(&dead_a).expect("claim then die"));
+		let dead_b = fake_ephemeral_dir(&scratch); // never claimed at all
+
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 2, "exactly the two abandoned dirs");
+		assert!(live.exists(), "the live service's keystore must survive");
+		assert!(!dead_a.exists() && !dead_b.exists(), "both abandoned keystores must be gone");
+		drop(claim);
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	#[test]
+	fn the_sweep_is_idempotent_and_quiet_on_an_empty_tree() {
+		// It runs on every ephemeral launch, so the common case — nothing to clean — must
+		// be a silent no-op, and a second pass must find nothing left.
+		let scratch = sweep_scratch("idempotent");
+		let dir = fake_ephemeral_dir(&scratch);
+		drop(claim_ephemeral_dir(&dir).expect("claim"));
+
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 1);
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch), 0, "a second pass has nothing to do");
+		assert_eq!(sweep_stale_ephemeral_dirs(&scratch.join("does-not-exist")), 0, "a missing temp tree is not an error");
+		std::fs::remove_dir_all(&scratch).ok();
+	}
+
+	#[test]
+	fn a_claim_is_exclusive() {
+		// The claim's whole meaning: while one process holds it, another cannot take it —
+		// which is what makes "the lock is free" a sound proxy for "the owner is gone".
+		let scratch = sweep_scratch("exclusive");
+		let dir = fake_ephemeral_dir(&scratch);
+		let held = claim_ephemeral_dir(&dir).expect("first claim");
+		assert!(!claim_is_free(&dir), "a held claim must not read as free");
+		drop(held);
+		assert!(claim_is_free(&dir), "a released claim must read as free");
+		std::fs::remove_dir_all(&scratch).ok();
 	}
 
 	#[test]

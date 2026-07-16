@@ -1,0 +1,131 @@
+# Continuous integration for the onyums workspace (ROADMAP Phase 0 — "Add CI").
+#
+# Scope note: every job here is offline. The live onion-service test
+# (`live_service_serves_over_the_tor_network_and_shuts_down`) is `#[ignore]`d and is
+# NOT run — it needs the real Tor network, takes minutes, and would make CI flaky on
+# a network hiccup rather than on a code defect. It stays a local/manual tier
+# (`cargo test -- --ignored`).
+#
+# Deliberately absent: a `cargo fmt --check` job. The repo's rustfmt.toml enables
+# unstable options, so formatting requires a *nightly* rustfmt whose output drifts
+# between releases — the tree as committed does not match current nightly rustfmt, so
+# the job would fail on arrival for reasons unrelated to any given change. Landing it
+# needs a repo-wide reformat pinned to one toolchain first (tracked on the ROADMAP).
+
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # Dependencies move under a frozen Cargo.lock; a weekly run catches a break that no
+  # push would have surfaced.
+  schedule:
+    - cron: "0 5 * * 1"
+
+# A new push to a PR makes the in-flight run obsolete. The arti stack is expensive to
+# compile, so cancel rather than pay for a superseded answer.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Note: no global `RUSTFLAGS: -D warnings`. RUSTFLAGS applies to *dependencies* too,
+  # so one warning in any of the ~200 crates in the arti tree — under a rustc release
+  # nobody here chose — would fail CI for a reason no contributor can fix. The denial
+  # belongs where it is enforceable: the clippy job below, which lints only workspace
+  # members and denies rustc's own lints alongside clippy's.
+
+jobs:
+  test:
+    name: test (stable)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-features
+      # `--all-features` reaches onyums-skin's opt-in `equix` PoW backend, which is off
+      # by default and would otherwise never be compiled or tested here.
+      - name: Test
+        run: cargo test --workspace --all-features
+      # The keystore hardening in src/keystore_perms.rs is `#[cfg(unix)]`: its syscall
+      # tests are inert on a Windows dev box, so this Linux runner is where they
+      # actually execute against a real filesystem.
+      - name: Test (keystore permissions, Unix path)
+        run: cargo test -p onyums --lib keystore_perms -- --nocapture
+
+  clippy:
+    name: clippy (-D warnings)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # The crates opt into clippy::pedantic/nursery/cargo in lib.rs; -D warnings makes
+      # that opt-in binding rather than advisory.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  msrv:
+    name: MSRV
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # The two crates have different floors on purpose: onyums is pinned by the
+      # embedded arti 0.44 stack, while onyums-skin carries none of arti and stays two
+      # minors lower. Checking them together at one version would silently let skin's
+      # floor drift up to the server's. See the `rust-version` comments in each manifest.
+      matrix:
+        include:
+          - crate: onyums
+            rust: "1.91"
+          - crate: onyums-skin
+            rust: "1.89"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Check ${{ matrix.crate }} on ${{ matrix.rust }}
+        run: cargo check -p ${{ matrix.crate }} --all-features --all-targets
+
+  deny:
+    name: cargo-deny (advisories, licences, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      # The second run is not redundant with the first. The default graph carries no
+      # copyleft (onyums-skin's LGPL `equix` backend is opt-in), which is precisely what
+      # `cargo deny check` above enforces. This run turns `equix` on and checks it under
+      # the same policy, where LGPL-3.0-only is allowed for exactly two named crates.
+      # `--workspace` is load-bearing: without it cargo-deny resolves from the root
+      # package, whose `--all-features` does not reach a member's optional feature, and
+      # the run would pass for the wrong reason.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace --all-features
+
+  docs:
+    name: docs
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # Docs must *build* — this is the gate that catches a doc example or intra-doc
+      # link that stops compiling. It is not yet `-D warnings`: the tree currently has
+      # 46 rustdoc warnings (mostly public docs linking to private items in
+      # onyums-skin). Clearing them and tightening this to deny is tracked on the
+      # ROADMAP; a job that fails on arrival would just be ignored.
+      - name: Build docs
+        run: cargo doc --no-deps --workspace --all-features

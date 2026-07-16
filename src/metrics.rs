@@ -13,7 +13,7 @@ use crate::circuit_gate;
 
 /// A point-in-time snapshot of a service's cumulative circuit/stream counters.
 ///
-/// Returned by [`OnionServiceHandle::metrics`] (onyums ROADMAP Phase 4 — per-service
+/// Returned by [`OnionServiceHandle::metrics`](crate::OnionServiceHandle::metrics) (onyums ROADMAP Phase 4 — per-service
 /// metrics). Every field is a monotonic total since the service launched (a counter, not
 /// a gauge), so two snapshots subtract to a rate or a delta — feed them to a
 /// Prometheus/OpenTelemetry exporter, or print a health line. `circuits_offered` counts
@@ -38,7 +38,7 @@ pub struct ServiceMetrics {
 
 /// One service's six counter samples as `(prometheus_metric_name, HELP_text, value)`
 /// triples in the shared family order — the return of
-/// [`ServiceMetrics::prometheus_series`], named so the per-service and fleet exporters
+/// `prometheus_series`, named so the per-service and fleet exporters
 /// share one type.
 type PrometheusSeries = [(&'static str, &'static str, u64); 6];
 
@@ -143,7 +143,7 @@ impl ServiceMetrics {
 
 /// Render `metrics` as a Prometheus exposition labeled with the service's `.onion`
 /// address under the conventional `service` label key — the body of
-/// [`OnionServiceHandle::metrics_prometheus`], factored out so the labeling choice
+/// [`OnionServiceHandle::metrics_prometheus`](crate::OnionServiceHandle::metrics_prometheus), factored out so the labeling choice
 /// (which key, which value) is offline-testable without a running service.
 pub fn service_metrics_prometheus(metrics: ServiceMetrics, address: &OnionAddress) -> String {
 	metrics.to_prometheus_labeled(&[("service", address.as_str())])
@@ -155,7 +155,7 @@ pub fn service_metrics_prometheus(metrics: ServiceMetrics, address: &OnionAddres
 /// service's sample under its own `service="<label>"` label. This is the correct way to
 /// scrape a fleet at a single `/metrics` endpoint.
 /// Concatenating per-service [`ServiceMetrics::to_prometheus`] /
-/// [`OnionServiceHandle::metrics_prometheus`] outputs instead repeats the HELP/TYPE
+/// [`OnionServiceHandle::metrics_prometheus`](crate::OnionServiceHandle::metrics_prometheus) outputs instead repeats the HELP/TYPE
 /// headers for every service, which the Prometheus/OpenMetrics text format forbids
 /// (metadata must appear at most once per metric family) and strict parsers reject.
 ///
@@ -163,7 +163,7 @@ pub fn service_metrics_prometheus(metrics: ServiceMetrics, address: &OnionAddres
 /// `service="…"`. Feed it from a set of handles with
 /// `fleet_prometheus(handles.iter().map(|h| (h.onion_address().as_str(), h.metrics())))`.
 /// An empty iterator yields the empty string. The family metadata (names, help, order)
-/// comes from the same [`ServiceMetrics::prometheus_series`] the per-service exporter
+/// comes from the same `prometheus_series` the per-service exporter
 /// uses, so the two exports can never disagree.
 #[must_use]
 pub fn fleet_prometheus<'a>(services: impl IntoIterator<Item = (&'a str, ServiceMetrics)>) -> String {
@@ -235,7 +235,7 @@ fn escape_prometheus_label_value(value: &str) -> String {
 }
 
 /// Shared atomic counters backing [`ServiceMetrics`]: incremented from the rendezvous
-/// loop and snapshotted by [`OnionServiceHandle::metrics`].
+/// loop and snapshotted by [`OnionServiceHandle::metrics`](crate::OnionServiceHandle::metrics).
 ///
 /// `Relaxed` ordering throughout — each counter is an independent monotonic total, not a
 /// lock guarding other state, so no cross-counter ordering is needed.

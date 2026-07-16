@@ -118,21 +118,30 @@ wildcards = "deny"
 # a `*` version requirement. Intra-workspace paths are exactly what the workspace is
 # for; the wildcard ban is aimed at wildcard requirements on *published* crates.
 allow-wildcard-paths = true
-# The "100% Rust, no FFI, ever" rule, made mechanical. It is honest about where the
-# rule already has an exception rather than asserting a purity the tree does not have:
-# `openssl-sys` IS in the graph on Linux/macOS today, reached from arti's own TLS
-# runtime (onyums -> tor-rtcompat -> async-native-tls -> native-tls -> openssl-sys).
-# The `wrappers` allowance says exactly that and nothing more — openssl may enter via
-# arti's TLS, and any *other* path to it (or a direct onyums dependency on it) fails
-# the check. That is the line the principle is really defending: onyums' and
-# onyums-skin's own dependency choices stay pure Rust; the embedded Tor client's
-# platform TLS is arti's call, and dropping it means changing arti's runtime, not
-# ignoring a lint. `libz-sys`/`cmake` have no such excuse and are denied outright.
+# The "100% Rust, no FFI, ever" rule, made mechanical — and honest about the fact that
+# the *tree* does not satisfy it today, while onyums' and onyums-skin's own dependency
+# choices do. Audited 2026-07-16 with `cargo tree --target all`: three vendored C
+# libraries are in the graph, every one of them reached through the embedded Tor client,
+# none of them onyums' choice:
+#
+#   openssl-sys     <- native-tls   <- async-native-tls <- tor-rtcompat   (arti's TLS)
+#   libsqlite3-sys  <- rusqlite     <- tor-dirmgr                         (directory cache)
+#   lzma-sys        <- xz2          <- async-compression                  (compression)
+#
+# Each is banned *except* through the exact path it legitimately arrives on. That is the
+# line the principle actually defends: the embedded Tor client's internals are arti's
+# call, but a *new* C dependency — or any second route to one of these, or a direct
+# onyums/onyums-skin dependency on it — fails CI instead of passing review unnoticed.
+# Naming them here also stops the rule from quietly reading as satisfied when it is not:
+# see the ROADMAP for what it would take to actually drop openssl (arti's rustls runtime)
+# and async-std (both ride on `arti-client`'s `full` feature).
+#
+# `libz-sys`/`cmake` have no such excuse and are denied outright — nothing in the tree
+# reaches them today, and that is the state to keep.
 deny = [
-	# The chain is tor-rtcompat -> async-native-tls -> native-tls -> {openssl,
-	# openssl-sys}, and `wrappers` matches the *direct* parents — of which there are
-	# two, since native-tls links openssl-sys directly as well as through `openssl`.
 	{ name = "openssl-sys", wrappers = ["openssl", "native-tls"] },
+	{ name = "libsqlite3-sys", wrappers = ["rusqlite"] },
+	{ name = "lzma-sys", wrappers = ["xz2"] },
 	{ name = "libz-sys" },
 	{ name = "cmake" },
 ]

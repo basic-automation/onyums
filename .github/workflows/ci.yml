@@ -95,6 +95,26 @@ jobs:
       - name: Check ${{ matrix.crate }} on ${{ matrix.rust }}
         run: cargo check -p ${{ matrix.crate }} --all-features --all-targets
 
+  deny:
+    name: cargo-deny (advisories, licences, bans, sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+      # The second run is not redundant with the first. The default graph carries no
+      # copyleft (onyums-skin's LGPL `equix` backend is opt-in), which is precisely what
+      # `cargo deny check` above enforces. This run turns `equix` on and checks it under
+      # the same policy, where LGPL-3.0-only is allowed for exactly two named crates.
+      # `--workspace` is load-bearing: without it cargo-deny resolves from the root
+      # package, whose `--all-features` does not reach a member's optional feature, and
+      # the run would pass for the wrong reason.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+          arguments: --workspace --all-features
+
   docs:
     name: docs
     runs-on: ubuntu-latest

@@ -1,0 +1,145 @@
+# cargo-deny configuration for the onyums workspace
+# (ROADMAP Phase 2 — "Add cargo audit/cargo deny to CI", non-negotiable for a
+# security-critical crate).
+#
+# This config is run TWICE, and the pair is the point:
+#
+#   cargo deny check                              # the default graph
+#   cargo deny --workspace --all-features check   # with onyums-skin's `equix` on
+#
+# The first run is what mechanically enforces the project's "the default build stays
+# MIT/copyleft-free" rule: the `allow` list below contains no copyleft licence, and
+# onyums-skin's `equix` PoW backend (LGPL-3.0-only) is opt-in and therefore absent from
+# the default graph. If a copyleft crate ever reaches a default build, that run fails.
+#
+# The second run is the only place LGPL-3.0-only may appear, and even there it is
+# permitted for exactly two named crates (`equix` and its `hashx` engine) via
+# `[[licenses.exceptions]]` — not as a blanket allow. Verified to have teeth: deleting
+# the equix exception makes that run fail with `error[rejected]: license is not
+# explicitly allowed`.
+#
+# Note `--workspace` is load-bearing on the second run. Without it, cargo-deny resolves
+# from the root package `onyums`, whose own `--all-features` does not reach a *member's*
+# optional feature — so `cargo deny --all-features check` alone silently evaluates a
+# graph with no equix in it and passes for the wrong reason.
+
+[graph]
+all-features = false
+# Pin the evaluated targets rather than inheriting the host's. Without this, the
+# dependency graph — and therefore the verdict — differs by whoever runs it: arti's TLS
+# runtime reaches `native-tls` -> `openssl-sys` on Linux but `schannel` on Windows, so a
+# green run on a Windows dev box would say nothing about the Linux CI runner (or about
+# what actually ships). These are the platforms onyums is expected to serve from.
+targets = [
+	"x86_64-unknown-linux-gnu",
+	"aarch64-unknown-linux-gnu",
+	"x86_64-pc-windows-msvc",
+	"aarch64-apple-darwin",
+]
+
+[advisories]
+version = 2
+# Unmaintained crates are a real supply-chain signal, so warnings are not silently
+# tolerated: everything is denied by default and each exception below is an explicit,
+# reasoned entry rather than a blanket allow.
+yanked = "deny"
+# Every entry below is transitive, inside the arti stack, and not fixable from this
+# workspace. Each carries the reason it is tolerated rather than a bare ID. The two
+# findings that *were* fixable were fixed rather than ignored: `anyhow` 1.0.102 ->
+# 1.0.103 (RUSTSEC-2026-0190, UB in `Error::downcast_mut`) and `spin` 0.9.8 -> 0.9.9
+# (yanked).
+ignore = [
+	# "Marvin Attack": timing sidechannel key recovery in `rsa` 0.9.x. There is NO
+	# patched release — the advisory is open upstream.
+	# Path: onyums -> arti-client/tor-hscrypto -> tor-key-forge -> ssh-key-fork-arti
+	#       -> rsa 0.9.10.
+	# Why tolerated rather than fixed: `rsa` is pulled in by arti's ssh-key fork for
+	# OpenSSH key *formats* in the keystore. A v3 onion service's identity is ed25519
+	# and its client auth is x25519 — onyums mints, parses, and serves no RSA key on
+	# any path (src/vanity.rs, src/client_auth.rs). That believed unreachability is why
+	# it is not a launch blocker; it is NOT a proof, and the exposure is not onyums' to
+	# close. Re-check on every arti bump (ROADMAP cross-cutting).
+	{ id = "RUSTSEC-2023-0071", reason = "rsa 0.9.x has no patched release; reached only via arti's ssh-key fork for key file formats, and onyums handles no RSA key (ed25519 identity, x25519 client auth)." },
+
+	# `paste` is no longer maintained. A compile-time-only proc-macro (token pasting);
+	# it ships no runtime code into the binary.
+	{ id = "RUSTSEC-2024-0436", reason = "unmaintained `paste`, build-time-only proc-macro with no runtime surface; transitive under the arti stack." },
+
+	# `async-std` is discontinued. Transitive only: onyums runs on tokio and drives
+	# arti with TokioNativeTlsRuntime (src/tor_client.rs); it pulls in no async-std
+	# executor of its own.
+	{ id = "RUSTSEC-2025-0052", reason = "discontinued `async-std`, transitive only; onyums runs on tokio via TokioNativeTlsRuntime." },
+
+	# `proc-macro-error2` is unmaintained. Build-time-only; cargo separately flags it
+	# as future-incompatible.
+	{ id = "RUSTSEC-2026-0173", reason = "unmaintained `proc-macro-error2`, build-time-only proc-macro helper with no runtime surface." },
+]
+
+[licenses]
+version = 2
+# Permissive licences only. onyums and onyums-skin are both MIT, and the project rule
+# is that a *default* build carries no copyleft — so this list deliberately has no
+# GPL/LGPL/AGPL entry, and `cargo deny check licenses` failing is the intended alarm if
+# one ever appears in the default graph.
+allow = [
+	"MIT",
+	"Apache-2.0",
+	"Apache-2.0 WITH LLVM-exception",
+	"BSD-2-Clause",
+	"BSD-3-Clause",
+	"ISC",
+	"Unicode-3.0",
+	"Zlib",
+	"CC0-1.0",
+	"MPL-2.0",       # file-level copyleft only; does not affect a linking consumer.
+	"Unlicense",
+	"BSL-1.0",
+]
+confidence-threshold = 0.9
+
+[[licenses.exceptions]]
+# The one copyleft crate the workspace may reference, and only behind onyums-skin's
+# opt-in `equix` feature (Tor's own Equi-X PoW puzzle — pure Rust, no FFI). It is
+# absent from the default graph this file checks; this exception exists so the
+# feature-enabled CI run has a precise, single-crate allowance rather than a blanket
+# LGPL permit.
+name = "equix"
+allow = ["LGPL-3.0-only"]
+
+[[licenses.exceptions]]
+# `hashx` is equix's engine and arrives on the same opt-in feature.
+name = "hashx"
+allow = ["LGPL-3.0-only"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# `onyums-skin = { workspace = true }` is a path dependency, which cargo-deny reads as
+# a `*` version requirement. Intra-workspace paths are exactly what the workspace is
+# for; the wildcard ban is aimed at wildcard requirements on *published* crates.
+allow-wildcard-paths = true
+# The "100% Rust, no FFI, ever" rule, made mechanical. It is honest about where the
+# rule already has an exception rather than asserting a purity the tree does not have:
+# `openssl-sys` IS in the graph on Linux/macOS today, reached from arti's own TLS
+# runtime (onyums -> tor-rtcompat -> async-native-tls -> native-tls -> openssl-sys).
+# The `wrappers` allowance says exactly that and nothing more — openssl may enter via
+# arti's TLS, and any *other* path to it (or a direct onyums dependency on it) fails
+# the check. That is the line the principle is really defending: onyums' and
+# onyums-skin's own dependency choices stay pure Rust; the embedded Tor client's
+# platform TLS is arti's call, and dropping it means changing arti's runtime, not
+# ignoring a lint. `libz-sys`/`cmake` have no such excuse and are denied outright.
+deny = [
+	# The chain is tor-rtcompat -> async-native-tls -> native-tls -> {openssl,
+	# openssl-sys}, and `wrappers` matches the *direct* parents — of which there are
+	# two, since native-tls links openssl-sys directly as well as through `openssl`.
+	{ name = "openssl-sys", wrappers = ["openssl", "native-tls"] },
+	{ name = "libz-sys" },
+	{ name = "cmake" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+# Everything must come from crates.io: no git dependency, no private registry, no
+# vendored path outside the workspace.
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

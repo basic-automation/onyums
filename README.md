@@ -76,7 +76,7 @@ carries none of arti, is usable on **1.89**.
 - **Multiple services on one bootstrap** — bootstrap once with `OnionService::shared_client()` (or reuse a running handle's `tor_client()`), pass it to several builders via `.tor_client(...)`, and aggregate fleet health with `ServiceStatus::worst_of([...])`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
 - **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
-- **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, bring-your-own-key migration from a Tor `hs_ed25519_secret_key` file, and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
+- **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, offline inspection of a Tor `hs_ed25519_secret_key` file (derive the address a key serves — launching *from* an imported key is not yet supported), and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
 - **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity (typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers for per-circuit isolation); see [Websocket example](#websocket-example).
 - **Version-skew-proof arti** — the arti stack is re-exported (`onyums::arti_client`, `onyums::tor_hsservice`, `onyums::tor_hscrypto`, …) so downstreams use the exact versions onyums does, just like `axum`.
 
@@ -451,6 +451,40 @@ Onyums treats encrypted transport as the standard, never as optional cruft to st
 - **`Tls::Strict`** — TLS is non-negotiable. Plaintext circuits are **rejected outright** (there is no port-80 redirect handler at all), and every HTTPS response carries an `Strict-Transport-Security` header (`max-age=63072000; includeSubDomains`) so a conforming client never silently downgrades.
 - **`Tls::Provided(cert)`** — serve your **own** certificate chain and key instead of the auto-generated self-signed one, for CA-signed `.onion` certificates (e.g. [HARICA](https://www.harica.gr/)) that some clients and browsers prefer. Build the cert once with `ProvidedCert::from_pem(cert_pem, key_pem)` — it parses and validates the pair up front, so a bad cert/key is a clean error at startup, not a runtime surprise. Bringing your own cert is *orthogonal* to plaintext strictness: it keeps the forgiving `Upgrade` posture (port-80 → HTTPS redirect, no HSTS).
 
+### Why TLS *inside* Tor? ("double encryption")
+
+A fair question, since the Tor circuit is already encrypted and — unlike the
+public-internet case — an onion service has **no exit node**: the circuit is
+encrypted end to end, all the way to the service. So the inner TLS is not a second
+lock against a network eavesdropper; that threat is already handled. What it
+actually buys is:
+
+- **Secure-context semantics.** Browsers gate real capabilities on *the scheme in
+  the URL bar*, not on how the bytes travelled. Over `http://…onion` you lose
+  WebCrypto, service workers, `Secure` / `__Host-` cookie prefixes, HTTP/2, and you
+  invite mixed-content blocking. TLS is what makes an onion service a first-class
+  web origin.
+- **A correct view of the request.** The app sees the `https` scheme and the
+  headers it implies, so redirects, cookie flags, `Onion-Location`, and anything
+  else that reasons about the scheme behave the way they would anywhere else.
+- **Defence in depth against misconfiguration** — a stray plaintext listener, or a
+  future deployment where the router is *not* in this process, fails closed under
+  `Tls::Strict` rather than quietly serving cleartext.
+
+Being precise about what it does **not** buy, since "double encryption" invites
+overclaiming: arti runs in-process and TLS terminates in that same process, so the
+inner layer is **not** meaningful protection against an attacker who can read this
+process's memory — such an attacker holds the TLS keys *and* the plaintext. Nor is
+it protection against a malicious Tor relay, which is already outside the circuit's
+end-to-end encryption. And it does not apply to raw ports at all: a
+`route_port(...)` handler is deliberately not TLS-wrapped (the onion circuit
+already encrypts and authenticates it, and the backend protocol negotiates its own
+security).
+
+The honest summary: the onion address authenticates, the circuit encrypts, and the
+inner TLS is what makes the browser treat your service like the real web
+application it is.
+
 ```rust
 use onyums::{OnionService, ProvidedCert, Tls, routing::get, Router};
 
@@ -539,10 +573,9 @@ let handle = OnionService::builder()
 	.unwrap();
 ```
 
-**Bring your own identity.** To migrate an existing service into onyums without
-changing its address, read its Tor `hs_ed25519_secret_key` file and confirm the
-address *before* wiring anything up — onyums derives it with the same encoding arti
-serves, so the check is exact:
+**Bring your own identity — inspection only, for now.** Read an existing service's
+Tor `hs_ed25519_secret_key` file and derive the exact address it serves; onyums uses
+the same encoding arti serves, so the check is exact:
 
 ```rust
 use onyums::address_from_tor_secret_key_file;
@@ -554,8 +587,17 @@ println!("this key serves {address}"); // matches the service's existing address
 
 A mined vanity key can also be exported to the same on-disk format
 (`VanityKey::to_tor_secret_key_file()`) for backup or to load into any Tor
-implementation. (Loading a BYO key directly into the live keystore is a
-forthcoming slice — it rides on an arti experimental API.)
+implementation.
+
+> **This does not yet migrate a service.** What exists is **offline only**: parse a
+> key file, derive its address, render the inverse blob. There is no API that loads
+> a bring-your-own key into the live keystore and launches on it — so you cannot, in
+> onyums today, take an existing `.onion` address and serve it. Launching from an
+> imported key needs either arti's `launch_onion_service_with_hsid` (behind an
+> experimental, non-semver feature) or a port of arti's `hss ctor-migrate` utility;
+> both are open decisions on the ROADMAP (Phase 1). Until then, treat these helpers
+> as a *pre-flight check* — verify a key serves the address you expect, back it up,
+> confirm a restore — not as a migration path.
 
 `handle.onion_address()` returns a typed `OnionAddress`, not a bare string, with the helpers an onion app actually needs:
 

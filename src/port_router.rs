@@ -125,6 +125,83 @@ pub struct PortRouter {
 	handlers: HashMap<u16, Arc<dyn StreamHandler>>,
 }
 
+/// Ports whose exposure over an onion service warrants naming the service out loud
+/// (onyums ROADMAP Phase 2 — raw-port security controls).
+///
+/// These are the administrative and datastore protocols that are normally bound to
+/// loopback or a private network precisely *because* they are not built to face
+/// hostile traffic — several authenticate weakly or not at all by default. Publishing
+/// one on an onion service is a legitimate thing to do deliberately (that is much of
+/// the appeal: a globally reachable admin port with no open firewall port and no IP to
+/// scan), and a bad thing to do accidentally. The list exists to tell the two apart in
+/// the log.
+///
+/// Deliberately conservative: only ports with an unambiguous well-known assignment,
+/// so the warning stays worth reading. An unlisted port still gets the generic
+/// bypass warning — this table only adds the service name.
+const SENSITIVE_PORTS: &[(u16, &str)] = &[
+	(22, "SSH"),
+	(23, "Telnet"),
+	(389, "LDAP"),
+	(445, "SMB"),
+	(1433, "Microsoft SQL Server"),
+	(2375, "Docker API (unauthenticated)"),
+	(2376, "Docker API"),
+	(2379, "etcd"),
+	(3306, "MySQL"),
+	(3389, "RDP"),
+	(5432, "PostgreSQL"),
+	(5672, "AMQP / RabbitMQ"),
+	(5900, "VNC"),
+	(6379, "Redis"),
+	(9092, "Kafka"),
+	(9200, "Elasticsearch"),
+	(11211, "Memcached"),
+	(27017, "MongoDB"),
+];
+
+/// The well-known name of a sensitive service on `port`, if it has one
+/// (see [`SENSITIVE_PORTS`]).
+///
+/// Pure lookup, so it is unit-testable with no live Tor network.
+#[must_use]
+pub fn well_known_sensitive_service(port: u16) -> Option<&'static str> {
+	SENSITIVE_PORTS.iter().find(|(p, _)| *p == port).map(|(_, name)| *name)
+}
+
+/// One registered raw port and what serving it gives up
+/// (see [`PortRouter::exposures`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawPortExposure {
+	/// The registered port.
+	pub port: u16,
+	/// The well-known sensitive service on this port, if any (e.g. `"SSH"` for 22).
+	pub service: Option<&'static str>,
+}
+
+impl RawPortExposure {
+	/// Is this a well-known administrative/datastore port (see [`SENSITIVE_PORTS`])?
+	#[must_use]
+	pub const fn is_sensitive(&self) -> bool {
+		self.service.is_some()
+	}
+
+	/// The operator-facing warning for this exposure.
+	///
+	/// States the bypass in terms of what is *not* running, since that is the part a
+	/// reader can act on, and names the service when it is a known-sensitive port so the
+	/// line is specific rather than boilerplate to scroll past.
+	#[must_use]
+	pub fn message(&self) -> String {
+		let Self { port, service } = *self;
+		let bypass = format!("port {port} serves a raw handler: the Skin gate (PoW/challenge), the WAF, rate limiting, and the built-in TLS do NOT apply to it. The onion circuit still encrypts and authenticates the channel; everything above it is the backend protocol's job.");
+		match service {
+			Some(service) => format!("{bypass} Port {port} is the well-known {service} port — if that is deliberate, ensure {service} does its own authentication, since restricted discovery controls who can *find* the service, not who may use it."),
+			None => bypass,
+		}
+	}
+}
+
 impl PortRouter {
 	/// An empty router — no raw handlers, so dispatch is exactly the built-in
 	/// HTTP-only behaviour.
@@ -170,6 +247,25 @@ impl PortRouter {
 			router.register(port, handler)?;
 		}
 		Ok(router)
+	}
+
+	/// What each registered raw port gives up, one [`RawPortExposure`] per port, ordered
+	/// by port number (onyums ROADMAP Phase 2 — raw-port security controls).
+	///
+	/// A raw port is the one hole in onyums' secure-by-default posture, and it is easy to
+	/// open without registering what it costs: [`dispatch`](Self::dispatch) hands the
+	/// stream straight to the handler, so the Skin gate, the WAF, the rate limiter, and
+	/// the built-in TLS — everything on the HTTP path — do not apply. `serve()` logs
+	/// these at launch so the decision appears in the operator's log rather than only in
+	/// the code that made it.
+	///
+	/// Pure data derived from the registrations, so it is unit-testable with no live Tor
+	/// network. Ordered so the output is deterministic (the backing map is not).
+	#[must_use]
+	pub fn exposures(&self) -> Vec<RawPortExposure> {
+		let mut exposures: Vec<_> = self.handlers.keys().map(|&port| RawPortExposure { port, service: well_known_sensitive_service(port) }).collect();
+		exposures.sort_unstable_by_key(|e| e.port);
+		exposures
 	}
 
 	/// Whether any raw handler is registered (an empty router is the HTTP-only
@@ -330,5 +426,97 @@ mod tests {
 		// is still rejected.
 		assert!(matches!(router.dispatch(9735, PlaintextPolicy::Upgrade), PortDispatch::Raw(_)));
 		assert!(matches!(router.dispatch(8080, PlaintextPolicy::Upgrade), PortDispatch::Reject));
+	}
+
+	// ---- Raw-port exposure warnings (Phase 2 — raw-port security controls). ----
+
+	#[test]
+	fn an_http_only_service_exposes_nothing() {
+		// The default posture registers no raw handler, so there is nothing to warn
+		// about and `serve()` stays quiet.
+		assert!(PortRouter::new().exposures().is_empty(), "an empty router has no raw exposure");
+	}
+
+	#[test]
+	fn well_known_sensitive_ports_are_named() {
+		assert_eq!(well_known_sensitive_service(22), Some("SSH"));
+		assert_eq!(well_known_sensitive_service(5432), Some("PostgreSQL"));
+		assert_eq!(well_known_sensitive_service(6379), Some("Redis"));
+		assert_eq!(well_known_sensitive_service(27017), Some("MongoDB"));
+	}
+
+	#[test]
+	fn an_ordinary_port_is_not_flagged_as_a_known_service() {
+		// The table is conservative on purpose: a warning that fires "sensitively" on
+		// every port would be noise, and noise is scrolled past.
+		assert_eq!(well_known_sensitive_service(9735), None, "Lightning's port is not an admin/datastore service");
+		assert_eq!(well_known_sensitive_service(8080), None);
+		assert_eq!(well_known_sensitive_service(0), None);
+	}
+
+	#[test]
+	fn no_sensitive_port_collides_with_the_reserved_http_ports() {
+		// A sensitive entry on 80/443 would be unreachable: `register` rejects those
+		// ports outright, so the warning could never fire and the table would be lying.
+		for (port, service) in SENSITIVE_PORTS {
+			assert!(!RESERVED_HTTP_PORTS.contains(port), "{service} on reserved port {port} can never be registered");
+		}
+	}
+
+	#[test]
+	fn the_sensitive_table_is_sorted_and_free_of_duplicates() {
+		// Sorted is how it stays readable and reviewable as it grows; a duplicate port
+		// would make `well_known_sensitive_service` silently prefer the first entry.
+		let ports: Vec<u16> = SENSITIVE_PORTS.iter().map(|(p, _)| *p).collect();
+		let mut sorted = ports.clone();
+		sorted.sort_unstable();
+		sorted.dedup();
+		assert_eq!(ports, sorted, "SENSITIVE_PORTS must be sorted by port and contain no duplicates");
+	}
+
+	#[test]
+	fn exposures_are_ordered_by_port_not_by_map_iteration() {
+		// The backing map's iteration order is randomised, so without the sort the
+		// launch log would shuffle between runs and two runs could not be diffed.
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(9735, handler()), (22, handler()), (5432, handler())];
+		let router = PortRouter::from_registrations(handlers).expect("registerable");
+		let ports: Vec<u16> = router.exposures().iter().map(|e| e.port).collect();
+		assert_eq!(ports, vec![22, 5432, 9735], "exposures must be ordered by port");
+	}
+
+	#[test]
+	fn every_raw_port_warns_that_the_gate_does_not_apply() {
+		// The point of the warning: a raw port bypasses the whole HTTP-path defence
+		// stack. That has to be said for an ordinary port too, not only a famous one.
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(9735, handler())];
+		let router = PortRouter::from_registrations(handlers).expect("registerable");
+		let exposure = router.exposures()[0];
+		assert!(!exposure.is_sensitive(), "9735 is not a well-known admin port");
+		let message = exposure.message();
+		for expected in ["9735", "Skin", "WAF", "rate limiting", "TLS"] {
+			assert!(message.contains(expected), "the bypass warning must name {expected}: {message}");
+		}
+	}
+
+	#[test]
+	fn a_sensitive_port_is_named_in_its_warning() {
+		// "port 22 serves a raw handler" is easy to skim past; "port 22 is the
+		// well-known SSH port" is not. The generic bypass text is still included.
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(22, handler())];
+		let router = PortRouter::from_registrations(handlers).expect("registerable");
+		let exposure = router.exposures()[0];
+		assert!(exposure.is_sensitive());
+		assert_eq!(exposure.service, Some("SSH"));
+		let message = exposure.message();
+		assert!(message.contains("SSH"), "the warning must name the service: {message}");
+		assert!(message.contains("Skin"), "the generic bypass warning must still be present: {message}");
+	}
+
+	#[test]
+	fn exposures_cover_every_registered_port() {
+		// A missed port is a silent exposure, which is the exact failure this guards.
+		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(22, handler()), (2222, handler()), (6379, handler())];
+		let router = PortRouter::from_registrations(handlers).expect("registerable");
+		assert_eq!(router.exposures().len(), router.len(), "every registered raw port must produce an exposure");
 	}
 }

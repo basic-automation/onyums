@@ -592,6 +592,30 @@ A raw port has no HTTP challenge surface, so when the circuit policy (e.g. Under
 
 Bring your own protocol by implementing the `StreamHandler` trait (one method: `serve(&self, stream: OnionStream) -> ServeFuture`). The TLS-first posture is preserved no matter what you register: ports **80 and 443 stay reserved for the built-in HTTP handler**, so a raw handler may only occupy another (otherwise-rejected) port — registering a reserved port, port 0, or the same port twice is a clean error from `serve()`, not a runtime surprise. This is an opt **up** in protocol reach, never a relaxation of the secure HTTP defaults.
 
+> **A raw port is unguarded — know what you are opening.** The HTTP defaults are
+> untouched, but nothing on the HTTP defence path reaches a raw stream: **no Skin
+> gate, no PoW/challenge, no WAF, no rate limiting, and no built-in TLS**. The onion
+> circuit still encrypts and authenticates the channel, and Tor still makes the port
+> unscannable and unreachable without the address — but from the handler inward, the
+> backend protocol's own authentication is the only thing standing there.
+>
+> So `serve()` logs a `WARN` for every registered raw port, naming what does not
+> apply, and names the service when the port is a well-known administrative or
+> datastore one (SSH, PostgreSQL, Redis, MongoDB, Docker's API, …) — the protocols
+> normally bound to loopback *because* they are not built to face hostile traffic.
+> Publishing one over an onion service is a legitimate and rather good idea done
+> deliberately (a globally reachable admin port with no open firewall port and no IP
+> to scan); it is a bad one done by accident, and the log is where the two are told
+> apart. The same data is available programmatically via
+> `PortRouter::exposures()` / `well_known_sensitive_service(port)` if you would
+> rather assert on it in your own startup checks.
+>
+> Two things worth stating: restricted discovery controls who can *find* the service,
+> not who may use a raw port once found; and per-circuit `CircuitPolicy` limits still
+> apply at the circuit layer, but a `Challenge` verdict on a raw port **fails closed**
+> (rejected, not served ungated) since there is no HTTP surface to render a challenge
+> on.
+
 ****
 
 ## Identity & address helpers

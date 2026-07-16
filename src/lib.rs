@@ -82,7 +82,7 @@ use http_stack::{build_serve_router, SkinChoice};
 use service_config::build_onion_service_config;
 use tor_client::{setup_tor_client, spawn_ephemeral_cleanup, storage_dirs};
 pub use client_auth::{provision_client, ClientAuthKeypair, ClientAuthKeypairError};
-pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, ServeFuture, StreamHandler};
+pub use port_router::{well_known_sensitive_service, AsyncStream, OnionStream, PortDispatch, PortRouter, RawPortExposure, ServeFuture, StreamHandler};
 pub use raw_tcp::RawTcpHandler;
 pub use provided_cert::ProvidedCert;
 pub use tls_policy::Tls;
@@ -822,6 +822,15 @@ impl OnionServiceBuilder {
 		// fails offline rather than at the first circuit. An empty router reproduces
 		// today's HTTP-only behaviour.
 		let port_router = Arc::new(PortRouter::from_registrations(self.raw_handlers)?);
+
+		// A raw port is the one hole in the secure-by-default posture: its stream goes
+		// straight to the handler, so the Skin gate, WAF, rate limiting, and built-in TLS
+		// do not apply. Log that at launch — the decision is made in code that may be far
+		// from whoever operates the service (ROADMAP Phase 2 — raw-port security
+		// controls). A well-known admin/datastore port is named explicitly.
+		for exposure in port_router.exposures() {
+			event!(Level::WARN, "{}", exposure.message());
+		}
 
 		// Insert the onyums-skin gate ahead of the application on the HTTP path
 		// (Phase 2 Skin integration) + Phase 3 TLS-first HSTS. Derive the pure, `Copy`

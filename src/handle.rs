@@ -25,7 +25,7 @@ use tor_hsservice::RunningOnionService;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 
 use crate::{
-	address::OnionAddress, metrics::{service_metrics_prometheus, CircuitMetrics, ServiceMetrics}, status::{await_status, project_service_problem, project_service_status, ServiceHealth, ServiceProblem, ServiceStatus}, tor_client::spawn_ephemeral_cleanup
+	address::OnionAddress, metrics::{service_metrics_prometheus, CircuitMetrics, ServiceMetrics}, status::{await_status, project_service_problem, project_service_status, ServiceHealth, ServiceProblem, ServiceStatus}, tor_client::{spawn_ephemeral_cleanup, EphemeralIdentity}
 };
 
 /// A running onion service plus its controls.
@@ -50,10 +50,11 @@ pub struct OnionServiceHandle {
 	// snapshots (onyums ROADMAP Phase 4 — per-service metrics).
 	metrics: Arc<CircuitMetrics>,
 	// Set only for an ephemeral service (see `OnionServiceBuilder::ephemeral`): the
-	// throwaway temp state dir, removed when the handle drops so the disposable
-	// identity key does not linger on disk. `Mutex<Option<..>>` so `shutdown` can
-	// `take()` and await the removal while `Drop` only cleans up what shutdown left.
-	ephemeral_state_dir: Mutex<Option<std::path::PathBuf>>,
+	// throwaway temp state dir plus the owner claim that marks it live, removed when the
+	// handle drops so the disposable identity key does not linger on disk.
+	// `Mutex<Option<..>>` so `shutdown` can `take()` and await the removal while `Drop`
+	// only cleans up what shutdown left.
+	ephemeral: Mutex<Option<EphemeralIdentity>>,
 }
 
 impl OnionServiceHandle {
@@ -72,9 +73,9 @@ impl OnionServiceHandle {
 		cancel: CancellationToken,
 		task: JoinHandle<()>,
 		metrics: Arc<CircuitMetrics>,
-		ephemeral_state_dir: Option<std::path::PathBuf>,
+		ephemeral: Option<EphemeralIdentity>,
 	) -> Self {
-		Self { address, service, client, cancel, task: Mutex::new(Some(task)), metrics, ephemeral_state_dir: Mutex::new(ephemeral_state_dir) }
+		Self { address, service, client, cancel, task: Mutex::new(Some(task)), metrics, ephemeral: Mutex::new(ephemeral) }
 	}
 
 	/// The service's stable `.onion` address.
@@ -290,9 +291,9 @@ impl OnionServiceHandle {
 		}
 		// Claim the ephemeral cleanup so `Drop` won't repeat it, and await the off-thread
 		// removal so shutdown() fully completes the teardown.
-		let dir = self.ephemeral_state_dir.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-		if let Some(dir) = dir
-			&& let Some(handle) = spawn_ephemeral_cleanup(dir)
+		let ephemeral = self.ephemeral.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(ephemeral) = ephemeral
+			&& let Some(handle) = spawn_ephemeral_cleanup(ephemeral.release())
 		{
 			let _ = handle.await;
 		}
@@ -318,9 +319,9 @@ impl Drop for OnionServiceHandle {
 		// (see `remove_ephemeral_state_dir`). Only cleans up what `shutdown` didn't
 		// already claim; offloads the blocking removal to the runtime's blocking pool so
 		// dropping a handle inside async code never stalls a worker on `remove_dir_all`.
-		let dir = self.ephemeral_state_dir.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
-		if let Some(dir) = dir {
-			let _ = spawn_ephemeral_cleanup(dir);
+		let ephemeral = self.ephemeral.get_mut().unwrap_or_else(std::sync::PoisonError::into_inner).take();
+		if let Some(ephemeral) = ephemeral {
+			let _ = spawn_ephemeral_cleanup(ephemeral.release());
 		}
 	}
 }

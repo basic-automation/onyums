@@ -686,7 +686,18 @@ By default onyums keeps its onion identity key in a persistent keystore
 configuration. `.ephemeral()` is the explicit opt-**down** to a throwaway identity —
 the keystore lives in a unique temp directory, so each launch mints a fresh,
 disposable address, and that directory is removed when the handle drops so the
-disposable key does not linger on disk:
+disposable key does not linger on disk.
+
+That covers the graceful exits. It does **not** cover the process being `SIGKILL`ed,
+OOM-killed, or the machine losing power — no cleanup code of any kind runs then, and
+a signal handler cannot help (`SIGKILL` is uncatchable by definition). So a throwaway
+identity key would otherwise sit in your temp directory indefinitely. Instead, each
+ephemeral service holds an **owner lock** inside its state directory for as long as it
+runs, and each ephemeral launch first sweeps away any `onyums-ephemeral-*` directory
+whose lock is free — i.e. whose owning process is gone, however it went. A running
+service's keystore is never swept, no matter how long it has been up. In practice: a
+crash leaves litter only until your next ephemeral launch, and you never have to
+reason about which temp directory belonged to what.
 
 ```rust
 use onyums::{OnionService, routing::get, Router};

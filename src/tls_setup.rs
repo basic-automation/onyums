@@ -20,7 +20,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use rcgen::generate_simple_self_signed;
 use tokio_rustls::{
-	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
+	TlsAcceptor, rustls, rustls::pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer, pem::PemObject}
 };
 
 use crate::{address::OnionAddress, tls_policy::Tls};
@@ -73,10 +73,7 @@ pub fn self_signed_server_config(address: &OnionAddress) -> Result<rustls::Serve
 	let cert = generate_simple_self_signed(subject_alt_names(address)).with_context(|| format!("failed to generate a self-signed certificate for {address}"))?;
 
 	let key_der = PrivatePkcs8KeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()).map_err(|e| anyhow::anyhow!("failed to convert the generated signing key to DER: {e:?}"))?;
-	let server_config = rustls::ServerConfig::builder()
-		.with_no_client_auth()
-		.with_single_cert(vec![cert.cert.der().clone()], PrivateKeyDer::Pkcs8(key_der))
-		.map_err(|e| anyhow::anyhow!("failed to build the rustls server config for {address}: {e:?}"))?;
+	let server_config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], PrivateKeyDer::Pkcs8(key_der)).map_err(|e| anyhow::anyhow!("failed to build the rustls server config for {address}: {e:?}"))?;
 	Ok(server_config)
 }
 

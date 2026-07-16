@@ -139,26 +139,7 @@ pub struct PortRouter {
 /// Deliberately conservative: only ports with an unambiguous well-known assignment,
 /// so the warning stays worth reading. An unlisted port still gets the generic
 /// bypass warning — this table only adds the service name.
-const SENSITIVE_PORTS: &[(u16, &str)] = &[
-	(22, "SSH"),
-	(23, "Telnet"),
-	(389, "LDAP"),
-	(445, "SMB"),
-	(1433, "Microsoft SQL Server"),
-	(2375, "Docker API (unauthenticated)"),
-	(2376, "Docker API"),
-	(2379, "etcd"),
-	(3306, "MySQL"),
-	(3389, "RDP"),
-	(5432, "PostgreSQL"),
-	(5672, "AMQP / RabbitMQ"),
-	(5900, "VNC"),
-	(6379, "Redis"),
-	(9092, "Kafka"),
-	(9200, "Elasticsearch"),
-	(11211, "Memcached"),
-	(27017, "MongoDB"),
-];
+const SENSITIVE_PORTS: &[(u16, &str)] = &[(22, "SSH"), (23, "Telnet"), (389, "LDAP"), (445, "SMB"), (1433, "Microsoft SQL Server"), (2375, "Docker API (unauthenticated)"), (2376, "Docker API"), (2379, "etcd"), (3306, "MySQL"), (3389, "RDP"), (5432, "PostgreSQL"), (5672, "AMQP / RabbitMQ"), (5900, "VNC"), (6379, "Redis"), (9092, "Kafka"), (9200, "Elasticsearch"), (11211, "Memcached"), (27017, "MongoDB")];
 
 /// The well-known name of a sensitive service on `port`, if it has one
 /// (see `SENSITIVE_PORTS`).

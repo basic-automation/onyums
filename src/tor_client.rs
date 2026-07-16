@@ -11,12 +11,12 @@
 use std::sync::Arc;
 
 use anyhow::Result;
-use arti_client::{config::TorClientConfigBuilder, TorClient, TorClientConfig};
+use arti_client::{TorClient, TorClientConfig, config::TorClientConfigBuilder};
 use tokio::task::JoinHandle;
 use tor_rtcompat::tokio::TokioNativeTlsRuntime;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
-use crate::keystore_perms::{harden_state_tree, Hardening};
+use crate::keystore_perms::{Hardening, harden_state_tree};
 
 /// The default persistent onyums state directory — home of the Arti keystore that
 /// holds the onion service's v3 identity key, so the `.onion` address is stable
@@ -66,9 +66,7 @@ pub fn storage_dirs(ephemeral: bool) -> (String, String) {
 /// # Errors
 /// Returns an error if Arti rejects the directory configuration.
 fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig> {
-	TorClientConfigBuilder::from_directories(state_dir, cache_dir)
-		.build()
-		.map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))
+	TorClientConfigBuilder::from_directories(state_dir, cache_dir).build().map_err(|e| anyhow::anyhow!("Failed to build Tor client config: {e}"))
 }
 
 /// Sets up and bootstraps a Tor client for the given state/cache directories.

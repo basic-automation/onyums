@@ -8,7 +8,7 @@
 use std::net::SocketAddr;
 
 use axum::extract::connect_info::Connected as AxumConnected;
-use hyper::{body::Incoming, Request};
+use hyper::{Request, body::Incoming};
 
 /// Per-connection identity threaded to the application via axum's connect-info
 /// extractor.

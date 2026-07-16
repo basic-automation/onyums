@@ -14,7 +14,9 @@
 
 use axum::http::request::Parts;
 
-use crate::{bot::{BotAssessment, BotHeuristics}, fingerprint::Ja4hFingerprint, shape::RequestShape};
+use crate::{
+	bot::{BotAssessment, BotHeuristics}, fingerprint::Ja4hFingerprint, shape::RequestShape
+};
 
 /// A one-pass bundle of the identity-free, Tor-surviving signals about one request's client.
 ///
@@ -40,11 +42,7 @@ impl ClientProfile {
 	/// default scorer.
 	#[must_use]
 	pub fn from_parts(parts: &Parts, heuristics: &BotHeuristics) -> Self {
-		Self {
-			fingerprint: Ja4hFingerprint::from_parts(parts),
-			shape: RequestShape::from_parts(parts),
-			bot: heuristics.assess(parts),
-		}
+		Self { fingerprint: Ja4hFingerprint::from_parts(parts), shape: RequestShape::from_parts(parts), bot: heuristics.assess(parts) }
 	}
 
 	/// Derive the profile using a default [`BotHeuristics`].
@@ -82,9 +80,7 @@ mod tests {
 
 	#[test]
 	fn profile_derives_all_three_signals_in_one_pass() {
-		let p = ClientProfile::from_parts_default(&parts(
-			Request::builder().method("GET").uri("/api/items").header("host", "x.onion").header("user-agent", "curl/8.0").header("accept", "*/*"),
-		));
+		let p = ClientProfile::from_parts_default(&parts(Request::builder().method("GET").uri("/api/items").header("host", "x.onion").header("user-agent", "curl/8.0").header("accept", "*/*")));
 		// Fingerprint: curl sends no Accept-Language → 0000 language field.
 		assert_eq!(&p.fingerprint.a[8..12], "0000");
 		// Shape: two path segments.
@@ -110,16 +106,7 @@ mod tests {
 
 	#[test]
 	fn browser_profile_is_not_suspicious() {
-		let p = ClientProfile::from_parts_default(&parts(
-			Request::builder()
-				.uri("/")
-				.header("host", "x.onion")
-				.header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0")
-				.header("accept", "text/html")
-				.header("accept-language", "en-US,en")
-				.header("accept-encoding", "gzip, deflate, br")
-				.header("connection", "keep-alive"),
-		));
+		let p = ClientProfile::from_parts_default(&parts(Request::builder().uri("/").header("host", "x.onion").header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0").header("accept", "text/html").header("accept-language", "en-US,en").header("accept-encoding", "gzip, deflate, br").header("connection", "keep-alive")));
 		assert!(!p.is_suspicious(0.5));
 		assert_eq!(p.bot.score, 0.0);
 	}

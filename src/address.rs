@@ -103,7 +103,7 @@ impl OnionAddress {
 	/// far below the smallest QR version's capacity, so encoding cannot fail.
 	#[must_use]
 	pub fn qr_svg(&self) -> String {
-		use qrcode::{render::svg, QrCode};
+		use qrcode::{QrCode, render::svg};
 		// The encoded data is a fixed-shape onion URL (~70 bytes), far below the
 		// capacity of even the smallest QR version, so construction cannot fail.
 		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
@@ -123,7 +123,7 @@ impl OnionAddress {
 	/// always fits in a QR code.
 	#[must_use]
 	pub fn qr_terminal(&self) -> String {
-		use qrcode::{render::unicode, QrCode};
+		use qrcode::{QrCode, render::unicode};
 		let code = QrCode::new(self.https_url().as_bytes()).expect("an onion URL always fits in a QR code");
 		code.render::<unicode::Dense1x2>().quiet_zone(true).build()
 	}

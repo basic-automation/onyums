@@ -59,23 +59,21 @@ pub mod ratelimit;
 pub mod shape;
 pub mod waf;
 
-pub use bot::{BotAssessment, BotHeuristics, BotSignal};
-pub use cache::{cache_control_ttl, is_cacheable_method, CacheKey, CachedResponse, ResponseCache};
 #[cfg(feature = "equix")]
 pub use ::equix::{Runtime, RuntimeOption};
+pub use bot::{BotAssessment, BotHeuristics, BotSignal};
+pub use cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_cacheable_method};
 #[cfg(feature = "equix")]
 pub use challenge::equix::EquiX;
 pub use challenge::{
 	Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
 };
-pub use circuit::{
-	AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock
-};
+pub use circuit::{AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock};
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};
 pub use difficulty::{AdaptiveDifficulty, BotDifficulty, ShapeDifficulty};
-pub use discovery::{parse_auth_file, AllowlistDiff, AuthDirError, AuthFileError, ClientAuthKey, ClientAuthKeyError, RestrictedDiscovery};
-pub use edge::{apply_response_headers, render_location, EdgeAction, EdgeDecision, EdgeMatch, EdgeRule, EdgeRules, HeaderMutation};
-pub use filter::{all, any, Field, FilterExpr, ParseError, StrOp};
+pub use discovery::{AllowlistDiff, AuthDirError, AuthFileError, ClientAuthKey, ClientAuthKeyError, RestrictedDiscovery, parse_auth_file};
+pub use edge::{EdgeAction, EdgeDecision, EdgeMatch, EdgeRule, EdgeRules, HeaderMutation, apply_response_headers, render_location};
+pub use filter::{Field, FilterExpr, ParseError, StrOp, all, any};
 pub use fingerprint::Ja4hFingerprint;
 pub use layer::{Skin, SkinBuilder, SkinLayer, SkinService};
 pub use observe::{CapturingSink, FanoutSink, MetricsSink, NullSink, SecurityEvent, SecurityEventSink, SecurityMetrics, Severity, TracingSink};

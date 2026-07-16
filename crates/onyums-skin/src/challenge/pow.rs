@@ -19,7 +19,9 @@ use rand::RngCore;
 use sha2::{Digest, Sha256};
 
 use super::{Challenge, Gate};
-use crate::{difficulty::{AdaptiveDifficulty, ShapeDifficulty}, shape::RequestShape};
+use crate::{
+	difficulty::{AdaptiveDifficulty, ShapeDifficulty}, shape::RequestShape
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -166,16 +168,7 @@ impl<P: Pow> PowChallenge<P> {
 	/// Build a challenge over `pow` (typically [`Hashcash`]) signing puzzles with
 	/// `secret` at the given leading-zero-bit `difficulty`.
 	pub fn new(pow: P, secret: impl Into<Vec<u8>>, difficulty: u32) -> Self {
-		Self {
-			pow,
-			secret: secret.into(),
-			difficulty,
-			adaptive: None,
-			shape: None,
-			ttl: DEFAULT_PUZZLE_TTL,
-			submit_path: DEFAULT_SUBMIT_PATH.to_owned(),
-			consumed: Mutex::new(HashMap::new()),
-		}
+		Self { pow, secret: secret.into(), difficulty, adaptive: None, shape: None, ttl: DEFAULT_PUZZLE_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
 	}
 
 	/// Record `seed` as redeemed, returning `false` if it was already redeemed (a
@@ -608,8 +601,9 @@ mod challenge_tests {
 
 	#[test]
 	fn adaptive_difficulty_raises_issued_puzzle_difficulty() {
-		use crate::circuit::{Clock, ManualClock};
 		use std::time::Instant;
+
+		use crate::circuit::{Clock, ManualClock};
 
 		struct ArcClock(Arc<ManualClock>);
 		impl Clock for ArcClock {
@@ -620,12 +614,7 @@ mod challenge_tests {
 
 		let clock = Arc::new(ManualClock::new());
 		// Controller ramps 0 -> 20 over rate band [2, 10]/window.
-		let ctrl = Arc::new(
-			AdaptiveDifficulty::new(0, 20)
-				.rate_band(2, 10)
-				.window(Duration::from_secs(1))
-				.with_clock(Box::new(ArcClock(clock.clone()))),
-		);
+		let ctrl = Arc::new(AdaptiveDifficulty::new(0, 20).rate_band(2, 10).window(Duration::from_secs(1)).with_clock(Box::new(ArcClock(clock.clone()))));
 		// Static floor 4; controller dormant at first.
 		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 4).with_adaptive_difficulty(ctrl.clone());
 
@@ -652,7 +641,9 @@ mod challenge_tests {
 	fn shape_difficulty_raises_issued_puzzle_difficulty_for_anomalous_shape() {
 		use std::time::Instant;
 
-		use crate::{circuit::{Clock, ManualClock}, shape::{RequestShape, ShapeBaseline}};
+		use crate::{
+			circuit::{Clock, ManualClock}, shape::{RequestShape, ShapeBaseline}
+		};
 
 		struct ArcClock(Arc<ManualClock>);
 		impl Clock for ArcClock {

@@ -6,11 +6,11 @@
 //! config validation — all before any Tor bootstrap, so a bad nickname or allowlist
 //! fails fast and offline. Extracted from `lib.rs` as a slice of the Phase 0 module split.
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use onyums_skin::RestrictedDiscovery;
 use tor_hscrypto::pk::HsClientDescEncKey;
 use tor_hsservice::{
-	config::{restricted_discovery::HsClientNickname, OnionServiceConfig, OnionServiceConfigBuilder}, HsNickname
+	HsNickname, config::{OnionServiceConfig, OnionServiceConfigBuilder, restricted_discovery::HsClientNickname}
 };
 
 /// Apply a caller's authorized-clients allowlist to an [`OnionServiceConfigBuilder`]
@@ -70,8 +70,9 @@ pub fn build_onion_service_config(nickname: &str, allowlist: Option<&RestrictedD
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use onyums_skin::ClientAuthKey;
+
+	use super::*;
 
 	#[test]
 	fn restricted_discovery_config_assembles_offline() {

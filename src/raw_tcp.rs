@@ -64,10 +64,11 @@ impl StreamHandler for RawTcpHandler {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use tokio::{
 		io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener
 	};
+
+	use super::*;
 
 	#[test]
 	fn new_stores_and_exposes_the_backend() {

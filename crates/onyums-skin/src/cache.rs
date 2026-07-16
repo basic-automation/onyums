@@ -18,15 +18,11 @@
 //! `max-age` is honoured.
 
 use std::{
-	collections::HashMap,
-	sync::Mutex,
-	time::{Duration, Instant},
+	collections::HashMap, sync::Mutex, time::{Duration, Instant}
 };
 
 use axum::{
-	body::Body,
-	http::{header, request::Parts, HeaderMap, Method, StatusCode},
-	response::Response,
+	body::Body, http::{HeaderMap, Method, StatusCode, header, request::Parts}, response::Response
 };
 
 use crate::circuit::{Clock, SystemClock};
@@ -47,13 +43,7 @@ impl CacheKey {
 	/// Derive the cache key from a parsed request's [`Parts`].
 	#[must_use]
 	pub fn from_parts(parts: &Parts) -> Self {
-		let host = parts
-			.uri
-			.authority()
-			.map(|a| a.as_str().to_owned())
-			.or_else(|| parts.headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(str::to_owned))
-			.unwrap_or_default()
-			.to_ascii_lowercase();
+		let host = parts.uri.authority().map(|a| a.as_str().to_owned()).or_else(|| parts.headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(str::to_owned)).unwrap_or_default().to_ascii_lowercase();
 		let path_and_query = parts.uri.path_and_query().map_or_else(|| parts.uri.path().to_owned(), |pq| pq.as_str().to_owned());
 		Self { method: parts.method.clone(), host, path_and_query }
 	}

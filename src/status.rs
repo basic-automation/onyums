@@ -413,12 +413,7 @@ mod tests {
 	#[test]
 	fn service_problem_surface_is_stable_and_distinct() {
 		use ServiceProblem::{DescriptorUpload, IntroductionPoint, Other, Runtime};
-		let all = [
-			Runtime("boom".into()),
-			DescriptorUpload("upload failed".into()),
-			IntroductionPoint("no ipts".into()),
-			Other("mystery".into()),
-		];
+		let all = [Runtime("boom".into()), DescriptorUpload("upload failed".into()), IntroductionPoint("no ipts".into()), Other("mystery".into())];
 		// `detail()` round-trips the diagnostic; `Display` is exactly `"<label>: <detail>"`.
 		for p in &all {
 			assert!(!p.label().is_empty());

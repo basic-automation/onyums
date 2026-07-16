@@ -6,9 +6,7 @@
 //! currently lives in onyums' `handle_stream_request`. See `ROADMAP.md`.
 
 use std::{
-	collections::HashMap,
-	sync::{Arc, Mutex},
-	time::{Duration, Instant},
+	collections::HashMap, sync::{Arc, Mutex}, time::{Duration, Instant}
 };
 
 use crate::observe::{SecurityEvent, SecurityEventSink};
@@ -180,16 +178,7 @@ impl AccountingCircuitPolicy {
 	/// reading time from the [`SystemClock`].
 	#[must_use]
 	pub fn new() -> Self {
-		Self {
-			inner: Mutex::new(HashMap::new()),
-			max_streams: None,
-			max_requests: None,
-			max_request_rate: None,
-			max_bytes: None,
-			under_attack: false,
-			clock: Box::new(SystemClock),
-			sink: None,
-		}
+		Self { inner: Mutex::new(HashMap::new()), max_streams: None, max_requests: None, max_request_rate: None, max_bytes: None, under_attack: false, clock: Box::new(SystemClock), sink: None }
 	}
 
 	/// Tear down any circuit that opens more than `max` streams.
@@ -410,9 +399,7 @@ mod tests {
 	#[test]
 	fn rate_cap_rejects_within_window_then_recovers_after() {
 		let clock = std::sync::Arc::new(ManualClock::new());
-		let policy = AccountingCircuitPolicy::new()
-			.max_request_rate(2, Duration::from_secs(1))
-			.with_clock(Box::new(ArcClock(clock.clone())));
+		let policy = AccountingCircuitPolicy::new().max_request_rate(2, Duration::from_secs(1)).with_clock(Box::new(ArcClock(clock.clone())));
 		// Two requests inside the window are fine; the third is throttled.
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
@@ -429,9 +416,7 @@ mod tests {
 	#[test]
 	fn rate_windows_are_per_circuit() {
 		let clock = std::sync::Arc::new(ManualClock::new());
-		let policy = AccountingCircuitPolicy::new()
-			.max_request_rate(1, Duration::from_secs(1))
-			.with_clock(Box::new(ArcClock(clock.clone())));
+		let policy = AccountingCircuitPolicy::new().max_request_rate(1, Duration::from_secs(1)).with_clock(Box::new(ArcClock(clock.clone())));
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
 		assert_eq!(policy.on_request(&C1), CircuitAction::Reject);
 		// A different circuit gets its own fresh window.
@@ -442,10 +427,7 @@ mod tests {
 	fn lifetime_ceiling_and_rate_cap_compose() {
 		let clock = std::sync::Arc::new(ManualClock::new());
 		// Generous rate (never the binding constraint here), tight lifetime ceiling.
-		let policy = AccountingCircuitPolicy::new()
-			.max_requests(3)
-			.max_request_rate(100, Duration::from_secs(1))
-			.with_clock(Box::new(ArcClock(clock.clone())));
+		let policy = AccountingCircuitPolicy::new().max_requests(3).max_request_rate(100, Duration::from_secs(1)).with_clock(Box::new(ArcClock(clock.clone())));
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
 		assert_eq!(policy.on_request(&C1), CircuitAction::Accept);
@@ -493,9 +475,11 @@ mod tests {
 			fn on_new_circuit(&self, _: &CircuitId) -> CircuitAction {
 				CircuitAction::Accept
 			}
+
 			fn on_new_stream(&self, _: &CircuitId, _: &StreamTarget) -> CircuitAction {
 				CircuitAction::Accept
 			}
+
 			fn on_request(&self, _: &CircuitId) -> CircuitAction {
 				CircuitAction::Accept
 			}
@@ -523,9 +507,11 @@ mod tests {
 			fn on_new_circuit(&self, _: &CircuitId) -> CircuitAction {
 				CircuitAction::Accept
 			}
+
 			fn on_new_stream(&self, _: &CircuitId, _: &StreamTarget) -> CircuitAction {
 				CircuitAction::Accept
 			}
+
 			fn on_request(&self, _: &CircuitId) -> CircuitAction {
 				CircuitAction::Accept
 			}

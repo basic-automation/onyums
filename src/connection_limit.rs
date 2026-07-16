@@ -29,9 +29,9 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use tokio::sync::Semaphore;
-use tracing::{event, Level};
+use tracing::{Level, event};
 
 use crate::port_router::{OnionStream, ServeFuture, StreamHandler};
 

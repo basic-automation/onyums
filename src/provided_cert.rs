@@ -13,8 +13,10 @@
 
 use std::sync::Arc;
 
-use anyhow::{bail, Result};
-use tokio_rustls::rustls::{self, pki_types::{pem::PemObject, CertificateDer, PrivateKeyDer}};
+use anyhow::{Result, bail};
+use tokio_rustls::rustls::{
+	self, pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject}
+};
 
 /// A caller-supplied TLS certificate chain and private key, parsed and validated
 /// into a ready-to-serve `rustls` [`ServerConfig`](rustls::ServerConfig).
@@ -43,17 +45,12 @@ impl ProvidedCert {
 	/// certificate or key PEM is malformed, or `rustls` rejects the pair (for
 	/// example an unsupported key algorithm).
 	pub fn from_pem(cert_pem: &[u8], key_pem: &[u8]) -> Result<Self> {
-		let cert_chain = CertificateDer::pem_slice_iter(cert_pem)
-			.collect::<std::result::Result<Vec<_>, _>>()
-			.map_err(|e| anyhow::anyhow!("failed to parse certificate PEM: {e}"))?;
+		let cert_chain = CertificateDer::pem_slice_iter(cert_pem).collect::<std::result::Result<Vec<_>, _>>().map_err(|e| anyhow::anyhow!("failed to parse certificate PEM: {e}"))?;
 		if cert_chain.is_empty() {
 			bail!("certificate PEM contained no certificates");
 		}
 		let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| anyhow::anyhow!("failed to parse private-key PEM: {e}"))?;
-		let config = rustls::ServerConfig::builder()
-			.with_no_client_auth()
-			.with_single_cert(cert_chain, key)
-			.map_err(|e| anyhow::anyhow!("provided certificate and key are not usable: {e}"))?;
+		let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(cert_chain, key).map_err(|e| anyhow::anyhow!("provided certificate and key are not usable: {e}"))?;
 		Ok(Self { config: Arc::new(config) })
 	}
 
@@ -93,8 +90,9 @@ impl std::fmt::Debug for ProvidedCert {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use rcgen::generate_simple_self_signed;
+
+	use super::*;
 
 	/// A fresh, valid self-signed cert/key PEM pair for an onion-style SAN.
 	fn sample_pem() -> (String, String) {

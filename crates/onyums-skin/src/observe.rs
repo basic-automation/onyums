@@ -14,8 +14,7 @@
 //! (the HTTP gate) and [`crate::circuit`] (the Tor dimension).
 
 use std::sync::{
-	Arc, Mutex,
-	atomic::{AtomicU64, Ordering},
+	Arc, Mutex, atomic::{AtomicU64, Ordering}
 };
 
 use crate::{

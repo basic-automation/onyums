@@ -424,8 +424,9 @@ impl std::error::Error for AuthDirError {
 
 #[cfg(test)]
 mod tests {
-	use super::*;
 	use std::str::FromStr;
+
+	use super::*;
 
 	/// A deterministic 32-byte key (0,1,2,…,31) and its known canonical form.
 	fn sample_key() -> ClientAuthKey {

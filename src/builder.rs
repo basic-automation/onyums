@@ -32,7 +32,7 @@ use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tracing::{event, span, Level};
 
 use crate::{
-	address::OnionAddress, handle::OnionServiceHandle, http_stack::{build_serve_router, SkinChoice}, metrics::CircuitMetrics, port_router::{PortRouter, StreamHandler}, serve_loop::{serve_circuits, ServeContext}, service_config::build_onion_service_config, tls_policy::Tls, tls_setup::tls_acceptor, tor_client::{claim_ephemeral_dir, setup_tor_client, storage_dirs, sweep_stale_ephemeral_dirs, EphemeralIdentity}
+	address::OnionAddress, handle::OnionServiceHandle, http_stack::{build_serve_router, SkinChoice}, metrics::CircuitMetrics, port_router::{PortRouter, StreamHandler}, serve_loop::{serve_circuits, ServeContext}, service_config::build_onion_service_config, tls_policy::Tls, tls_setup::tls_acceptor, tor_client::{prepare_ephemeral_dir, setup_tor_client, storage_dirs, sweep_stale_ephemeral_dirs}
 };
 
 /// Launches an onion service from an already-built [`OnionServiceConfig`].
@@ -456,17 +456,14 @@ impl OnionServiceBuilder {
 					event!(Level::INFO, "Swept {swept} abandoned ephemeral keystore(s) left by previous runs.");
 				}
 			}
-			// `setup_tor_client` creates and hardens the state dir, so the claim — a
-			// lockfile *inside* it — is taken after, and held by the handle for the
-			// service's lifetime.
+			// Claim the ephemeral dir **before** bootstrapping, not after. `setup_tor_client`
+			// creates the dir and then spends a minute or more on the network; a claim taken
+			// afterwards would leave the dir unclaimed for that whole window, and a second
+			// ephemeral service launching meanwhile would sweep it as abandoned — deleting a
+			// live service's keystore while it booted. `prepare_ephemeral_dir` creates,
+			// hardens, and claims in one step, so a sweep never sees it unclaimed.
+			let ephemeral = self.ephemeral.then(|| prepare_ephemeral_dir(&state_dir)).transpose()?;
 			let client = setup_tor_client(&state_dir, &cache_dir).await?;
-			let ephemeral = if self.ephemeral {
-				let dir = std::path::PathBuf::from(&state_dir);
-				let claim = claim_ephemeral_dir(&dir)?;
-				Some(EphemeralIdentity::new(dir, claim))
-			} else {
-				None
-			};
 			(client, ephemeral)
 		};
 		let (service, address, request_stream) = initialize_onion_service(&client, svc_cfg)?;

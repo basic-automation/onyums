@@ -277,6 +277,32 @@ Onyums bundles [`onyums-skin`](crates/onyums-skin), a "Cloudflare for Tor" abuse
 
 The posture is *secure and complete by default*: the gate is on unless you turn it off, and you opt **down** (`no_skin`) or **across** (a custom `Skin`), never up.
 
+### What the gate does *not* do
+
+"Abuse defense on by default" is a floor, not a guarantee. Three limits are worth
+stating plainly, because assuming otherwise is how a service gets hurt:
+
+- **The WAF is best-effort and non-authoritative.** It is a *starter signature
+  ruleset* — pattern matching over the request. Signature WAFs are bypassable, and
+  a determined attacker with time to iterate will get a payload past this one. It
+  exists to cut background noise and raise the cost of drive-by scanning; it is
+  **not** a substitute for a secure application. Parameterise your queries, encode
+  your output, and authorise every request as if the WAF were not there. Treat a
+  WAF block as telemetry, not as proof you were safe.
+- **The proof-of-work is HTTP-layer only — there is no Tor introduction-point
+  PoW.** The challenge is served by the Skin gate *after* a rendezvous circuit has
+  already been established, so it raises the cost of hammering your *application*.
+  It does nothing about a flood aimed at your introduction points, which is the
+  attack Tor's own onion-service PoW (Equi-X, `tor-hspow`) addresses. That lives
+  in arti behind an experimental feature and is **not** wired up here (ROADMAP
+  Phase 2). If you are being flooded at the intro layer, onyums does not currently
+  help.
+- **The gate keys on the circuit and the clearance token, not on an identity.**
+  There are no client IPs over Tor, so a `CircuitId` is synthetic and an attacker
+  can rotate circuits at will. Per-circuit limits are therefore a speed bump, not
+  a ban. Bind anything that must be durable to a clearance token, a restricted-
+  discovery key, or your own application auth.
+
 ```rust
 use onyums::{OnionService, Skin, routing::get, Router};
 
@@ -316,6 +342,44 @@ The full Skin API (clearance tokens, the challenge chain, the WAF, per-circuit `
 
 For a service with a known, small set of users, `.authorized_clients(...)` enables Tor's **restricted discovery** (v3 client authorization): the service descriptor — its introduction points and keys — is encrypted to the listed clients' x25519 keys, so an *unlisted* client cannot even discover the service. This is DoS resistance enforced in descriptor crypto, upstream of the Skin HTTP gate rather than in place of it.
 
+> **Restricted discovery is not authentication.** It controls who can *find* the
+> service, not who may *do* what once they arrive. Read it as an unlisted phone
+> number, not a lock on the door:
+>
+> - **Removing a client does not revoke it.** The allowlist gates descriptor
+>   *decryption*, so a removed client keeps working until the descriptor is
+>   republished and its existing circuits die — and anyone who already learned the
+>   introduction points can keep reaching you meanwhile. There is no session kill.
+> - **The key is a bearer credential.** It identifies a *client entry*, not a
+>   person; a leaked or shared `.auth_private` is indistinguishable from the real
+>   client, and nothing binds it to a request.
+> - **Every authorized client is equal.** There are no roles, no per-route
+>   permissions, and no audit trail of who did what.
+>
+> So layer real authentication *inside* the app and treat discovery as the outer
+> shell. The two compose — restricted discovery keeps strangers from ever opening a
+> circuit, the Skin gate absorbs abuse from those who do, and app auth decides what
+> an authenticated user may actually do:
+>
+> ```rust
+> // Restricted discovery says WHO CAN FIND the service.
+> // Your app still says WHO THIS IS and WHAT THEY MAY DO.
+> let app = Router::new()
+> 	.route("/admin", get(admin_page))
+> 	.layer(middleware::from_fn(require_login)); // sessions/tokens/mTLS — your call
+>
+> let handle = OnionService::builder()
+> 	.router(app)
+> 	.nickname("private_service")
+> 	.authorized_clients(allowlist) // outer shell: strangers cannot even discover it
+> 	.serve()
+> 	.await?;
+> ```
+>
+> A useful test: if leaking one client's `.auth_private` file would be a breach
+> rather than an inconvenience, you are relying on restricted discovery for
+> authentication and need app auth underneath it.
+
 The allowlist is an `onyums_skin::RestrictedDiscovery`, built from `.auth` files or by authorizing keys directly:
 
 ```rust
@@ -343,7 +407,7 @@ async fn main() {
 }
 ```
 
-This is an explicit opt-*down* in reachability (from "anyone with the address" to "only these clients"). Restricted discovery is a DoS-resistance mechanism, **not** a substitute for authentication: removing a client does not immediately revoke an already-connected one.
+This is an explicit opt-*down* in reachability (from "anyone with the address" to "only these clients") — and, per the note above, a discovery control rather than an authentication one.
 
 ### Provisioning a new client
 

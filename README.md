@@ -102,6 +102,48 @@ Reach for **raw Arti** when you want to build the stack yourself, **tor-hsrproxy
 front an existing local service with no app code, and **onyums** when you want the
 secure-by-default axum→onion path in one library.
 
+## Feature status — how much to trust each of these
+
+Pre-1.0, and the honest answer differs per feature, so here it is per feature. The
+distinction that matters most is the middle row group: onyums' automated tests are
+**offline** (a `tower`-level harness with no Tor network), so a feature can be fully
+unit-tested and still never have been exercised against real Tor by CI. The live
+tier exists — `live_service_serves_over_the_tor_network_and_shuts_down`, run
+manually with `cargo test -- --ignored` — but it is not part of CI and does not
+cover every row below.
+
+| Status | Meaning |
+|---|---|
+| 🟢 **Tested offline** | Implemented, with automated tests that CI runs on every push. No live Tor involved. |
+| 🟡 **Needs live verification** | Implemented and compiles; its logic is unit-tested where it could be isolated, but the code path only truly runs against the real Tor network, which CI does not do. |
+| 🔵 **Planned** | Not implemented. |
+| 🔴 **Blocked upstream** | Cannot be implemented from here until arti changes. |
+
+| Feature | Status | Notes |
+|---|---|---|
+| `serve()` / builder API, config validation | 🟢 | Nickname, port, TLS, and client-choice validation all fail offline before any bootstrap. |
+| TLS policy (`Upgrade` / `Strict` / `Provided`) | 🟢 | Composition (gate + HSTS + app) is `oneshot`-tested; `ProvidedCert` parses/validates up front. |
+| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 428 unit tests in `onyums-skin`, no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
+| Restricted discovery / client-auth keys | 🟢 | Key generation, `.auth` rendering/parsing, and allowlist assembly are offline-tested and byte-checked against Tor's file format. Descriptor encryption itself is arti's. |
+| Identity: persistent + `.ephemeral()` keystore | 🟢 | Directory resolution, uniqueness, and cleanup tested offline. |
+| Keystore permission hardening (0700/0600) | 🟢 | Unix-only; the syscall path runs on CI's Linux runner. A no-op on Windows (see [Deployment](#deployment)). |
+| Vanity mining, address helpers, QR | 🟢 | Pure computation; derives the exact address arti serves. |
+| `ServiceStatus` / `ServiceProblem` projection | 🟢 | Mapping tested against every arti state. The *emission* of transitions is 🟡. |
+| Host-side metrics + Prometheus exposition | 🟢 | Counter mechanics and text format tested offline; the accept loop's increment sites are 🟡. |
+| **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path. Covered by the manual `--ignored` live test, not by CI. |
+| Raw-port serving (`route_port`) | 🟡 | The routing table and the `RawTcpHandler` proxy are offline-tested against a loopback backend; the live path is not. |
+| Circuit-policy gate, Under Attack mode | 🟡 | Decision logic is offline-tested; it is driven from the live rendezvous loop. |
+| Multiple services on one shared client | 🟡 | The offline surface (`shared_client()`, conflict rejection, fleet status) is tested; N-services-actually-reachable is not verified. |
+| `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
+| Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
+| Intro-layer PoW (Tor's Equi-X) | 🔵 | Needs arti's experimental `hs-pow-full`. Skin's PoW is HTTP-layer only. |
+| Host-global concurrency/backpressure caps | 🔵 | Per-circuit limits exist via `CircuitPolicy`; total circuit/stream semaphores do not. |
+| CLI binary, framework layer (Phase 5) | 🔵 | Library only today. |
+| Single-onion-service mode | 🔴 | The `anonymity` field is commented out in the pinned tor-hsservice 0.43. |
+| arti-sourced gauges (intro-point health, …) | 🔴 | Arrives with arti ≥ 1.4.3's `metrics` feature; onyums pins 0.43. |
+
+Full detail, including what each slice covers, lives in [ROADMAP.md](ROADMAP.md).
+
 ## Hello world example
 
 The one-line `serve()` entry point still works and blocks until the service stops:

@@ -51,20 +51,81 @@ redirecting, `no_skin()` drops the abuse gate, `under_attack(true)` forces every
 circuit through the gate, and `route_port(...)` adds a raw-TCP branch. See the
 sections below for each.
 
-## Installation
+## Quick start
+
+From nothing to a live onion service:
 
 ```sh
+cargo new my-onion-app && cd my-onion-app
 cargo add onyums tokio --features tokio/full
 ```
 
-Onyums is a library — add it to an async binary. No external Tor daemon is
-required: the [Arti](https://gitlab.torproject.org/tpo/core/arti) Tor client is
-embedded, so the first run downloads Tor consensus data over the network and
-creates the keystore/cache under `./tor/onyums/` itself. It uses Rust **edition
-2024** and its MSRV is **Rust 1.90**, declared as `rust-version` in the manifest
-and enforced in CI. The floor comes from the embedded arti 0.43 stack, not the
-edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate, which
-carries none of arti, is usable on **1.89**.
+`src/main.rs` — complete, and it is the whole program:
+
+```rust
+use onyums::{OnionService, routing::get, Router};
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+	let app = Router::new().route("/", get(|| async { "Hello from Tor!" }));
+
+	let handle = OnionService::builder()
+		.router(app)
+		.nickname("my_onion")   // names the identity key in the keystore
+		.serve()
+		.await?;
+
+	// The address is stable across restarts (the keystore is persisted).
+	println!("serving on https://{}", handle.onion_address());
+
+	// Resolves when the descriptor is published and the service is reachable.
+	handle.ready().await;
+	println!("reachable — open that URL in Tor Browser");
+
+	// Run until Ctrl-C, then stop cleanly.
+	tokio::signal::ctrl_c().await?;
+	handle.shutdown().await;
+	Ok(())
+}
+```
+
+```sh
+cargo run
+```
+
+That is the entire secure stack: a self-signed TLS certificate for the address, the
+Skin abuse-defense gate, and the WAF are all already on. Expect the first run to
+take a minute or two (see [First launch & troubleshooting](#first-launch--troubleshooting)),
+and expect a certificate warning in Tor Browser — that one is normal, and
+[TLS-first transport](#tls-first-transport) explains why.
+
+### What it needs from the outside
+
+Almost nothing — which is much of the point:
+
+- **No external Tor daemon, no `torrc`, no system service.** The
+  [Arti](https://gitlab.torproject.org/tpo/core/arti) Tor client is compiled *into*
+  your binary. If you have deployed an onion service behind C-tor before, the thing
+  you are looking for to configure is not there, by design.
+- **Outbound network access is required** — to reach Tor directory authorities and
+  relays. Onyums opens no inbound listener and needs no port forwarded, no public
+  IP, and no firewall hole: rendezvous circuits are established *outbound*. A host
+  that can make outbound TCP connections can serve an onion service.
+- **The first run downloads the Tor network consensus**, which is why it is slower
+  than later ones. It is cached (see below) and refreshed as needed.
+- **Two directories are created under the process's working directory**:
+  `./tor/onyums/state` — the keystore holding the service's identity key. **This is
+  the service's identity**: back it up, keep it owner-only (onyums enforces
+  `0700`/`0600` on Unix — see [Deployment](#deployment)), and it is what makes the
+  address stable across restarts. And `./tor/onyums/cache` — the network consensus,
+  disposable and refetched if deleted.
+- **A clock that is roughly right.** Tor is sensitive to clock skew; a badly wrong
+  system time is a common cause of a bootstrap that never finishes.
+
+**Toolchain:** Rust **edition 2024**, MSRV **1.90** — declared as `rust-version` in
+the manifest and enforced in CI. The floor comes from the embedded arti 0.43 stack,
+not the edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate,
+which carries none of arti, is usable on **1.89**.
 
 ## Features
 

@@ -71,6 +71,7 @@ mod provided_cert;
 mod service_config;
 mod status;
 mod tls_policy;
+mod tls_setup;
 mod tor_client;
 mod vanity;
 pub use address::OnionAddress;
@@ -80,6 +81,7 @@ pub use status::{ServiceHealth, ServiceProblem, ServiceProblemKind, ServiceStatu
 use status::{await_status, project_service_problem, project_service_status};
 use http_stack::{build_serve_router, SkinChoice};
 use service_config::build_onion_service_config;
+use tls_setup::tls_acceptor;
 use tor_client::{setup_tor_client, spawn_ephemeral_cleanup, storage_dirs};
 pub use client_auth::{provision_client, ClientAuthKeypair, ClientAuthKeypairError};
 pub use port_router::{well_known_sensitive_service, AsyncStream, OnionStream, PortDispatch, PortRouter, RawPortExposure, ServeFuture, StreamHandler};
@@ -90,10 +92,7 @@ pub use vanity::{address_from_expanded_secret, address_from_secret_seed, address
 
 use circuit_gate::{CircuitDisposition, CircuitIdAllocator, StreamDisposition};
 use metrics::{service_metrics_prometheus, CircuitMetrics};
-use rcgen::generate_simple_self_signed;
-use tokio_rustls::{
-	rustls, rustls::pki_types::{pem::PemObject, PrivateKeyDer, PrivatePkcs8KeyDer}, TlsAcceptor
-};
+use tokio_rustls::TlsAcceptor;
 
 /// Launches an onion service from an already-built [`OnionServiceConfig`].
 ///
@@ -1010,42 +1009,6 @@ async fn handle_http_redirect(stream_request: StreamRequest, requested_host: Str
 	hyper_util::server::conn::auto::Builder::new(TokioExecutor::new()).http1_only().serve_connection(stream, hyper_service).await.map_err(|err| anyhow::anyhow!("Error serving HTTP redirect: {err}"))
 }
 
-fn tls_acceptor(address: &OnionAddress, tls: &Tls) -> Result<TlsAcceptor> {
-	// Phase 3 bring-your-own cert: `Tls::Provided` serves the caller-supplied,
-	// already-validated config (parsed once in `ProvidedCert::from_pem`); every
-	// other mode auto-generates a self-signed certificate for the onion address.
-	let server_config = match tls {
-		Tls::Provided(cert) => cert.server_config(),
-		Tls::Upgrade | Tls::Strict => Arc::new(self_signed_server_config(address)?),
-	};
-	let acceptor = TlsAcceptor::from(server_config);
-	Ok(acceptor)
-}
-
-/// Build a `rustls` server config with a freshly generated self-signed
-/// certificate for the onion address — the default when the caller did not
-/// bring their own.
-fn self_signed_server_config(address: &OnionAddress) -> Result<rustls::ServerConfig> {
-	let subject_alt_names = vec![address.host().to_string()];
-	let cert = generate_simple_self_signed(subject_alt_names).unwrap();
-
-	let key_der = match PrivatePkcs8KeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()) {
-		Ok(key_der) => PrivateKeyDer::Pkcs8(key_der),
-		Err(e) => {
-			event!(Level::ERROR, "Error converting key to der: {e:?}");
-			bail!(format!("Error converting key to der: {e:?}"))
-		}
-	};
-	let server_config = match rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], key_der) {
-		Ok(server_config) => server_config,
-		Err(e) => {
-			event!(Level::ERROR, "Error creating server config: {e:?}");
-			bail!(format!("Error creating server config: {e:?}"))
-		}
-	};
-	Ok(server_config)
-}
-
 // Then handle_stream_request
 async fn handle_stream_request(stream_request: StreamRequest, ctx: ServeContext, circuit_id: CircuitId) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
@@ -1091,6 +1054,9 @@ async fn handle_raw_stream(stream_request: StreamRequest, handler: Arc<dyn Strea
 #[cfg(test)]
 mod tests {
 	use axum::{routing::get, Router};
+	// `rustls` is no longer used by the lib itself (the TLS assembly moved to
+	// tls_setup.rs); the live-Tor test's cert verifier still needs it.
+	use tokio_rustls::rustls;
 
 	use super::*;
 
@@ -1110,16 +1076,6 @@ mod tests {
 		// A provided cert keeps the forgiving plaintext posture (BYO is orthogonal).
 		assert!(matches!(builder.tls, Tls::Provided(_)));
 		assert_eq!(builder.tls.plaintext_policy(), tls_policy::PlaintextPolicy::Upgrade);
-	}
-
-	#[test]
-	fn tls_acceptor_builds_from_a_provided_certificate() {
-		let address = OnionAddress::normalized("examplereturnsavalidacceptorpaddingxxxxxxxxxxxxxxxxxxxxx");
-		let ck = rcgen::generate_simple_self_signed(vec![address.host().to_string()]).expect("rcgen");
-		let provided = ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
-		// The acceptor builds offline for both the self-signed and provided paths.
-		tls_acceptor(&address, &Tls::Provided(provided)).expect("provided-cert acceptor");
-		tls_acceptor(&address, &Tls::Upgrade).expect("self-signed acceptor");
 	}
 
 	#[tokio::test]

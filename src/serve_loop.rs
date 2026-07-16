@@ -32,7 +32,6 @@ use onyums_skin::{CircuitId, CircuitPolicy};
 use tokio_rustls::TlsAcceptor;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{RendRequest, StreamRequest};
-use tor_proto::client::stream::IncomingStreamRequest;
 use tower_service::Service;
 use tracing::{event, span, Level};
 
@@ -121,10 +120,7 @@ pub async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamReques
 	while let Some(stream_request) = streams.next().await {
 		let stream_span = span!(Level::INFO, "onyums - incoming_stream");
 		let _stream_guard = stream_span.enter();
-		let port = match stream_request.request() {
-			IncomingStreamRequest::Begin(begin) => begin.port(),
-			_ => 0,
-		};
+		let port = circuit_gate::requested_port(stream_request.request());
 		let target = circuit_gate::stream_target(port);
 
 		let disposition = circuit_gate::stream_disposition(policy.on_new_stream(&id, &target), port);
@@ -219,10 +215,7 @@ pub async fn handle_stream_request(stream_request: StreamRequest, ctx: ServeCont
 	// decision wins for ports 80/443 (so under a `Reject` plaintext policy the
 	// port-80 arm resolves to `Reject`, no plaintext handler at all); any other
 	// port resolves to a caller-registered raw handler or, with none, a reject.
-	let port = match stream_request.request() {
-		IncomingStreamRequest::Begin(begin) => begin.port(),
-		_ => 0,
-	};
+	let port = circuit_gate::requested_port(stream_request.request());
 	match ctx.port_router.dispatch(port, ctx.plaintext) {
 		PortDispatch::ServeHttp => handle_tls_connection(stream_request, ctx.tls_acceptor, ctx.app, circuit_id).await,
 		PortDispatch::RedirectToHttps => handle_http_redirect(stream_request, ctx.address.host().to_string()).await,

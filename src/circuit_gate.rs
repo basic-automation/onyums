@@ -17,6 +17,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use onyums_skin::{CircuitAction, CircuitId, StreamTarget};
+use tor_proto::client::stream::IncomingStreamRequest;
 
 /// Allocates monotonic, process-unique [`CircuitId`]s — one per offered rendezvous
 /// circuit, minted at the `RendRequest` boundary (see the module docs for why the id is
@@ -101,6 +102,29 @@ pub const fn stream_disposition(action: CircuitAction, port: u16) -> StreamDispo
 	}
 }
 
+/// The port a client's incoming stream request asks for.
+///
+/// A `BEGIN` cell carries the target port, and that port is what the whole downstream
+/// gate keys on ([`stream_target`] → [`stream_disposition`] → the port dispatch). Every
+/// *other* request kind — `BEGIN_DIR` (a directory fetch, meaningless for an onion
+/// service) and `RESOLVE` (a DNS lookup, which an onion service has no business
+/// answering) — maps to port `0`, which no handler may register and which is not a
+/// reserved HTTP port, so it is refused downstream. That mapping is a security decision,
+/// not a formality: it is what makes an unexpected request kind fail closed instead of
+/// being served by whatever happens to sit on the port it decodes to.
+///
+/// Lives here rather than inline in the loop because it *is* a decision, and this module
+/// exists to hold the loop's decisions where they can be tested (see the module docs).
+/// `IncomingStreamRequest` is `#[non_exhaustive]`-shaped from onyums' side, so an
+/// unknown future kind lands in the same fail-closed arm.
+#[must_use]
+pub fn requested_port(request: &IncomingStreamRequest) -> u16 {
+	match request {
+		IncomingStreamRequest::Begin(begin) => begin.port(),
+		_ => 0,
+	}
+}
+
 /// Build skin's [`StreamTarget`] from a BEGIN cell's port. Onion-service BEGIN cells are
 /// gated on port (443 TLS / 80 → HTTPS redirect); the host is not consulted by current
 /// policy, so it is left `None`.
@@ -134,6 +158,30 @@ mod tests {
 		// 8 threads, each one id, all distinct.
 		ids.dedup();
 		assert_eq!(ids.len(), 8);
+	}
+
+	#[test]
+	fn requested_port_reads_the_begin_cells_port() {
+		// A BEGIN cell is the only request kind an onion-service client should send, and
+		// its port is what the entire downstream gate keys on. Constructible offline —
+		// `Begin::new` is public — so unlike the loop that consumes it, this decision is
+		// testable without live Tor.
+		for port in [443, 80, 22, 9735, 65535] {
+			let begin = tor_cell::relaycell::msg::Begin::new("example.onion", port, 0).expect("a valid BEGIN cell");
+			assert_eq!(requested_port(&IncomingStreamRequest::Begin(begin)), port);
+		}
+	}
+
+	#[test]
+	fn a_non_begin_request_fails_closed_on_port_zero() {
+		// BEGIN_DIR (a directory fetch) and RESOLVE (a DNS lookup) are meaningless for an
+		// onion service. Mapping them to port 0 is what makes them fail closed: 0 can never
+		// be registered as a raw port (`PortRouter::register` rejects it) and is not a
+		// reserved HTTP port, so the dispatch refuses them rather than serving them off
+		// whatever port they might otherwise decode to.
+		let begin_dir = IncomingStreamRequest::BeginDir(tor_cell::relaycell::msg::BeginDir::default());
+		assert_eq!(requested_port(&begin_dir), 0, "BEGIN_DIR must not resolve to a servable port");
+		assert!(!crate::port_router::is_reserved_http_port(requested_port(&begin_dir)), "port 0 is not a reserved HTTP port, so it is refused");
 	}
 
 	#[test]

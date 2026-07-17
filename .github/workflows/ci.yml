@@ -134,10 +134,14 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # Docs must *build* — this is the gate that catches a doc example or intra-doc
-      # link that stops compiling. It is not yet `-D warnings`: the tree currently has
-      # 46 rustdoc warnings (mostly public docs linking to private items in
-      # onyums-skin). Clearing them and tightening this to deny is tracked on the
-      # ROADMAP; a job that fails on arrival would just be ignored.
+      # Docs must build *warning-free*. This catches a doc example or intra-doc link that
+      # stops compiling, and — since 2026-07-17, when the last of the rustdoc warnings were
+      # cleared out of onyums-skin — a broken or private-target intra-doc link too. The
+      # deny is the point: rustdoc warnings are invisible in normal work (nobody reads
+      # `cargo doc` output), so without a gate they silently accumulate, which is exactly
+      # how the tree reached 46 of them. Verified locally at zero across the workspace
+      # before this was tightened.
       - name: Build docs
+        env:
+          RUSTDOCFLAGS: -D warnings
         run: cargo doc --no-deps --workspace --all-features

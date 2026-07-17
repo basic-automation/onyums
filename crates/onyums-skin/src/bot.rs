@@ -44,10 +44,11 @@ const DEFAULT_SPARSE_HEADER_THRESHOLD: usize = 4;
 pub enum BotSignal {
 	/// No `User-Agent` header at all — every real browser sends one.
 	NoUserAgent,
-	/// The `User-Agent` names a known non-browser HTTP client (see [`NON_BROWSER_UA_TOKENS`]).
+	/// The `User-Agent` names a known non-browser HTTP client (an internal `NON_BROWSER_UA_TOKENS`
+	/// set: curl, wget, python-requests, …).
 	NonBrowserUserAgent,
-	/// The `User-Agent` names a browser automation / headless framework (see
-	/// [`AUTOMATION_UA_TOKENS`]) — a strong bot signal even behind a browser-shaped UA.
+	/// The `User-Agent` names a browser automation / headless framework (an internal
+	/// `AUTOMATION_UA_TOKENS` set) — a strong bot signal even behind a browser-shaped UA.
 	AutomationUserAgent,
 	/// No `Accept` header — browsers always send one; many scripts omit it.
 	NoAccept,

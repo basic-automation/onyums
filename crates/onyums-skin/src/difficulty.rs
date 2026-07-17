@@ -9,7 +9,7 @@
 //! effort control loop, one layer up.
 //!
 //! The rate is measured over a fixed window read from an injectable
-//! [`Clock`](crate::circuit::Clock), so the controller is deterministically testable
+//! [`Clock`], so the controller is deterministically testable
 //! with [`ManualClock`](crate::circuit::ManualClock) and never needs to sleep.
 
 use std::{

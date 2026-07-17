@@ -36,7 +36,7 @@
 use axum::http::request::Parts;
 use regex::RegexSet;
 
-/// Maximum number of percent-decode passes [`normalize`] performs before giving up.
+/// Maximum number of percent-decode passes the WAF's internal `normalize` performs before giving up.
 /// One pass peels a single encoding layer; reaching this cap means the input was
 /// multiply encoded (or maliciously deep) and is treated as evasive regardless.
 pub const MAX_DECODE_PASSES: usize = 4;

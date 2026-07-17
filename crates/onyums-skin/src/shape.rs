@@ -13,7 +13,7 @@
 //! request-shape baselining.
 //!
 //! **Why the header *set*, not the wire order.** JA4H keys on the raw on-the-wire header
-//! order, but axum/hyper parse headers into an [`http::HeaderMap`] whose iteration order is
+//! order, but axum/hyper parse headers into an [`axum::http::HeaderMap`] whose iteration order is
 //! not the wire order, so that signal is unavailable post-parse. We key on the sorted,
 //! de-duplicated *set* of header names instead — still a real fingerprint (Tor Browser
 //! emits a fixed canonical set; a bot's set differs) and stable across requests.
@@ -51,7 +51,7 @@ pub struct RequestShape {
 	/// Whether the request carries a `Cookie` header (a returning/cleared client usually
 	/// does; a fresh flood usually does not).
 	pub has_cookie: bool,
-	/// The user-agent, lowercased and capped at [`MAX_UA_LEN`]; `None` if absent. Over Tor
+	/// The user-agent, lowercased and capped at an internal `MAX_UA_LEN`; `None` if absent. Over Tor
 	/// the legitimate UA set is tiny (Tor Browser pins it), so an odd or missing UA stands
 	/// out sharply.
 	pub ua: Option<String>,

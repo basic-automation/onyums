@@ -134,7 +134,7 @@ identity costs a fresh proof-of-work solve.
 | PoW | pluggable `Pow` trait, **SHA-256 hashcash default** | hand-rolled; pure-Rust Equi-X behind the opt-in `equix` feature | MIT (equix: LGPL, gated) |
 | Rate limiter | reuse | `governor` (keyed on the clearance token) | MIT/Apache |
 | Clearance token | reuse | `hmac` + `sha2` | MIT |
-| No-JS fallbacks | server-rendered CAPTCHA + patience tarpit | `captcha` / hand-rolled | MIT |
+| No-JS fallbacks | **patience tarpit shipped**; server-rendered CAPTCHA *not built yet* | hand-rolled (`PatienceChallenge`); the CAPTCHA tier is planned — see the note below | MIT |
 | WAF | build | `regex` + `aho-corasick` + the in-house `FilterExpr` rule language | MIT |
 
 ## Principles
@@ -142,8 +142,12 @@ identity costs a fresh proof-of-work solve.
 - **Tor-native substitutes, not IP-based defense** — every mechanism is re-keyed onto
   the per-rendezvous-circuit and an app-issued clearance token.
 - **Secure and complete by default; you opt *down*, never *up*.**
-- **No-JS is a first-class client** — Skin degrades (PoW → CAPTCHA → patience tarpit),
-  never fails.
+- **No-JS is a first-class client** — Skin degrades rather than failing. **Today that
+  degradation is PoW → patience tarpit: the CAPTCHA tier is designed but not
+  implemented** (`ClearanceLevel::Captcha` exists in the token vocabulary; no
+  `Challenge` implements it). A no-JS client therefore reaches the tarpit, which serves
+  them — it is a real fallback, not a dead end — but it is a *delay*, not a
+  human-verification step. Do not read "CAPTCHA" into the current build.
 - **Cost, not prevention** — a fresh synthetic identity costs a fresh proof-of-work solve.
 - **100% Rust — no FFI, ever** (MIT, no copyleft in the default build).
 

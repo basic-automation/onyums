@@ -1540,6 +1540,26 @@ pub fn starter_rules() -> Vec<Rule> {
 			category: WafCategory::XPathInjection,
 			pattern: r"(?i)(\bdeclare\s+(namespace|default\s+(element|function))\b|\bfor\s+\$\w+\s+in\b[\s\S]{0,80}\breturn\b|\bcount\s*\(\s*/)",
 		},
+		// An XPath *node test or node function opening a predicate* — `[text()='x']`, `[position()=2]`,
+		// `[substring(name(),1,4)='adm']`. The predicate-opening `[` is the false-positive anchor the
+		// bare function names cannot carry on their own: jQuery's `.text()`, a generic `substring(` in a
+		// posted code sample, or a `contains(` in prose all lack it, while an XPath predicate cannot be
+		// written without it. `not(` is allowed to sit between the two (`[not(contains(@r,'admin'))]`),
+		// which is the negation form of the same shape. `concat(`/`translate(`/`node(` are deliberately
+		// left out — the first two are equally SQL/JS idioms, and `node()` only appears on an axis step
+		// (`descendant::node()`), which `xpathi_axis` already holds.
+		Rule {
+			id: "xpathi_predicate_function",
+			category: WafCategory::XPathInjection,
+			pattern: r"(?i)\[\s*(not\s*\(\s*)?(local-name|namespace-uri|normalize-space|string-length|substring-before|substring-after|substring|starts-with|contains|position|last|text|name|count)\s*\(",
+		},
+		// The abbreviated attribute axis inside a predicate, compared against a literal — `[@name='admin']`,
+		// `[@id!=1]`, `[@role=$r]`. This is the shape of the classic XPath authentication break-out
+		// (`//user[@name='x' or '1'='1']`). Requiring both the comparison operator *and* a literal head
+		// (quote / digit / `$var`) after the attribute name is what holds the false positives down: an
+		// `@`-mention in markup (`[@alice]`) has no comparison, and a bare `[@key=value]`-style config or
+		// tag syntax has no quoted/numeric right-hand side, so both stay clean.
+		Rule { id: "xpathi_attribute_predicate", category: WafCategory::XPathInjection, pattern: r#"(?i)\[\s*@[\w:.-]+\s*(!=|<=|>=|=|<|>)\s*('|"|\d|\$)"# },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -3269,6 +3289,44 @@ mod tests {
 	}
 
 	#[test]
+	fn xpath_predicate_function_is_blocked() {
+		// A node test / node function opening a predicate — the forms the axis and FLWOR rules skip.
+		let waf = Waf::starter();
+		for value in [
+			"q=//user[text()='admin']",                      // text() node test
+			"q=/users/user[position()=1]/password",          // position() predicate
+			"q=//user[name()='password']",                   // name() node test
+			"q=//user[substring(name(),1,4)='root']",        // substring( — the deferral's FP worry, anchored
+			"q=//user[starts-with(@name,'adm')]",            // starts-with(
+			"q=//user[not(contains(@role,'guest'))]/secret", // the not(-wrapped negation form
+			"q=//a[last()]",                                 // last()
+			"q=//node[string-length(text())>0]",             // string-length(
+		] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::XPathInjection, "{value}");
+			assert_eq!(m.rule_id, "xpathi_predicate_function", "{value}");
+		}
+	}
+
+	#[test]
+	fn xpath_attribute_predicate_is_blocked() {
+		// The abbreviated attribute axis compared against a literal — the classic auth break-out shape.
+		let waf = Waf::starter();
+		for value in [
+			"q=//user[@name='admin']/password",   // quoted string literal
+			"q=//user[@id=1]",                    // numeric literal
+			"q=//user[@role!=\"guest\"]",         // negated comparison
+			"q=//user[@level>=3]",                // relational comparison
+			"q=//user[@name=$injected]",          // variable reference
+			"q=//account[ @user.name = 'root' ]", // whitespace-padded, dotted attribute name
+		] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::XPathInjection, "{value}");
+			assert_eq!(m.rule_id, "xpathi_attribute_predicate", "{value}");
+		}
+	}
+
+	#[test]
 	fn xpath_injection_keeps_false_positives_low() {
 		// Generic `::` scope operators from posted Rust/PHP/C++ code (not XPath axes), an "ancestor"
 		// word with no axis `::`, a `for`/`return` in prose without the FLWOR shape, and a `count(` that
@@ -3284,6 +3342,59 @@ mod tests {
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn xpath_wildcard_node_set_attributes_to_the_sql_comment_rule_first() {
+		// Found while adding the predicate rules, and worth pinning rather than hiding: the XPath
+		// wildcard step `//*` *contains* `/*`, the SQL comment opener, so a `//*[…]` payload trips a
+		// Sqli rule before the XPath rules are ever reached (first-match order runs Sqli first).
+		//
+		// It is not a miss — the request is blocked either way, which is what protects the app — but
+		// the *attribution* an operator sees on their event stream says `sqli`, not `xpath_injection`.
+		// Left as-is deliberately: re-ordering the rule table to fix a label would change which rule
+		// reports every overlapping payload in the whole set, and blocking is the load-bearing part.
+		// Both facts are asserted so neither can drift silently.
+		let waf = Waf::starter();
+		let Verdict::Block(m) = waf.inspect(&parts("GET", "/x?q=//*[name()='password']")) else {
+			panic!("a wildcard-step XPath payload must still block");
+		};
+		assert_eq!(m.category, WafCategory::Sqli, "the `/*` comment token wins first-match");
+
+		// Scoring inspects every rule, so the XPath signal is still visible there — an operator who
+		// scores rather than first-matches does see the XPath attribution.
+		let all = waf.inspect_all(&parts("GET", "/x?q=//*[name()='password']"));
+		assert!(all.iter().any(|m| m.rule_id == "xpathi_predicate_function"), "got: {all:?}");
+	}
+
+	#[test]
+	fn xpath_predicate_rules_keep_false_positives_low() {
+		// The exact collisions that deferred this rule pair: an XPath node function's name is only a
+		// signal *inside a predicate*, and an `@`-token is only a signal when compared to a literal.
+		let waf = Waf::starter();
+		for uri in [
+			"/js?snip=$(el).text()",            // jQuery .text() — a function call, no predicate `[`
+			"/js?snip=s.substring(0,4)",        // generic substring( — the named FP worry
+			"/docs?q=how+contains()+works",     // prose mentioning a function name
+			"/api/items[0]",                    // an index predicate with no node test
+			"/data?rows[1]=x&rows[2]=y",        // PHP/Rails-style bracket params
+			"/feed?msg=hi+[@alice]+welcome",    // an @-mention, no comparison operator
+			"/cfg?opt=[@section]",              // a bare bracketed @-token
+			"/post?body=email+me+[@me=you]",    // `[@k=v]` with no quoted/numeric literal head
+			"/search?q=last+call+for+position", // the function words as prose
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+
+		// The known over-match, asserted rather than left to be discovered: source code that indexes with
+		// a call (`arr[name(x)]`) is indistinguishable from an XPath predicate by shape alone, so it
+		// trips. Accepted because it is a *code* form, not something that appears in ordinary request
+		// values — but pinned here so a future reader sees it was a decision, and a change of heart
+		// shows up as this test failing rather than as a silent behaviour change.
+		let Verdict::Block(m) = waf.inspect(&parts("GET", "/code?c=arr[name(x)]")) else {
+			panic!("the documented over-match should still block");
+		};
+		assert_eq!(m.rule_id, "xpathi_predicate_function");
 	}
 
 	#[test]

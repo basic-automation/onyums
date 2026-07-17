@@ -1658,6 +1658,24 @@ mod tests {
 	}
 
 	#[test]
+	fn starter_rule_ids_are_unique() {
+		// The rule id is an operator-facing key, not a label: `disable_rule(id)` switches off *every*
+		// rule whose id matches, and `is_rule_enabled` reports on the first hit. So a duplicated id
+		// silently breaks the per-rule disabling this crate advertises — an operator turning off one
+		// noisy rule would turn off an unrelated one with it, and the WAF would report the same id for
+		// two different signatures on the event stream. Nothing else in the table enforces this: the ids
+		// are hand-written string literals across ~100 rules, and a copy-pasted rule is exactly how a
+		// duplicate arrives. The table is only ever appended to, so this is cheap insurance on the
+		// invariant everything else assumes.
+		let rules = starter_rules();
+		let mut seen = std::collections::HashSet::new();
+		for rule in &rules {
+			assert!(seen.insert(rule.id), "duplicate starter rule id: {}", rule.id);
+		}
+		assert_eq!(seen.len(), rules.len());
+	}
+
+	#[test]
 	fn benign_request_is_allowed() {
 		let waf = Waf::starter();
 		assert_eq!(waf.inspect(&parts("GET", "/articles/hello-world?page=2")), Verdict::Allow);

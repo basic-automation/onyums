@@ -44,7 +44,13 @@ and Unix-shell evasion — `$IFS` whitespace plus character-insertion
 de-obfuscation (`c'a't`, `c\at`, `who${x}ami`) and `{cat,/path}` brace-expansion —
 network-recon/exfil command coverage,
 NoSQL/ORM lookup injection, XPath/XQuery injection (a first-class `XPathInjection`
-category — axis steps, XQuery FLWOR, `count(//…)` node-sets), restricted-file access
+category — axis steps, XQuery FLWOR, `count(//…)` node-sets, and the predicate forms:
+node tests/functions that open a predicate like `[text()='admin']`/`[position()=1]`
+plus the `[@name='admin']` attribute-axis auth break-out), remote file inclusion (a
+first-class `Rfi` category — an inclusion-flavored parameter pointed at a remote
+`http(s)`/`ftp(s)` URL, and the `?`-truncation payload; distinct from path traversal,
+which is *local* inclusion, and from SSRF, which fetches but does not execute),
+restricted-file access
 (incl. AI coding-assistant artifact
 dirs like `.claude/`/`.cursor/`), and a `ScannerDetection` class that hard-blocks
 self-identifying attack tools (sqlmap/nikto/ghauri/nuclei/ffuf/dalfox/…); input is

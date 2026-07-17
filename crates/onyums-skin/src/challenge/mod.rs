@@ -9,6 +9,7 @@ use axum::{http::request::Parts, response::Response};
 
 use crate::clearance::ClearanceLevel;
 
+pub mod captcha;
 #[cfg(feature = "equix")]
 pub mod equix;
 pub mod patience;

@@ -131,7 +131,7 @@ impl HmacClearanceStore {
 
 	/// Add a verify-only key, returning `self` for chaining. Tokens minted under this key
 	/// (e.g. by a fleet member on a previous secret, or before a rotation) still verify, but
-	/// this store keeps minting under its primary [`secret`](Self::secret). Add several to
+	/// this store keeps minting under its primary secret. Add several to
 	/// span an entire rotation window.
 	#[must_use]
 	pub fn with_verify_key(mut self, secret: impl Into<Vec<u8>>) -> Self {

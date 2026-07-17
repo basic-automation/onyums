@@ -294,7 +294,8 @@ fn request_host(parts: &Parts) -> Option<String> {
 
 /// Substitute the supported placeholders in a redirect location template:
 ///
-/// - `{host}` — the request host ([`request_host`]), or empty if absent.
+/// - `{host}` — the request host (the `Host` header, or an absolute URI's authority), or empty
+///   if absent.
 /// - `{path}` — the request path (always begins with `/`).
 /// - `{path_and_query}` — the path plus `?query` when a query is present.
 ///

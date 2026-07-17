@@ -66,7 +66,7 @@ pub use cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_c
 #[cfg(feature = "equix")]
 pub use challenge::equix::EquiX;
 pub use challenge::{
-	Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
+	Challenge, ChallengeChain, Gate, captcha::{CAPTCHA_ALPHABET, CaptchaText}, patience::PatienceChallenge, pow::{Hashcash, Pow, PowChallenge, Puzzle}
 };
 pub use circuit::{AccountingCircuitPolicy, CircuitAction, CircuitId, CircuitPolicy, CircuitStats, Clock, ManualClock, StreamTarget, SystemClock};
 pub use clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore, TokenId};

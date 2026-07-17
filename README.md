@@ -38,7 +38,7 @@ inside the onion-encrypted stream; the Skin abuse-defense gate runs before the r
                    │  decrypted HTTP request
                    ▼
         ┌───────────────────────┐
-        │   Skin gate           │  clearance check · PoW / CAPTCHA challenge ·
+        │   Skin gate           │  clearance check · PoW / tarpit challenge ·
         │   (abuse defense)     │  WAF · rate-limit (keyed on the clearance token)
         └──────────┬────────────┘
                    │  cleared request

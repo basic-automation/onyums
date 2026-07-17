@@ -60,7 +60,17 @@ sha2 = "0.10.9"
 rand = "0.9.2"
 hmac = "0.12.1"
 base64 = "0.22.1"
-governor = "0.10.1"
+# `default-features = false` drops governor's `jitter` feature, which skin does not use
+# (`ratelimit.rs` takes `DefaultKeyedRateLimiter` + `Quota` and no `Jitter`). Jitter is the
+# *only* thing pulling `rand`/`getrandom` into governor's subtree — its `rand` dep is
+# optional — so turning it off removes one of the three reverse deps on `rand` 0.9 and
+# drops `getrandom`'s `wasm_js`, which is dead weight on a server. The other three default
+# features are kept **deliberately**: `quanta` because it selects governor's `DefaultClock`
+# (dropping it silently swaps the limiter's clock for `MonotonicClock`), `dashmap` because
+# `DefaultKeyedRateLimiter`'s state store is a `DashMap`, and `std` for the rest.
+# This does not by itself remove `rand` 0.9 from the tree — onyums and onyums-skin still
+# depend on it directly; see the ROADMAP's dependency-tree item.
+governor = { version = "0.10.1", default-features = false, features = ["std", "dashmap", "quanta"] }
 # onyums-skin WAF (Phase 3) — pure Rust signature matching. `regex` pulls in
 # `aho-corasick` internally for literal prefiltering (both MIT/Apache, no FFI).
 regex = "1.11.1"

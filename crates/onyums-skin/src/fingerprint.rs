@@ -14,7 +14,7 @@
 //!
 //! **The one deviation from the spec — header *order*.** Canonical JA4H hashes the header
 //! names in their raw on-the-wire order. axum/hyper parse headers into an
-//! [`http::HeaderMap`] whose iteration order is *not* the wire order (the same limitation
+//! [`axum::http::HeaderMap`] whose iteration order is *not* the wire order (the same limitation
 //! [`RequestShape`](crate::shape::RequestShape) already documents), so the header-name
 //! component here ([`b`](Ja4hFingerprint::b)) hashes the **sorted, de-duplicated set** of
 //! names instead. That weakens it relative to a packet-capture JA4H — order is a real
@@ -38,7 +38,7 @@ const EMPTY_HASH: &str = "000000000000";
 const LANG_LEN: usize = 4;
 
 /// A JA4H-style fingerprint of one HTTP request, in four components
-/// (`a`/`b`/`c`/`d`), rendered as `a_b_c_d` by [`Display`]/[`raw`](Self::raw).
+/// (`a`/`b`/`c`/`d`), rendered as `a_b_c_d` by [`Display`](std::fmt::Display)/[`raw`](Self::raw).
 ///
 /// Construct with [`from_parts`](Self::from_parts). The string is a stable in-process
 /// cluster key, not a wire format or a cross-version stability guarantee — see the module
@@ -54,13 +54,14 @@ pub struct Ja4hFingerprint {
 	/// `0000` if absent.
 	pub a: String,
 	/// Truncated SHA-256 (12 hex) of the comma-joined header-name **set** (sorted, lowercased,
-	/// `Cookie`/`Referer` excluded), or [`EMPTY_HASH`] when no other headers are present.
+	/// `Cookie`/`Referer` excluded), or the all-zero empty-hash sentinel (`000000000000`) when no
+	/// other headers are present.
 	pub b: String,
-	/// Truncated SHA-256 (12 hex) of the sorted, comma-joined cookie field **names**, or
-	/// [`EMPTY_HASH`] when there is no `Cookie` header.
+	/// Truncated SHA-256 (12 hex) of the sorted, comma-joined cookie field **names**, or the
+	/// all-zero empty-hash sentinel (`000000000000`) when there is no `Cookie` header.
 	pub c: String,
-	/// Truncated SHA-256 (12 hex) of the sorted, comma-joined cookie `name=value` pairs, or
-	/// [`EMPTY_HASH`] when there is no `Cookie` header.
+	/// Truncated SHA-256 (12 hex) of the sorted, comma-joined cookie `name=value` pairs, or the
+	/// all-zero empty-hash sentinel (`000000000000`) when there is no `Cookie` header.
 	pub d: String,
 }
 

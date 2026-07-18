@@ -136,7 +136,7 @@ which carries none of arti, is usable on **1.89**.
 - **Observability — what, why, and how much** — `status()` says what the service's reachability is, `problem()` says *why* when it isn't healthy (a stable `ServiceProblem` projection of arti's `Display`-less diagnostics), `health()` bundles both from one consistent read, and `metrics()` exposes per-service circuit/stream counters (with `since()` interval deltas) for a `/up` line — plus a built-in Prometheus exporter (`metrics_prometheus()` per service, `fleet_prometheus(...)` for many) ready to serve at `/metrics`.
 - **Multiple services on one bootstrap** — bootstrap once with `OnionService::shared_client()` (or reuse a running handle's `tor_client()`), pass it to several builders via `.tor_client(...)`, and aggregate fleet health with `ServiceStatus::worst_of([...])`.
 - **TLS-first transport** — auto-generated self-signed certs, automatic HTTP→HTTPS upgrade, strict mode with HSTS, or bring your own CA-signed cert; see [TLS-first transport](#tls-first-transport).
-- **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler; see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
+- **Any protocol over the onion service** — `.route_port(port, handler)` tunnels raw TCP / gRPC / SSH / Lightning alongside the built-in TLS HTTP handler, with opt-in raw-port controls (`ConnectionLimit` concurrency caps, `AuthGate` + `SharedSecretAuth` to put authentication in front of an unauthenticated backend); see [Protocol versatility](#protocol-versatility--any-protocol-over-an-onion-service).
 - **Stable identity, opt-down to throwaway** — a persistent keystore by default (stable `.onion` across restarts), or `.ephemeral()` for a fresh, disposable address each run; plus vanity-address mining, offline inspection of a Tor `hs_ed25519_secret_key` file (derive the address a key serves — launching *from* an imported key is not yet supported), and address helpers (QR, `Onion-Location`); see [Identity & address helpers](#identity--address-helpers).
 - **Websockets over Tor** — with the per-circuit `ConnectionInfo` as the client identity (typed `is_over_tor()` / `circuit()` / `same_circuit()` helpers for per-circuit isolation); see [Websocket example](#websocket-example).
 - **Version-skew-proof arti** — the arti stack is re-exported (`onyums::arti_client`, `onyums::tor_hsservice`, `onyums::tor_hscrypto`, …) so downstreams use the exact versions onyums does, just like `axum`.
@@ -668,9 +668,12 @@ Bring your own protocol by implementing the `StreamHandler` trait (one method: `
 > Publishing one over an onion service is a legitimate and rather good idea done
 > deliberately (a globally reachable admin port with no open firewall port and no IP
 > to scan); it is a bad one done by accident, and the log is where the two are told
-> apart. The same data is available programmatically via
-> `PortRouter::exposures()` / `well_known_sensitive_service(port)` if you would
-> rather assert on it in your own startup checks.
+> apart. If you wrap the port in an `AuthGate` or a `ConnectionLimit` (below), the
+> warning says so — *"this handler does apply: a stream authorizer; a connection
+> limit of 8"* — rather than pretending the port is wide open. The same data is
+> available programmatically via `PortRouter::exposures()` (each exposure carries a
+> `HandlerProtection`) / `well_known_sensitive_service(port)` if you would rather
+> assert on it in your own startup checks.
 >
 > Two things worth stating: restricted discovery controls who can *find* the service,
 > not who may use a raw port once found; and per-circuit `CircuitPolicy` limits still
@@ -703,6 +706,45 @@ retry; one parked in an invisible queue cannot tell slow from dead. The cap is p
 wrapper, so each port gets its own budget, and `in_flight()` / `is_saturated()` expose
 the current state for a health endpoint. A limit of `0` is rejected at construction
 rather than becoming a port that silently accepts nothing.
+
+**Put authentication in front of a raw backend.** Many of the services people expose over
+an onion service — Redis, a Docker socket, Memcached, an internal admin port — authenticate
+weakly or not at all, on the assumption that only loopback can reach them. `AuthGate` puts a
+decision in front of the backend: it wraps any handler behind a `StreamAuthorizer` that must
+approve a stream *before the backend sees it*. The batteries-included `SharedSecretAuth`
+admits a connection only if it opens with a pre-shared secret, which it strips before
+forwarding the rest of the stream:
+
+```rust
+use onyums::{AuthGate, ConnectionLimit, OnionService, RawTcpHandler, SharedSecretAuth, routing::get, Router};
+
+// The client prepends this secret to the connection; the gate reads it, compares in
+// constant time, and forwards only what follows to Redis.
+let auth = SharedSecretAuth::new(std::env::var("REDIS_ONION_SECRET")?.into_bytes())?;
+let redis = ConnectionLimit::new(AuthGate::new(RawTcpHandler::new("127.0.0.1:6379"), auth), 8)?;
+
+let handle = OnionService::builder()
+	.router(Router::new().route("/", get(|| async { "hi" })))
+	.nickname("my_onion")
+	.route_port(16379, redis)  // authenticated, at most 8 concurrent
+	.serve()
+	.await?;
+```
+
+`AuthGate` **fails closed**: a rejected stream — or an authorizer that errors mid-decision —
+is dropped without touching the backend. It composes with `ConnectionLimit` in either order,
+and a wrapped port reports what it applies, so the raw-port `WARN` at launch says *"this
+handler does apply: a stream authorizer; a connection limit of 8"* instead of pretending the
+port is wide open. Implement `StreamAuthorizer` yourself for a custom scheme (a token lookup,
+a challenge/response); `SharedSecretAuth` is the ready-made one.
+
+Understand what a shared secret is and is not: it is a **bearer credential shared by every
+authorized client** — the same shape and the same caveats as a restricted-discovery key. It
+authenticates the channel, not a user; a leaked secret is a breach; and there are no
+per-client identities or roles (layer real per-user auth in the backend for that). It adds no
+round trip, so it does not defend against replay by an attacker who has already captured the
+preamble — but capturing it means compromising an endpoint, since the onion circuit is
+encrypted end-to-end.
 
 ****
 

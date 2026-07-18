@@ -39,7 +39,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
 use tracing::{Level, event};
 
-use crate::port_router::{OnionStream, ServeFuture, StreamHandler};
+use crate::port_router::{HandlerProtection, OnionStream, ServeFuture, StreamHandler};
 
 /// The future returned by [`StreamAuthorizer::authorize`]: owned (`'static`) and `Send`,
 /// so it can be driven on the spawned per-connection task like a [`ServeFuture`].
@@ -138,6 +138,14 @@ impl<H: StreamHandler + 'static> StreamHandler for AuthGate<H> {
 				}
 			}
 		})
+	}
+
+	fn protection(&self) -> HandlerProtection {
+		// Report that a stream is authorized before the backend, merging in whatever the
+		// wrapped handler already protects.
+		let mut protection = self.inner.protection();
+		protection.authorized = true;
+		protection
 	}
 }
 
@@ -440,5 +448,24 @@ mod tests {
 		serve.await.expect("task").expect("admitted");
 		assert_eq!(served.load(Ordering::SeqCst), 1);
 		assert_eq!(echoed, b"board", "only the secret's length is stripped; the rest reaches the backend");
+	}
+
+	#[test]
+	fn an_auth_gate_reports_authorization_and_merges_the_inner_protection() {
+		use crate::ConnectionLimit;
+
+		// A bare AuthGate reports only authorization.
+		let gate = AuthGate::new(backend().0, AdmitAll);
+		let p = gate.protection();
+		assert!(p.authorized, "an AuthGate must report that it authorizes");
+		assert_eq!(p.connection_limit, None, "a bare AuthGate adds no connection limit");
+
+		// Nesting composes: AuthGate<ConnectionLimit<_>> reports *both*, so the launch
+		// warning names the whole stack in front of the backend.
+		let stacked = AuthGate::new(ConnectionLimit::new(backend().0, 4).expect("limit"), AdmitAll);
+		let p = stacked.protection();
+		assert!(p.authorized, "the outer AuthGate's authorization must be reported");
+		assert_eq!(p.connection_limit, Some(4), "the inner ConnectionLimit's cap must be merged in");
+		assert_eq!(p.describe().as_deref(), Some("a stream authorizer; a connection limit of 4"));
 	}
 }

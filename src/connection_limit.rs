@@ -33,7 +33,7 @@ use anyhow::{Result, bail};
 use tokio::sync::Semaphore;
 use tracing::{Level, event};
 
-use crate::port_router::{OnionStream, ServeFuture, StreamHandler};
+use crate::port_router::{HandlerProtection, OnionStream, ServeFuture, StreamHandler};
 
 /// Caps how many connections a raw port serves at once, refusing the rest.
 ///
@@ -108,6 +108,14 @@ impl<H: StreamHandler + 'static> StreamHandler for ConnectionLimit<H> {
 			drop(permit);
 			result
 		})
+	}
+
+	fn protection(&self) -> HandlerProtection {
+		// Report the cap and merge in whatever the wrapped handler already protects, so a
+		// ConnectionLimit<AuthGate<_>> reports both.
+		let mut protection = self.inner.protection();
+		protection.connection_limit = Some(self.max);
+		protection
 	}
 }
 
@@ -256,6 +264,17 @@ mod tests {
 		}
 		release.notify_waiters();
 		next.await.expect("task").expect("a connection after the flush is served");
+	}
+
+	#[test]
+	fn a_connection_limit_reports_its_cap_as_a_protection() {
+		// The launch-time exposure warning reads this off the handler, so a raw port behind
+		// a limit is not warned about as if it had none.
+		let limit = ConnectionLimit::new(RejectAll, 5).expect("limit");
+		let protection = limit.protection();
+		assert_eq!(protection.connection_limit, Some(5), "the cap must be reported");
+		assert!(!protection.authorized, "a bare ConnectionLimit does not authorize");
+		assert_eq!(protection.describe().as_deref(), Some("a connection limit of 5"));
 	}
 
 	#[tokio::test]

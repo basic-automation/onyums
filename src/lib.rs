@@ -64,7 +64,7 @@ pub use connection::ConnectionInfo;
 pub use connection_limit::ConnectionLimit;
 pub use handle::OnionServiceHandle;
 pub use metrics::{ServiceMetrics, fleet_prometheus};
-pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, RawPortExposure, ServeFuture, StreamHandler, well_known_sensitive_service};
+pub use port_router::{AsyncStream, HandlerProtection, OnionStream, PortDispatch, PortRouter, RawPortExposure, ServeFuture, StreamHandler, well_known_sensitive_service};
 pub use provided_cert::ProvidedCert;
 pub use raw_tcp::RawTcpHandler;
 pub use status::{ServiceHealth, ServiceProblem, ServiceProblemKind, ServiceStatus};

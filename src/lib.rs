@@ -68,7 +68,7 @@ pub use port_router::{AsyncStream, OnionStream, PortDispatch, PortRouter, RawPor
 pub use provided_cert::ProvidedCert;
 pub use raw_tcp::RawTcpHandler;
 pub use status::{ServiceHealth, ServiceProblem, ServiceProblemKind, ServiceStatus};
-pub use stream_auth::{AuthFuture, AuthGate, AuthOutcome, StreamAuthorizer};
+pub use stream_auth::{AuthFuture, AuthGate, AuthOutcome, SharedSecretAuth, StreamAuthorizer};
 pub use tls_policy::Tls;
 pub use vanity::{VanityKey, address_from_expanded_secret, address_from_secret_seed, address_from_tor_secret_key_file, expanded_secret_from_tor_file, mine, mine_parallel, mine_within, tor_secret_key_file_from_expanded, validate_prefix};
 

@@ -35,6 +35,8 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
+use subtle::ConstantTimeEq;
+use tokio::io::AsyncReadExt;
 use tracing::{Level, event};
 
 use crate::port_router::{OnionStream, ServeFuture, StreamHandler};
@@ -134,6 +136,83 @@ impl<H: StreamHandler + 'static> StreamHandler for AuthGate<H> {
 					event!(Level::WARN, "Refused a raw-port connection: the stream authorizer errored: {err:#}");
 					Err(err.context("stream authorizer failed; refusing the connection"))
 				}
+			}
+		})
+	}
+}
+
+/// A [`StreamAuthorizer`] that admits a stream only if it opens with a shared secret.
+///
+/// The batteries-included authorizer: the client prepends the pre-shared secret bytes to
+/// the connection, the gate reads exactly that many bytes, compares them to the configured
+/// secret in constant time, and on a match hands the *rest* of the stream to the backend
+/// (the secret is stripped — the backend never sees it). This is how you put an
+/// authentication step in front of a raw backend that has none of its own — a Redis, a
+/// Docker socket, a Memcached — reachable only to a client that holds the secret.
+///
+/// ```rust
+/// use onyums::{AuthGate, RawTcpHandler, SharedSecretAuth};
+///
+/// # fn f() -> anyhow::Result<()> {
+/// let auth = SharedSecretAuth::new(b"correct horse battery staple".to_vec())?;
+/// let redis = AuthGate::new(RawTcpHandler::new("127.0.0.1:6379"), auth);
+/// // .route_port(16379, redis)
+/// # let _ = redis;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// **What it is and is not.** It is a bearer credential shared by every authorized client
+/// — the same shape as a restricted-discovery key, and with the same caveats (see the
+/// README's restricted-discovery limits): a leaked secret is a breach, there are no
+/// per-client identities or roles, and removing access means rotating the secret for
+/// everyone. It authenticates *the channel*, not a user; layer real per-user auth in the
+/// backend on top. It is deliberately a raw byte prefix, not a challenge/response, so it
+/// adds no round trip over the Tor latency budget — which means it does **not** defend
+/// against replay by an attacker who already captured the preamble (the onion circuit is
+/// encrypted end-to-end, so that requires compromising an endpoint, but say so plainly).
+/// The comparison is constant-time so a wrong secret cannot be recovered byte-by-byte from
+/// timing; the *length* of the secret is still observable from how many bytes are read.
+pub struct SharedSecretAuth {
+	secret: Arc<[u8]>,
+}
+
+impl SharedSecretAuth {
+	/// Build an authorizer that admits a stream opening with exactly `secret`.
+	///
+	/// # Errors
+	/// Returns an error if `secret` is empty: an empty preamble is read as zero bytes and
+	/// matches unconditionally, which would admit every stream — a gate that is silently no
+	/// gate. Rejected here, offline, rather than in production.
+	pub fn new(secret: impl Into<Vec<u8>>) -> Result<Self> {
+		let secret = secret.into();
+		if secret.is_empty() {
+			bail!("a shared secret must not be empty; an empty preamble would admit every connection");
+		}
+		Ok(Self { secret: secret.into() })
+	}
+
+	/// The number of preamble bytes this authorizer reads (the secret's length).
+	#[must_use]
+	pub fn preamble_len(&self) -> usize {
+		self.secret.len()
+	}
+}
+
+impl StreamAuthorizer for SharedSecretAuth {
+	fn authorize(&self, mut stream: OnionStream) -> AuthFuture {
+		let secret = Arc::clone(&self.secret);
+		Box::pin(async move {
+			let mut preamble = vec![0u8; secret.len()];
+			// A short read (the peer closed before sending the whole preamble) is a failure
+			// to decide, not a clean rejection: it surfaces as an `Err`, which `AuthGate`
+			// fails closed on. Constant-time compare below only runs on a full-length read.
+			stream.read_exact(&mut preamble).await.map_err(|e| anyhow::anyhow!("could not read the {}-byte auth preamble: {e}", secret.len()))?;
+			if preamble.ct_eq(&secret).into() {
+				// The secret is consumed; the backend sees only what follows it.
+				Ok(AuthOutcome::Admit(stream))
+			} else {
+				Ok(AuthOutcome::Refuse)
 			}
 		})
 	}
@@ -274,5 +353,92 @@ mod tests {
 		serve.await.expect("task").expect("admitted");
 		assert_eq!(served.load(Ordering::SeqCst), 1);
 		assert_eq!(echoed, b"payload", "the backend must see the stream with the preamble stripped");
+	}
+
+	// ---- SharedSecretAuth (Phase 2 — raw-port controls, pre-shared-key preamble). ----
+
+	#[test]
+	fn an_empty_secret_is_rejected_offline() {
+		// An empty preamble matches unconditionally, so a gate built on it is no gate. Caught
+		// at construction, before any Tor launch, rather than silently admitting everyone.
+		let err = SharedSecretAuth::new(Vec::new()).err().expect("an empty secret must be rejected");
+		assert!(err.to_string().contains("must not be empty"), "unexpected error: {err}");
+		let auth = SharedSecretAuth::new(b"s".to_vec()).expect("a one-byte secret is the smallest gate");
+		assert_eq!(auth.preamble_len(), 1);
+	}
+
+	#[tokio::test]
+	async fn the_correct_secret_admits_and_strips_the_preamble() {
+		let (backend, served) = backend();
+		let secret = b"open-sesame";
+		let gate = AuthGate::new(backend, SharedSecretAuth::new(secret.to_vec()).expect("secret"));
+		let (stream, mut test_side) = pipe();
+
+		let serve = tokio::spawn(async move { gate.serve(stream).await });
+		// The client sends the secret, then its real payload.
+		test_side.write_all(secret).await.expect("write secret");
+		test_side.write_all(b"GET / HTTP/1.0\r\n\r\n").await.expect("write payload");
+		test_side.shutdown().await.expect("shutdown");
+		let mut echoed = Vec::new();
+		test_side.read_to_end(&mut echoed).await.expect("read echo");
+
+		serve.await.expect("task").expect("the correct secret admits");
+		assert_eq!(served.load(Ordering::SeqCst), 1, "the backend must serve an authenticated stream");
+		assert_eq!(echoed, b"GET / HTTP/1.0\r\n\r\n", "the backend must see the payload with the secret stripped");
+	}
+
+	#[tokio::test]
+	async fn a_wrong_secret_is_refused_and_never_reaches_the_backend() {
+		let (backend, served) = backend();
+		let gate = AuthGate::new(backend, SharedSecretAuth::new(b"open-sesame".to_vec()).expect("secret"));
+		let (stream, mut test_side) = pipe();
+
+		let serve = tokio::spawn(async move { gate.serve(stream).await });
+		// Same length as the secret so the read completes, but wrong content.
+		test_side.write_all(b"open-samsae").await.expect("write wrong secret");
+		test_side.write_all(b"payload").await.expect("write payload");
+		test_side.shutdown().await.expect("shutdown");
+
+		let err = serve.await.expect("task").expect_err("a wrong secret must be refused");
+		assert!(err.to_string().contains("refused"), "unexpected error: {err}");
+		assert_eq!(served.load(Ordering::SeqCst), 0, "a wrong secret must never reach the backend");
+	}
+
+	#[tokio::test]
+	async fn a_truncated_preamble_fails_closed() {
+		// The peer connects and sends fewer bytes than the secret, then closes. read_exact
+		// cannot complete, so the authorizer errors and AuthGate fails closed.
+		let (backend, served) = backend();
+		let gate = AuthGate::new(backend, SharedSecretAuth::new(b"open-sesame".to_vec()).expect("secret"));
+		let (stream, mut test_side) = pipe();
+
+		let serve = tokio::spawn(async move { gate.serve(stream).await });
+		test_side.write_all(b"open").await.expect("write partial secret");
+		test_side.shutdown().await.expect("close early");
+
+		let err = serve.await.expect("task").expect_err("a truncated preamble must fail closed");
+		assert!(format!("{err:#}").contains("auth preamble"), "the preamble-read cause must be carried: {err:#}");
+		assert_eq!(served.load(Ordering::SeqCst), 0, "a truncated preamble must never reach the backend");
+	}
+
+	#[tokio::test]
+	async fn a_secret_that_is_a_prefix_of_the_sent_bytes_still_admits_exactly_its_length() {
+		// Guards the boundary: only `secret.len()` bytes are consumed as the preamble, so a
+		// secret that happens to be a prefix of a longer token admits and leaves the rest —
+		// including the token's tail — for the backend. (An authorizer that greedily read
+		// "as much as looks like the secret" would corrupt the backend stream.)
+		let (backend, served) = backend();
+		let gate = AuthGate::new(backend, SharedSecretAuth::new(b"key".to_vec()).expect("secret"));
+		let (stream, mut test_side) = pipe();
+
+		let serve = tokio::spawn(async move { gate.serve(stream).await });
+		test_side.write_all(b"keyboard").await.expect("write");
+		test_side.shutdown().await.expect("shutdown");
+		let mut echoed = Vec::new();
+		test_side.read_to_end(&mut echoed).await.expect("read echo");
+
+		serve.await.expect("task").expect("admitted");
+		assert_eq!(served.load(Ordering::SeqCst), 1);
+		assert_eq!(echoed, b"board", "only the secret's length is stripped; the rest reaches the backend");
 	}
 }

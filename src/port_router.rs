@@ -42,6 +42,59 @@ impl<T: AsyncRead + AsyncWrite + Send + Unpin> AsyncStream for T {}
 /// across the multithreaded runtime.
 pub type ServeFuture = Pin<Box<dyn Future<Output = Result<()>> + Send + 'static>>;
 
+/// What protections a [`StreamHandler`] applies to the streams it serves — the
+/// operator-facing summary that keeps the raw-port exposure warning honest.
+///
+/// A bare raw handler (e.g. [`RawTcpHandler`](crate::RawTcpHandler)) applies none: its
+/// stream goes straight to the backend. The wrapper handlers report what they add and
+/// merge in whatever they wrap, so a `ConnectionLimit<AuthGate<RawTcpHandler>>` reports
+/// *both* a limit and an authorizer. [`PortRouter::exposures`] reads this off each
+/// registered handler so `serve()`'s launch warning can say "this raw port is gated by an
+/// authorizer" instead of blanket-claiming the whole defence stack is bypassed.
+///
+/// Non-exhaustive: more protection kinds (a per-port TLS wrapper, say) may be reported in
+/// future without a breaking change.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct HandlerProtection {
+	/// A concurrency cap is in force, with this maximum (see
+	/// [`ConnectionLimit`](crate::ConnectionLimit)).
+	pub connection_limit: Option<usize>,
+	/// A [`StreamAuthorizer`](crate::StreamAuthorizer) must approve a connection before
+	/// the backend sees it (see [`AuthGate`](crate::AuthGate)).
+	pub authorized: bool,
+}
+
+impl HandlerProtection {
+	/// A handler that applies no protections of its own — the default for a bare raw
+	/// handler.
+	#[must_use]
+	pub const fn none() -> Self {
+		Self { connection_limit: None, authorized: false }
+	}
+
+	/// Whether any protection at all is in force.
+	#[must_use]
+	pub const fn is_protected(&self) -> bool {
+		self.authorized || self.connection_limit.is_some()
+	}
+
+	/// A human phrase listing the protections in force, or `None` if there are none —
+	/// e.g. `"a stream authorizer; a connection limit of 8"`. Used to annotate the
+	/// exposure warning.
+	#[must_use]
+	pub fn describe(&self) -> Option<String> {
+		let mut parts = Vec::new();
+		if self.authorized {
+			parts.push("a stream authorizer".to_string());
+		}
+		if let Some(max) = self.connection_limit {
+			parts.push(format!("a connection limit of {max}"));
+		}
+		if parts.is_empty() { None } else { Some(parts.join("; ")) }
+	}
+}
+
 /// Serves a single accepted stream for a caller-registered port.
 ///
 /// This is the versatility layer that lets onyums tunnel an arbitrary protocol
@@ -60,6 +113,17 @@ pub trait StreamHandler: Send + Sync {
 	/// security (a raw handler is not wrapped in the built-in TLS the HTTP handler
 	/// uses).
 	fn serve(&self, stream: OnionStream) -> ServeFuture;
+
+	/// What protections this handler applies, for the operator-facing exposure report
+	/// ([`PortRouter::exposures`]).
+	///
+	/// Defaults to [`HandlerProtection::none`] — a bare handler hands its stream straight
+	/// to the backend. A wrapper (like [`ConnectionLimit`](crate::ConnectionLimit) or
+	/// [`AuthGate`](crate::AuthGate)) overrides this to report what it adds *and* merge in
+	/// what it wraps, so nesting composes.
+	fn protection(&self) -> HandlerProtection {
+		HandlerProtection::none()
+	}
 }
 
 /// What the rendezvous loop should do with a BEGIN cell for a given port — the
@@ -158,6 +222,10 @@ pub struct RawPortExposure {
 	pub port: u16,
 	/// The well-known sensitive service on this port, if any (e.g. `"SSH"` for 22).
 	pub service: Option<&'static str>,
+	/// What protections the handler on this port applies of its own accord (a connection
+	/// limit, a stream authorizer). The HTTP-path defences (Skin/WAF/rate-limit/TLS) still
+	/// do not apply regardless — this only reports what the raw handler itself adds back.
+	pub protection: HandlerProtection,
 }
 
 impl RawPortExposure {
@@ -174,12 +242,20 @@ impl RawPortExposure {
 	/// line is specific rather than boilerplate to scroll past.
 	#[must_use]
 	pub fn message(&self) -> String {
-		let Self { port, service } = *self;
+		let Self { port, service, protection } = *self;
 		let bypass = format!("port {port} serves a raw handler: the Skin gate (PoW/challenge), the WAF, rate limiting, and the built-in TLS do NOT apply to it. The onion circuit still encrypts and authenticates the channel; everything above it is the backend protocol's job.");
-		match service {
+		let mut message = match service {
 			Some(service) => format!("{bypass} Port {port} is the well-known {service} port — if that is deliberate, ensure {service} does its own authentication, since restricted discovery controls who can *find* the service, not who may use it."),
 			None => bypass,
+		};
+		// Report what the handler *does* add back, so the warning does not over-state the
+		// exposure of a port that is, say, behind a shared-secret authorizer.
+		if let Some(applied) = protection.describe() {
+			use std::fmt::Write as _;
+			// Writing to a String is infallible.
+			let _ = write!(message, " This handler does apply: {applied}.");
 		}
+		message
 	}
 }
 
@@ -244,7 +320,7 @@ impl PortRouter {
 	/// network. Ordered so the output is deterministic (the backing map is not).
 	#[must_use]
 	pub fn exposures(&self) -> Vec<RawPortExposure> {
-		let mut exposures: Vec<_> = self.handlers.keys().map(|&port| RawPortExposure { port, service: well_known_sensitive_service(port) }).collect();
+		let mut exposures: Vec<_> = self.handlers.iter().map(|(&port, handler)| RawPortExposure { port, service: well_known_sensitive_service(port), protection: handler.protection() }).collect();
 		exposures.sort_unstable_by_key(|e| e.port);
 		exposures
 	}
@@ -499,5 +575,58 @@ mod tests {
 		let handlers: Vec<(u16, Arc<dyn StreamHandler>)> = vec![(22, handler()), (2222, handler()), (6379, handler())];
 		let router = PortRouter::from_registrations(handlers).expect("registerable");
 		assert_eq!(router.exposures().len(), router.len(), "every registered raw port must produce an exposure");
+	}
+
+	// ---- Handler protection reporting (Phase 2 — raw-port controls). ----
+
+	/// A handler that reports a fixed protection, so the exposure plumbing can be tested
+	/// without pulling in the real wrapper types.
+	struct ProtectedHandler(HandlerProtection);
+	impl StreamHandler for ProtectedHandler {
+		fn serve(&self, _stream: OnionStream) -> ServeFuture {
+			Box::pin(async { Ok(()) })
+		}
+		fn protection(&self) -> HandlerProtection {
+			self.0
+		}
+	}
+
+	#[test]
+	fn handler_protection_describes_what_is_in_force() {
+		assert!(HandlerProtection::none().describe().is_none(), "no protection describes to nothing");
+		assert!(!HandlerProtection::none().is_protected());
+
+		let authed = HandlerProtection { authorized: true, ..HandlerProtection::none() };
+		assert!(authed.is_protected());
+		assert_eq!(authed.describe().as_deref(), Some("a stream authorizer"));
+
+		let limited = HandlerProtection { connection_limit: Some(4), ..HandlerProtection::none() };
+		assert_eq!(limited.describe().as_deref(), Some("a connection limit of 4"));
+
+		let both = HandlerProtection { authorized: true, connection_limit: Some(8) };
+		assert_eq!(both.describe().as_deref(), Some("a stream authorizer; a connection limit of 8"));
+	}
+
+	#[test]
+	fn a_bare_handler_reports_no_protection_and_no_note() {
+		let mut router = PortRouter::new();
+		router.register(9735, handler()).expect("register");
+		let exposure = router.exposures()[0];
+		assert!(!exposure.protection.is_protected(), "the default handler adds no protection");
+		assert!(!exposure.message().contains("This handler does apply"), "a bare handler gets no protection note: {}", exposure.message());
+	}
+
+	#[test]
+	fn exposures_report_and_annotate_a_handlers_protections() {
+		let mut router = PortRouter::new();
+		let protection = HandlerProtection { authorized: true, connection_limit: Some(8) };
+		router.register(16379, Arc::new(ProtectedHandler(protection))).expect("register");
+		let exposure = router.exposures()[0];
+		assert_eq!(exposure.protection, protection, "exposures must carry the handler's reported protection");
+		let message = exposure.message();
+		// The bypass warning is still present — the HTTP-path defences genuinely do not apply.
+		assert!(message.contains("do NOT apply"), "the bypass warning must remain: {message}");
+		// But the note now tells the operator what the handler does add back.
+		assert!(message.contains("This handler does apply: a stream authorizer; a connection limit of 8"), "the protection note must be present and accurate: {message}");
 	}
 }

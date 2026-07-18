@@ -27,13 +27,15 @@
 //! a limit exists to prevent. A client that is refused can retry; one stuck in an
 //! invisible queue cannot tell the difference between slow and dead.
 
-use std::sync::Arc;
+use std::sync::{
+	Arc, atomic::{AtomicU64, Ordering}
+};
 
 use anyhow::{Result, bail};
 use tokio::sync::Semaphore;
 use tracing::{Level, event};
 
-use crate::port_router::{OnionStream, ServeFuture, StreamHandler};
+use crate::port_router::{HandlerProtection, OnionStream, ServeFuture, StreamHandler};
 
 /// Caps how many connections a raw port serves at once, refusing the rest.
 ///
@@ -48,6 +50,8 @@ pub struct ConnectionLimit<H> {
 	inner: Arc<H>,
 	permits: Arc<Semaphore>,
 	max: usize,
+	admitted: Arc<AtomicU64>,
+	refused: Arc<AtomicU64>,
 }
 
 impl<H> ConnectionLimit<H> {
@@ -62,13 +66,33 @@ impl<H> ConnectionLimit<H> {
 		if max == 0 {
 			bail!("a connection limit of 0 would refuse every connection; use at least 1, or don't register the port");
 		}
-		Ok(Self { inner: Arc::new(inner), permits: Arc::new(Semaphore::new(max)), max })
+		Ok(Self { inner: Arc::new(inner), permits: Arc::new(Semaphore::new(max)), max, admitted: Arc::new(AtomicU64::new(0)), refused: Arc::new(AtomicU64::new(0)) })
 	}
 
 	/// The configured cap.
 	#[must_use]
 	pub const fn max(&self) -> usize {
 		self.max
+	}
+
+	/// How many connections this limiter has admitted over its lifetime (cumulative).
+	///
+	/// A monotonic counter for a health endpoint or rate computation, paired with
+	/// [`refused`](Self::refused); together they show how often the cap is actually biting.
+	#[must_use]
+	pub fn admitted(&self) -> u64 {
+		self.admitted.load(Ordering::Relaxed)
+	}
+
+	/// How many connections this limiter has refused at capacity over its lifetime
+	/// (cumulative).
+	///
+	/// Unlike a `WARN` log line, this is something an operator can graph and alert on: a
+	/// climbing refusal count is either legitimate load outgrowing the cap or a connection
+	/// flood being turned away — either way, a signal worth watching.
+	#[must_use]
+	pub fn refused(&self) -> u64 {
+		self.refused.load(Ordering::Relaxed)
 	}
 
 	/// How many connections are being served right now.
@@ -92,6 +116,8 @@ impl<H: StreamHandler + 'static> StreamHandler for ConnectionLimit<H> {
 		let permits = Arc::clone(&self.permits);
 		let inner = Arc::clone(&self.inner);
 		let max = self.max;
+		let admitted = Arc::clone(&self.admitted);
+		let refused = Arc::clone(&self.refused);
 		Box::pin(async move {
 			// `try_acquire_owned`, not `acquire_owned`: at capacity we refuse rather than
 			// queue (see the module docs).
@@ -99,15 +125,25 @@ impl<H: StreamHandler + 'static> StreamHandler for ConnectionLimit<H> {
 				// Dropping the stream closes it, which is the refusal the peer observes.
 				// Explicit rather than incidental, since this is the security-relevant act.
 				drop(stream);
+				refused.fetch_add(1, Ordering::Relaxed);
 				event!(Level::WARN, "Refused a raw-port connection: already serving the configured maximum of {max} concurrent connection(s).");
 				bail!("connection limit reached: {max} concurrent connection(s) already in flight");
 			};
+			admitted.fetch_add(1, Ordering::Relaxed);
 			let result = inner.serve(stream).await;
 			// Held across the whole connection, so the permit returns however the
 			// connection ended — including on an error from the inner handler.
 			drop(permit);
 			result
 		})
+	}
+
+	fn protection(&self) -> HandlerProtection {
+		// Report the cap and merge in whatever the wrapped handler already protects, so a
+		// ConnectionLimit<AuthGate<_>> reports both.
+		let mut protection = self.inner.protection();
+		protection.connection_limit = Some(self.max);
+		protection
 	}
 }
 
@@ -225,6 +261,36 @@ mod tests {
 	}
 
 	#[tokio::test]
+	async fn admitted_and_refused_counters_track_outcomes() {
+		// The counters back a health endpoint: a climbing `refused()` is the cap biting,
+		// which a WARN log alone cannot be graphed or alerted on.
+		let (limit, started, release) = parking();
+		let limit = Arc::new(limit);
+		assert_eq!(limit.admitted(), 0);
+		assert_eq!(limit.refused(), 0);
+
+		let mut held = Vec::new();
+		for _ in 0..2 {
+			let l = Arc::clone(&limit);
+			held.push(tokio::spawn(async move { l.serve(stream()).await }));
+		}
+		while started.load(Ordering::SeqCst) < 2 {
+			tokio::task::yield_now().await;
+		}
+		assert_eq!(limit.admitted(), 2, "both under-cap connections are counted as admitted");
+
+		// The third, over capacity, is refused — counted, and not counted as an admit.
+		let _ = limit.serve(stream()).await;
+		assert_eq!(limit.refused(), 1, "the over-capacity connection is counted as refused");
+		assert_eq!(limit.admitted(), 2, "a refusal is not an admit");
+
+		release.notify_waiters();
+		for h in held {
+			h.await.expect("task").expect("held");
+		}
+	}
+
+	#[tokio::test]
 	async fn a_finished_connection_returns_its_permit() {
 		// Without this the port would degrade to permanently refusing everything after
 		// `max` lifetime connections — a limiter that becomes a denial of service.
@@ -256,6 +322,17 @@ mod tests {
 		}
 		release.notify_waiters();
 		next.await.expect("task").expect("a connection after the flush is served");
+	}
+
+	#[test]
+	fn a_connection_limit_reports_its_cap_as_a_protection() {
+		// The launch-time exposure warning reads this off the handler, so a raw port behind
+		// a limit is not warned about as if it had none.
+		let limit = ConnectionLimit::new(RejectAll, 5).expect("limit");
+		let protection = limit.protection();
+		assert_eq!(protection.connection_limit, Some(5), "the cap must be reported");
+		assert!(!protection.authorized, "a bare ConnectionLimit does not authorize");
+		assert_eq!(protection.describe().as_deref(), Some("a connection limit of 5"));
 	}
 
 	#[tokio::test]

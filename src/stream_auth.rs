@@ -32,7 +32,9 @@
 //! gate, so the safe default when it cannot make up its mind is to deny, never to let the
 //! stream through ungated.
 
-use std::sync::Arc;
+use std::sync::{
+	Arc, atomic::{AtomicU64, Ordering}
+};
 
 use anyhow::{Result, bail};
 use subtle::ConstantTimeEq;
@@ -107,13 +109,36 @@ pub trait StreamAuthorizer: Send + Sync {
 pub struct AuthGate<H> {
 	inner: Arc<H>,
 	authorizer: Arc<dyn StreamAuthorizer>,
+	admitted: Arc<AtomicU64>,
+	refused: Arc<AtomicU64>,
 }
 
 impl<H> AuthGate<H> {
 	/// Gate `inner` behind `authorizer`: every accepted stream must be
 	/// [`Admit`](AuthOutcome::Admit)ted before `inner` serves it.
 	pub fn new<A: StreamAuthorizer + 'static>(inner: H, authorizer: A) -> Self {
-		Self { inner: Arc::new(inner), authorizer: Arc::new(authorizer) }
+		Self { inner: Arc::new(inner), authorizer: Arc::new(authorizer), admitted: Arc::new(AtomicU64::new(0)), refused: Arc::new(AtomicU64::new(0)) }
+	}
+
+	/// How many streams this gate has admitted to the backend over its lifetime
+	/// (cumulative).
+	///
+	/// Paired with [`refused`](Self::refused) for a health endpoint: the ratio is how often
+	/// a connection to this port cleared authorization.
+	#[must_use]
+	pub fn admitted(&self) -> u64 {
+		self.admitted.load(Ordering::Relaxed)
+	}
+
+	/// How many streams this gate has refused over its lifetime — a clean rejection *or*
+	/// an authorizer error, both of which fail closed (cumulative).
+	///
+	/// A climbing count on a shared-secret gate is a stream of connections arriving without
+	/// the secret: a scan, a misconfigured client, or an attacker probing the port. Unlike
+	/// the `WARN` log, it is something to graph and alert on.
+	#[must_use]
+	pub fn refused(&self) -> u64 {
+		self.refused.load(Ordering::Relaxed)
 	}
 }
 
@@ -121,18 +146,25 @@ impl<H: StreamHandler + 'static> StreamHandler for AuthGate<H> {
 	fn serve(&self, stream: OnionStream) -> ServeFuture {
 		let inner = Arc::clone(&self.inner);
 		let authorizer = Arc::clone(&self.authorizer);
+		let admitted = Arc::clone(&self.admitted);
+		let refused = Arc::clone(&self.refused);
 		Box::pin(async move {
 			match authorizer.authorize(stream).await {
-				Ok(AuthOutcome::Admit(stream)) => inner.serve(stream).await,
+				Ok(AuthOutcome::Admit(stream)) => {
+					admitted.fetch_add(1, Ordering::Relaxed);
+					inner.serve(stream).await
+				}
 				Ok(AuthOutcome::Refuse) => {
 					// A clean, expected rejection. The stream was dropped by the authorizer
 					// (it took ownership and did not hand it back), which closes it.
+					refused.fetch_add(1, Ordering::Relaxed);
 					event!(Level::WARN, "Refused a raw-port connection: the stream authorizer rejected it before the backend.");
 					bail!("stream authorizer refused the connection");
 				}
 				Err(err) => {
 					// An authorizer that errored fails closed — the backend never sees the
 					// stream — but the cause is carried for the operator's log.
+					refused.fetch_add(1, Ordering::Relaxed);
 					event!(Level::WARN, "Refused a raw-port connection: the stream authorizer errored: {err:#}");
 					Err(err.context("stream authorizer failed; refusing the connection"))
 				}
@@ -448,6 +480,38 @@ mod tests {
 		serve.await.expect("task").expect("admitted");
 		assert_eq!(served.load(Ordering::SeqCst), 1);
 		assert_eq!(echoed, b"board", "only the secret's length is stripped; the rest reaches the backend");
+	}
+
+	#[tokio::test]
+	async fn auth_gate_counts_refusals() {
+		// A refusal — clean or via an authorizer error — is counted, so a flood of
+		// unauthenticated probes shows up as a graphable number, not just log lines.
+		let gate = Arc::new(AuthGate::new(backend().0, RefuseAll));
+		assert_eq!(gate.refused(), 0);
+		assert_eq!(gate.admitted(), 0);
+
+		for expected in 1..=3 {
+			let (stream, _test_side) = pipe();
+			let _ = gate.serve(stream).await;
+			assert_eq!(gate.refused(), expected, "each refusal increments the counter");
+		}
+		assert_eq!(gate.admitted(), 0, "no refusal counts as an admit");
+	}
+
+	#[tokio::test]
+	async fn auth_gate_counts_admits() {
+		let gate = Arc::new(AuthGate::new(backend().0, AdmitAll));
+		let g = Arc::clone(&gate);
+		let (stream, mut test_side) = pipe();
+		let serve = tokio::spawn(async move { g.serve(stream).await });
+		test_side.write_all(b"payload").await.expect("write");
+		test_side.shutdown().await.expect("shutdown");
+		let mut echoed = Vec::new();
+		test_side.read_to_end(&mut echoed).await.expect("read echo");
+		serve.await.expect("task").expect("admitted");
+
+		assert_eq!(gate.admitted(), 1, "an admitted stream is counted");
+		assert_eq!(gate.refused(), 0);
 	}
 
 	#[test]

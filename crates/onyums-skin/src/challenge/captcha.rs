@@ -1,17 +1,40 @@
-//! The text core of the server-rendered, no-JS CAPTCHA fallback.
+//! The server-rendered, no-JS CAPTCHA fallback.
 //!
-//! **This is one slice of the planned `CaptchaChallenge`, not the whole thing.** It owns the part
-//! that has to be *correct* — generating the puzzle text and deciding whether a submitted
-//! answer matches it. Rendering that text to a distorted image, and the [`Challenge`]
-//! implementation that serves it, are the next slice; there is deliberately no
-//! `impl Challenge` here yet, because a challenge that cannot present itself is not one.
-//! See the crate `ROADMAP.md` (Phase 1, `CaptchaChallenge`).
+//! Three layers, in increasing distance from "must be correct":
+//!
+//! - [`CaptchaText`] — the puzzle *answer*: a confusable-free character set, generation,
+//!   and the case/whitespace-folding match. This is the part that decides who clears the
+//!   gate, so it is the part pinned hardest by tests.
+//! - The renderer ([`CaptchaText::to_png`]) — the answer drawn as a distorted image OCR
+//!   struggles with but a human reads.
+//! - [`CaptchaChallenge`] — the [`Challenge`] that presents the image (a no-JS HTML form)
+//!   and verifies the typed answer. It is **stateless in the answer**: the answer never
+//!   reaches the client in the clear, only inside an encrypted-then-MAC'd envelope the
+//!   client echoes back, so no server-side puzzle map is needed to remember it.
+//!
+//! This is the no-JS tier of a [`ChallengeChain`](super::ChallengeChain): [`needs_js`] is
+//! `false`, so a Tor "Safer"/"Safest" client (no JS, no WASM) that cannot run the PoW
+//! solver falls through to a CAPTCHA before the last-resort patience tarpit. It finally
+//! gives [`ClearanceLevel::Captcha`](crate::clearance::ClearanceLevel::Captcha) a minter.
 //!
 //! [`Challenge`]: super::Challenge
+//! [`needs_js`]: super::Challenge::needs_js
 
+use std::{
+	collections::HashMap, sync::Mutex, time::{Duration, SystemTime, UNIX_EPOCH}
+};
+
+use axum::{
+	http::{StatusCode, request::Parts}, response::{Html, IntoResponse, Response}
+};
+use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+use hmac::{Hmac, Mac};
 use rand::RngCore;
+use sha2::Sha256;
 
-use super::png::GrayImage;
+use super::{Challenge, Gate, png::GrayImage};
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// The character set puzzle text is drawn from: **uppercase letters and digits, minus every
 /// visually confusable pair**.
@@ -325,6 +348,226 @@ fn add_noise(mut img: GrayImage, rng: &mut impl RngCore) -> GrayImage {
 	img
 }
 
+// --- The Challenge: present the image, verify the typed answer -------------------------
+
+/// Default number of characters in a puzzle. Six confusable-free glyphs is ~26 bits against
+/// blind guessing ([`entropy_bits`]) — ample, since a CAPTCHA loses to OCR, not to guessing.
+const DEFAULT_LEN: usize = 6;
+
+/// Default lifetime of an issued puzzle: long enough for a human to read and type,
+/// short enough that a solved envelope goes stale quickly.
+const DEFAULT_TTL: Duration = Duration::from_secs(300);
+
+/// Default Skin-owned route the CAPTCHA form submits its answer to.
+const DEFAULT_SUBMIT_PATH: &str = "/.skin/captcha";
+
+/// Length of the random per-puzzle nonce, in bytes.
+const NONCE_LEN: usize = 16;
+
+/// A no-JS, server-rendered CAPTCHA [`Challenge`].
+///
+/// **Stateless in the answer.** The puzzle answer is not remembered server-side; instead it
+/// is *encrypted* under a key derived from the challenge secret, the ciphertext and an
+/// expiry are packed into an envelope, that envelope is MAC'd, and it rides in a hidden
+/// form field. The rendered image is drawn from the same answer. On submission the client
+/// echoes the envelope plus the characters they typed; [`verify`](Challenge::verify) checks
+/// the MAC, expiry, and single-use record, decrypts the answer from the *verified* envelope,
+/// and compares. The client therefore cannot read the answer out of the envelope (it is
+/// encrypted, not merely signed — the distinction a plain [`super::pow`]-style signed
+/// envelope would miss), tamper with it, or replay a stale one.
+///
+/// **No new dependency.** The envelope crypto is built from the `hmac` + `sha2` the crate
+/// already carries: an HMAC-derived keystream (HKDF-Expand-style) encrypts the short answer,
+/// and a second independent HMAC key authenticates the whole payload (encrypt-then-MAC).
+///
+/// **Single-use**, exactly as [`PowChallenge`](super::pow::PowChallenge): a solved envelope
+/// clears at most once (keyed on its nonce), so one human solve cannot be replayed to mint
+/// an unbounded number of clearances and rate-limit buckets. The map is bounded by the
+/// puzzles outstanding within one TTL window and pruned opportunistically.
+pub struct CaptchaChallenge {
+	secret: Vec<u8>,
+	len: usize,
+	ttl: Duration,
+	submit_path: String,
+	/// Nonces of envelopes already redeemed, with the instant their entry can be pruned.
+	consumed: Mutex<HashMap<[u8; NONCE_LEN], SystemTime>>,
+}
+
+impl CaptchaChallenge {
+	/// Build a CAPTCHA challenge signing/encrypting puzzles with `secret`, at the default
+	/// length (6) and TTL (5 minutes).
+	pub fn new(secret: impl Into<Vec<u8>>) -> Self {
+		Self { secret: secret.into(), len: DEFAULT_LEN, ttl: DEFAULT_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
+	}
+
+	/// Override the number of characters in a puzzle (clamped to at least 1).
+	#[must_use]
+	pub fn with_len(mut self, len: usize) -> Self {
+		self.len = len.max(1);
+		self
+	}
+
+	/// Override how long an issued puzzle stays valid (default 5 minutes).
+	#[must_use]
+	pub fn with_ttl(mut self, ttl: Duration) -> Self {
+		self.ttl = ttl;
+		self
+	}
+
+	/// Override the route the form submits answers to (default `/.skin/captcha`).
+	#[must_use]
+	pub fn with_submit_path(mut self, path: impl Into<String>) -> Self {
+		self.submit_path = path.into();
+		self
+	}
+
+	/// A subkey derived from the secret for `context`, so encryption and authentication use
+	/// independent keys (never the raw secret directly).
+	fn subkey(&self, context: &[u8]) -> [u8; 32] {
+		let mut mac = HmacSha256::new_from_slice(&self.secret).expect("HMAC accepts a key of any length");
+		mac.update(context);
+		mac.finalize().into_bytes().into()
+	}
+
+	/// An HKDF-Expand-style keystream of `n` bytes: `HMAC(enc_key, nonce ‖ counter)` blocks
+	/// concatenated. Unbounded in `n`, so an over-long answer is still fully covered.
+	fn keystream(enc_key: &[u8; 32], nonce: &[u8; NONCE_LEN], n: usize) -> Vec<u8> {
+		let mut out = Vec::with_capacity(n);
+		let mut counter: u32 = 0;
+		while out.len() < n {
+			let mut mac = HmacSha256::new_from_slice(enc_key).expect("HMAC accepts a key of any length");
+			mac.update(nonce);
+			mac.update(&counter.to_be_bytes());
+			out.extend_from_slice(&mac.finalize().into_bytes());
+			counter += 1;
+		}
+		out.truncate(n);
+		out
+	}
+
+	/// Encrypt `answer` under a fresh nonce and pack `nonce ‖ expiry ‖ ciphertext` into the
+	/// MAC'd wire envelope `base64url(payload).base64url(tag)`.
+	fn seal(&self, answer: &str) -> String {
+		let mut nonce = [0u8; NONCE_LEN];
+		rand::rng().fill_bytes(&mut nonce);
+		let enc_key = self.subkey(b"onyums-skin captcha enc v1");
+		let keystream = Self::keystream(&enc_key, &nonce, answer.len());
+		let ciphertext: Vec<u8> = answer.bytes().zip(keystream).map(|(b, k)| b ^ k).collect();
+
+		let expires = SystemTime::now() + self.ttl;
+		let mut payload = Vec::with_capacity(NONCE_LEN + 8 + ciphertext.len());
+		payload.extend_from_slice(&nonce);
+		payload.extend_from_slice(&unix_secs(expires).to_be_bytes());
+		payload.extend_from_slice(&ciphertext);
+
+		let tag = self.tag(&payload);
+		format!("{}.{}", URL_SAFE_NO_PAD.encode(&payload), URL_SAFE_NO_PAD.encode(tag))
+	}
+
+	/// Recover `(nonce, answer, expiry)` from a verified envelope, or `None` if the MAC is
+	/// wrong, the format is malformed, or the puzzle has expired.
+	fn open(&self, envelope: &str) -> Option<([u8; NONCE_LEN], String, SystemTime)> {
+		let (payload_b64, tag_b64) = envelope.split_once('.')?;
+		let payload = URL_SAFE_NO_PAD.decode(payload_b64).ok()?;
+		let tag = URL_SAFE_NO_PAD.decode(tag_b64).ok()?;
+		if payload.len() < NONCE_LEN + 8 {
+			return None;
+		}
+		// Constant-time authentication before trusting or decrypting any field.
+		let mut mac = HmacSha256::new_from_slice(&self.subkey(b"onyums-skin captcha mac v1")).expect("HMAC accepts a key of any length");
+		mac.update(&payload);
+		mac.verify_slice(&tag).ok()?;
+
+		let mut nonce = [0u8; NONCE_LEN];
+		nonce.copy_from_slice(&payload[0..NONCE_LEN]);
+		let expires = from_unix_secs(u64::from_be_bytes(payload[NONCE_LEN..NONCE_LEN + 8].try_into().ok()?));
+		if expires <= SystemTime::now() {
+			return None;
+		}
+
+		let ciphertext = &payload[NONCE_LEN + 8..];
+		let enc_key = self.subkey(b"onyums-skin captcha enc v1");
+		let keystream = Self::keystream(&enc_key, &nonce, ciphertext.len());
+		let plain: Vec<u8> = ciphertext.iter().zip(keystream).map(|(c, k)| c ^ k).collect();
+		let answer = String::from_utf8(plain).ok()?;
+		Some((nonce, answer, expires))
+	}
+
+	/// `HMAC-SHA256(mac_key, payload)` over the envelope payload.
+	fn tag(&self, payload: &[u8]) -> Vec<u8> {
+		let mut mac = HmacSha256::new_from_slice(&self.subkey(b"onyums-skin captcha mac v1")).expect("HMAC accepts a key of any length");
+		mac.update(payload);
+		mac.finalize().into_bytes().to_vec()
+	}
+
+	/// Record `nonce` as redeemed, returning `false` if it was already redeemed (a replay).
+	/// Expired entries are pruned first so the map stays bounded by outstanding puzzles.
+	fn consume(&self, nonce: [u8; NONCE_LEN], expires: SystemTime) -> bool {
+		let mut consumed = self.consumed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+		let now = SystemTime::now();
+		consumed.retain(|_, exp| *exp > now);
+		if consumed.contains_key(&nonce) {
+			return false;
+		}
+		consumed.insert(nonce, expires);
+		true
+	}
+
+	/// The no-JS interstitial: the CAPTCHA image (inline `data:` URI, so no second route or
+	/// server state) and a plain GET form that echoes the envelope and the typed answer.
+	fn page(&self, image_png: &[u8], envelope: &str) -> Response {
+		let data_uri = format!("data:image/png;base64,{}", STANDARD.encode(image_png));
+		let body = format!(
+			"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Verify you are human</title>\n</head>\n<body>\n<h1>Verify you are human</h1>\n<p>Type the characters shown in the image, then choose Continue. This works without JavaScript; letters are not case-sensitive.</p>\n<img src=\"{data_uri}\" alt=\"CAPTCHA challenge\">\n<form method=\"GET\" action=\"{}\">\n<input type=\"hidden\" name=\"puzzle\" value=\"{envelope}\">\n<input type=\"text\" name=\"answer\" autocomplete=\"off\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" aria-label=\"Characters shown in the image\">\n<button type=\"submit\">Continue</button>\n</form>\n</body>\n</html>\n",
+			self.submit_path
+		);
+		(StatusCode::SERVICE_UNAVAILABLE, Html(body)).into_response()
+	}
+}
+
+/// Read a single query parameter's raw value from the request URI.
+fn query_param<'a>(req: &'a Parts, key: &str) -> Option<&'a str> {
+	let query = req.uri.query()?;
+	query.split('&').find_map(|pair| pair.split_once('=').filter(|(k, _)| *k == key).map(|(_, v)| v))
+}
+
+impl Challenge for CaptchaChallenge {
+	fn issue(&self, _req: &Parts) -> Gate {
+		let text = CaptchaText::generate(self.len);
+		let envelope = self.seal(text.as_str());
+		Gate::Present(self.page(&text.to_png(), &envelope))
+	}
+
+	fn verify(&self, req: &Parts) -> bool {
+		let (Some(envelope), Some(answer)) = (query_param(req, "puzzle"), query_param(req, "answer")) else {
+			return false;
+		};
+		let Some((nonce, expected, expires)) = self.open(envelope) else {
+			return false;
+		};
+		if !CaptchaText(expected).matches(answer) {
+			return false;
+		}
+		// Single-use: a correct answer clears exactly once, so a solved envelope cannot be
+		// replayed to mint clearances beyond the one human solve it represents.
+		self.consume(nonce, expires)
+	}
+
+	fn needs_js(&self) -> bool {
+		false
+	}
+}
+
+/// Seconds since the Unix epoch, saturating at 0 for pre-epoch times.
+fn unix_secs(t: SystemTime) -> u64 {
+	t.duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
+}
+
+/// Inverse of [`unix_secs`].
+fn from_unix_secs(secs: u64) -> SystemTime {
+	UNIX_EPOCH + Duration::from_secs(secs)
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -498,5 +741,134 @@ mod tests {
 		let a = text.to_png();
 		let b = text.to_png();
 		assert_ne!(a, b, "two renders of the same text must differ");
+	}
+
+	// --- CaptchaChallenge ---------------------------------------------------------------
+
+	use axum::http::Request;
+
+	/// Request `Parts` whose URI carries the given query string on the submit path.
+	fn parts_with_query(query: &str) -> Parts {
+		Request::builder().uri(format!("/.skin/captcha?{query}")).body(()).unwrap().into_parts().0
+	}
+
+	fn challenge() -> CaptchaChallenge {
+		CaptchaChallenge::new(b"test-secret".to_vec())
+	}
+
+	#[test]
+	fn needs_js_is_false() {
+		// The whole point of the CAPTCHA tier: it is the no-JS fallback.
+		assert!(!challenge().needs_js());
+	}
+
+	#[tokio::test]
+	async fn issue_presents_a_no_js_image_form() {
+		use http_body_util::BodyExt;
+
+		let Gate::Present(resp) = challenge().issue(&parts_with_query("")) else {
+			panic!("the CAPTCHA challenge must present an interstitial");
+		};
+		assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+		let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+		assert!(body.contains("data:image/png;base64,"), "the page embeds the CAPTCHA image inline");
+		assert!(body.contains("action=\"/.skin/captcha\""), "the form submits to the Skin route");
+		assert!(body.contains("name=\"puzzle\""), "the envelope rides in a hidden field");
+		assert!(body.contains("name=\"answer\""), "the answer field is present");
+		assert!(!body.contains("<script"), "the no-JS fallback must not require a script");
+	}
+
+	#[test]
+	fn a_correct_answer_verifies() {
+		let chal = challenge();
+		let envelope = chal.seal("ACEF");
+		assert!(chal.verify(&parts_with_query(&format!("puzzle={envelope}&answer=ACEF"))));
+	}
+
+	#[test]
+	fn folding_holds_through_verify() {
+		// The image carries no case; a lowercase submission with stray whitespace clears.
+		let chal = challenge();
+		let envelope = chal.seal("MHWX");
+		assert!(chal.verify(&parts_with_query(&format!("puzzle={envelope}&answer=mhwx"))));
+	}
+
+	#[test]
+	fn a_wrong_answer_is_rejected() {
+		let chal = challenge();
+		let envelope = chal.seal("ACEF");
+		assert!(!chal.verify(&parts_with_query(&format!("puzzle={envelope}&answer=ACE3"))));
+	}
+
+	#[test]
+	fn a_solved_envelope_is_single_use() {
+		let chal = challenge();
+		let envelope = chal.seal("KNPR");
+		let query = format!("puzzle={envelope}&answer=KNPR");
+		assert!(chal.verify(&parts_with_query(&query)), "first solve clears");
+		assert!(!chal.verify(&parts_with_query(&query)), "the same solved envelope cannot be replayed");
+	}
+
+	#[test]
+	fn a_tampered_envelope_is_rejected() {
+		let chal = challenge();
+		let envelope = chal.seal("ACEF");
+		let (payload, tag) = envelope.split_once('.').unwrap();
+		let mut chars: Vec<char> = payload.chars().collect();
+		let last = chars.last_mut().unwrap();
+		*last = if *last == 'A' { 'B' } else { 'A' };
+		let forged: String = chars.into_iter().collect();
+		assert!(!chal.verify(&parts_with_query(&format!("puzzle={forged}.{tag}&answer=ACEF"))));
+	}
+
+	#[test]
+	fn an_expired_puzzle_is_rejected() {
+		let chal = CaptchaChallenge::new(b"sec".to_vec()).with_ttl(Duration::ZERO);
+		let envelope = chal.seal("ACEF");
+		assert!(!chal.verify(&parts_with_query(&format!("puzzle={envelope}&answer=ACEF"))), "a zero-TTL envelope is already expired on submission");
+	}
+
+	#[test]
+	fn an_envelope_from_another_secret_is_rejected() {
+		let mint = CaptchaChallenge::new(b"secret-a".to_vec());
+		let check = CaptchaChallenge::new(b"secret-b".to_vec());
+		assert!(mint.verify(&parts_with_query(&format!("puzzle={}&answer=ACEF", mint.seal("ACEF")))), "the minting store clears its own puzzle");
+		// A fresh envelope MAC'd by secret-a must not verify under secret-b.
+		assert!(!check.verify(&parts_with_query(&format!("puzzle={}&answer=ACEF", mint.seal("ACEF")))), "an envelope MAC'd by a different secret must not verify");
+	}
+
+	#[test]
+	fn the_answer_is_encrypted_not_merely_signed() {
+		// The load-bearing property: the plaintext answer must NOT be recoverable from the
+		// envelope the client holds — otherwise base64-decoding it defeats the CAPTCHA.
+		let chal = challenge();
+		let answer = "MHWXY7";
+		let envelope = chal.seal(answer);
+		let payload_b64 = envelope.split_once('.').unwrap().0;
+		let payload = URL_SAFE_NO_PAD.decode(payload_b64).unwrap();
+		// The answer bytes must not appear verbatim anywhere in the envelope payload.
+		let needle = answer.as_bytes();
+		let leaked = payload.windows(needle.len()).any(|w| w == needle);
+		assert!(!leaked, "the answer leaked into the envelope in the clear");
+		// And it round-trips back out only with the secret.
+		let (_n, recovered, _e) = chal.open(&envelope).expect("the sealer's own envelope opens");
+		assert_eq!(recovered, answer);
+	}
+
+	#[test]
+	fn missing_parameters_are_rejected() {
+		let chal = challenge();
+		let envelope = chal.seal("ACEF");
+		assert!(!chal.verify(&parts_with_query("answer=ACEF")), "no puzzle");
+		assert!(!chal.verify(&parts_with_query(&format!("puzzle={envelope}"))), "no answer");
+		assert!(!chal.verify(&Request::builder().uri("/.skin/captcha").body(()).unwrap().into_parts().0), "no query at all");
+	}
+
+	#[test]
+	fn garbage_envelope_is_rejected_without_panic() {
+		let chal = challenge();
+		for junk in ["", "no-dot", "not-base64!.also-not", "AAAA.BBBB"] {
+			assert!(!chal.verify(&parts_with_query(&format!("puzzle={junk}&answer=ACEF"))), "{junk:?} must not clear the gate");
+		}
 	}
 }

@@ -15,7 +15,7 @@
 //! This is the no-JS tier of a [`ChallengeChain`](super::ChallengeChain): [`needs_js`] is
 //! `false`, so a Tor "Safer"/"Safest" client (no JS, no WASM) that cannot run the PoW
 //! solver falls through to a CAPTCHA before the last-resort patience tarpit. It finally
-//! gives [`ClearanceLevel::Captcha`](crate::clearance::ClearanceLevel::Captcha) a minter.
+//! gives [`ClearanceLevel::Captcha`](crate::clearance::ClearanceLevel) a minter.
 //!
 //! [`Challenge`]: super::Challenge
 //! [`needs_js`]: super::Challenge::needs_js
@@ -33,6 +33,7 @@ use rand::RngCore;
 use sha2::Sha256;
 
 use super::{Challenge, Gate, png::GrayImage};
+use crate::clearance::ClearanceLevel;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -555,6 +556,10 @@ impl Challenge for CaptchaChallenge {
 
 	fn needs_js(&self) -> bool {
 		false
+	}
+
+	fn granted_level(&self) -> ClearanceLevel {
+		ClearanceLevel::Captcha
 	}
 }
 

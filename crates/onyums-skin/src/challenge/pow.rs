@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Challenge, Gate};
 use crate::{
-	difficulty::{AdaptiveDifficulty, ShapeDifficulty}, shape::RequestShape
+	clearance::ClearanceLevel, difficulty::{AdaptiveDifficulty, ShapeDifficulty}, shape::RequestShape
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -335,6 +335,10 @@ impl<P: Pow> Challenge for PowChallenge<P> {
 
 	fn needs_js(&self) -> bool {
 		true
+	}
+
+	fn granted_level(&self) -> ClearanceLevel {
+		ClearanceLevel::Pow
 	}
 }
 

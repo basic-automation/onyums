@@ -101,6 +101,10 @@ impl<S: ClearanceStore> Challenge for PatienceChallenge<S> {
 	fn needs_js(&self) -> bool {
 		false
 	}
+
+	fn granted_level(&self) -> ClearanceLevel {
+		ClearanceLevel::Patience
+	}
 }
 
 #[cfg(test)]

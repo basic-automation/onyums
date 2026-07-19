@@ -13,6 +13,7 @@ pub mod captcha;
 #[cfg(feature = "equix")]
 pub mod equix;
 pub mod patience;
+mod png;
 pub mod pow;
 
 /// Outcome of presenting/evaluating a gate.

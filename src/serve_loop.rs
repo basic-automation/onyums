@@ -1414,4 +1414,50 @@ Connection: close
 		assert_eq!(limited.admitted(), 2);
 		assert_eq!(limited.refused(), 0);
 	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn the_application_receives_the_per_circuit_connection_info() {
+		use axum::extract::ConnectInfo;
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		// `handle_tls_connection` mints the axum connect-info for each stream, but nothing
+		// checked that a handler actually receives it — so the per-circuit id could have
+		// been silently `None` at the point it matters (it was hardcoded `None` for a long
+		// time, which is exactly the regression this guards).
+		let address = address();
+		let acceptor = tls_acceptor(&address, &Tls::Upgrade).expect("self-signed acceptor assembles offline");
+		let app = Router::new().route("/", axum::routing::get(|ConnectInfo(info): ConnectInfo<ConnectionInfo>| async move { format!("circuit={} tor={}", info.circuit().unwrap_or("<none>"), info.is_over_tor()) }));
+
+		let (stream_request, client_side) = DuplexStreamReq::pair(443);
+		let server = tokio::spawn(handle_tls_connection(stream_request, acceptor, app, CircuitId(4242)));
+
+		let tls_config = tokio_rustls::rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(AcceptAnyCert)).with_no_client_auth();
+		let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+		let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(address.host().to_string()).expect("valid server name");
+		let mut tls = connector.connect(server_name, client_side).await.expect("TLS handshake");
+
+		tls.write_all(
+			format!(
+				"GET / HTTP/1.1
+Host: {}
+Connection: close
+
+",
+				address.host()
+			)
+			.as_bytes(),
+		)
+		.await
+		.expect("write");
+		tls.flush().await.expect("flush");
+
+		let mut response = String::new();
+		tls.read_to_string(&mut response).await.expect("read");
+		let _ = server.await.expect("join");
+
+		// The id the loop assigned must be the id the handler sees — not `<none>`, and not
+		// some other circuit's.
+		assert!(response.contains("circuit=4242"), "the handler must receive this circuit's id, got: {response:?}");
+		assert!(response.contains("tor=true"), "a stream arriving over a rendezvous circuit must report itself as over-Tor, got: {response:?}");
+	}
 }

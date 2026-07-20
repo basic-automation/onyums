@@ -17,7 +17,7 @@
 //! every decision worth testing is made somewhere else and this code only sequences
 //! them.
 
-use std::sync::Arc;
+use std::{future::Future, pin::Pin, sync::Arc};
 
 use anyhow::Result;
 use axum::Router;
@@ -73,7 +73,77 @@ pub struct ServeContext {
 /// drives accept / per-stream reject / whole-circuit teardown. Each circuit's streams
 /// are handled on a dedicated task so circuits run concurrently, and the circuit's
 /// accounting is dropped via [`CircuitPolicy::forget`] once its stream drains.
-pub async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, ctx: ServeContext, policy: Arc<dyn CircuitPolicy>) -> Result<()> {
+pub async fn serve_circuits(rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, ctx: ServeContext, policy: Arc<dyn CircuitPolicy>) -> Result<()> {
+	serve_circuits_with(rend_requests, ctx, policy, |streams, id, ctx, policy| async move {
+		handle_circuit_streams(streams, id, ctx, policy.as_ref()).await;
+	})
+	.await
+}
+
+/// What [`serve_circuits_with`] needs from one offered rendezvous circuit.
+///
+/// This exists so the loop's *sequencing* can be tested offline. `tor_hsservice`'s
+/// [`RendRequest`] has no public constructor and no test double — its fields are
+/// private and it is only ever minted by arti from a real INTRODUCE2 on a live
+/// tunnel — so the loop could not be exercised without a live Tor network. The trait
+/// routes around exactly that: it names the two operations the loop performs on a
+/// circuit, the real type implements it, and a test supplies its own implementor.
+///
+/// The module itself is private (`mod serve_loop;`), so this trait is crate-internal
+/// however it is spelled: it is an internal seam, not public API, and must never reach
+/// the builder's signature.
+///
+/// The `Streams` associated type is what the circuit yields once accepted. It is an
+/// associated type rather than a bound because [`RendRequest::accept`] returns a
+/// *return-position `impl Trait`* whose concrete type cannot be named on stable — the
+/// real implementation therefore boxes it (see the impl below).
+pub trait IncomingCircuit: Send + 'static {
+	/// What one accepted circuit yields: its stream of stream-requests.
+	type Streams: Send + 'static;
+
+	/// Accept the circuit, yielding its streams.
+	fn accept(self) -> impl Future<Output = Result<Self::Streams>> + Send;
+
+	/// Refuse the circuit without accepting it.
+	fn reject(self) -> impl Future<Output = Result<()>> + Send;
+}
+
+impl IncomingCircuit for RendRequest {
+	// `RendRequest::accept` returns `impl Stream<Item = StreamRequest> + Unpin`, whose
+	// concrete type is un-nameable on stable, so it is boxed to give the associated
+	// type a name. The box costs one allocation per accepted circuit — once per
+	// rendezvous, not per stream or per request.
+	type Streams = Pin<Box<dyn Stream<Item = StreamRequest> + Send>>;
+
+	async fn accept(self) -> Result<Self::Streams> {
+		let streams = Self::accept(self).await.map_err(|e| anyhow::anyhow!("failed to accept rendezvous circuit: {e}"))?;
+		Ok(Box::pin(streams))
+	}
+
+	async fn reject(self) -> Result<()> {
+		Self::reject(self).await.map_err(|e| anyhow::anyhow!("failed to reject rendezvous circuit: {e}"))
+	}
+}
+
+/// The generic core of [`serve_circuits`]: everything the loop *decides and sequences*,
+/// with the two arti-owned pieces abstracted away — the circuit type behind
+/// [`IncomingCircuit`], and what to do with an accepted circuit's streams behind
+/// `drive`.
+///
+/// Splitting it this way is what makes the sequencing testable without a live Tor
+/// network, which is the whole point: the per-verdict *decisions* were already covered
+/// by [`circuit_gate`](crate::circuit_gate)'s tests, but the ordering around them was
+/// not — that a policy-rejected circuit is never accepted and never yields streams,
+/// that [`CircuitPolicy::forget`] fires on both the rejected and the drained path, that
+/// a circuit is recorded as offered *before* the verdict, and that a failed accept does
+/// not count as an accepted circuit. Each of those is a way the loop could regress
+/// silently, since CI cannot run it.
+pub async fn serve_circuits_with<C, F, Fut>(mut rend_requests: impl Stream<Item = C> + Send + Unpin, ctx: ServeContext, policy: Arc<dyn CircuitPolicy>, drive: F) -> Result<()>
+where
+	C: IncomingCircuit,
+	F: Fn(C::Streams, CircuitId, ServeContext, Arc<dyn CircuitPolicy>) -> Fut + Clone + Send + 'static,
+	Fut: Future<Output = ()> + Send + 'static
+{
 	event!(Level::INFO, "Waiting for incoming rendezvous circuits...");
 	let allocator = Arc::new(CircuitIdAllocator::new());
 	while let Some(rend_request) = rend_requests.next().await {
@@ -110,8 +180,9 @@ pub async fn serve_circuits(mut rend_requests: impl Stream<Item = RendRequest> +
 
 		let ctx = ctx.clone();
 		let policy = policy.clone();
+		let drive = drive.clone();
 		tokio::spawn(async move {
-			handle_circuit_streams(streams, id, ctx, policy.as_ref()).await;
+			drive(streams, id, ctx, Arc::clone(&policy)).await;
 			// The circuit has drained; drop its accounting so the policy's map does not
 			// grow without bound (there is no per-stream close hook).
 			policy.forget(&id);
@@ -250,4 +321,199 @@ pub async fn handle_raw_stream(stream_request: StreamRequest, handler: Arc<dyn S
 	event!(Level::INFO, "Accepting a raw stream on port {port} for a registered handler...");
 	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
 	handler.serve(Box::pin(onion_service_stream)).await
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::{
+		Arc, Mutex, atomic::{AtomicUsize, Ordering}
+	};
+
+	use onyums_skin::{CircuitAction, StreamTarget};
+
+	use super::*;
+	use crate::{metrics::CircuitMetrics, port_router::PortRouter, tls_policy::Tls, tls_setup::tls_acceptor};
+
+	/// A syntactically well-formed 56-character onion host, as in `tls_setup`'s tests.
+	fn address() -> OnionAddress {
+		OnionAddress::normalized("examplereturnsavalidacceptorpaddingxxxxxxxxxxxxxxxxxxxxx")
+	}
+
+	/// A `ServeContext` assembled entirely offline: a bare router, a self-signed
+	/// acceptor generated in-process by rcgen, and an empty port table.
+	fn context(metrics: &Arc<CircuitMetrics>) -> ServeContext {
+		let address = address();
+		ServeContext {
+			app: Router::new(),
+			tls_acceptor: tls_acceptor(&address, &Tls::Upgrade).expect("self-signed acceptor assembles offline"),
+			address,
+			plaintext: tls_policy::PlaintextPolicy::Upgrade,
+			port_router: Arc::new(PortRouter::default()),
+			metrics: Arc::clone(metrics),
+			adaptive: None
+		}
+	}
+
+	/// What one test circuit did, recorded so the assertions can name it.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum CircuitOutcome {
+		Accepted,
+		Rejected
+	}
+
+	/// A test stand-in for `RendRequest`. It records whether it was accepted or
+	/// rejected into a shared log, which is what lets a test assert that a circuit the
+	/// policy refused was *never* accepted — the ordering property the real loop has
+	/// and no offline test could previously observe.
+	struct FakeCircuit {
+		outcomes: Arc<Mutex<Vec<CircuitOutcome>>>,
+		/// When true, `accept()` fails — standing in for arti failing to accept a
+		/// circuit that the policy admitted.
+		accept_fails: bool
+	}
+
+	impl IncomingCircuit for FakeCircuit {
+		/// The accepted circuit yields nothing to drive; this slice covers the circuit
+		/// layer only, so the streams payload is deliberately a unit.
+		type Streams = ();
+
+		// Not `async fn`: there is nothing to await, and the trait only asks for a
+		// `Future`, so a ready one is the honest shape.
+		fn accept(self) -> impl Future<Output = Result<Self::Streams>> + Send {
+			let outcome = if self.accept_fails {
+				Err(anyhow::anyhow!("simulated accept failure"))
+			} else {
+				self.outcomes.lock().expect("not poisoned").push(CircuitOutcome::Accepted);
+				Ok(())
+			};
+			std::future::ready(outcome)
+		}
+
+		fn reject(self) -> impl Future<Output = Result<()>> + Send {
+			self.outcomes.lock().expect("not poisoned").push(CircuitOutcome::Rejected);
+			std::future::ready(Ok(()))
+		}
+	}
+
+	/// A policy that answers every circuit with a fixed verdict and counts `forget`s.
+	struct ScriptedPolicy {
+		circuit_verdict: CircuitAction,
+		forgotten: Arc<Mutex<Vec<u64>>>
+	}
+
+	impl ScriptedPolicy {
+		fn scripted(circuit_verdict: CircuitAction) -> (Arc<dyn CircuitPolicy>, Arc<Mutex<Vec<u64>>>) {
+			let forgotten = Arc::new(Mutex::new(Vec::new()));
+			let policy: Arc<dyn CircuitPolicy> = Arc::new(Self { circuit_verdict, forgotten: Arc::clone(&forgotten) });
+			(policy, forgotten)
+		}
+	}
+
+	impl CircuitPolicy for ScriptedPolicy {
+		fn on_new_circuit(&self, _id: &CircuitId) -> CircuitAction {
+			self.circuit_verdict
+		}
+
+		fn on_new_stream(&self, _id: &CircuitId, _target: &StreamTarget) -> CircuitAction {
+			CircuitAction::Accept
+		}
+
+		fn on_request(&self, _id: &CircuitId) -> CircuitAction {
+			CircuitAction::Accept
+		}
+
+		fn forget(&self, id: &CircuitId) {
+			self.forgotten.lock().expect("not poisoned").push(id.0);
+		}
+	}
+
+	/// Run the generic loop over `count` circuits under `verdict`, returning the
+	/// circuit outcomes, the ids forgotten, how many times the drive callback ran, and
+	/// the metrics snapshot.
+	async fn run(verdict: CircuitAction, count: usize, accept_fails: bool) -> (Vec<CircuitOutcome>, Vec<u64>, usize, crate::metrics::ServiceMetrics) {
+		let metrics = Arc::new(CircuitMetrics::default());
+		let ctx = context(&metrics);
+		let (policy, forgotten) = ScriptedPolicy::scripted(verdict);
+		let outcomes = Arc::new(Mutex::new(Vec::new()));
+		let drives = Arc::new(AtomicUsize::new(0));
+
+		let circuits: Vec<_> = (0..count).map(|_| FakeCircuit { outcomes: Arc::clone(&outcomes), accept_fails }).collect();
+		let stream = futures::stream::iter(circuits);
+
+		let drive_count = Arc::clone(&drives);
+		serve_circuits_with(stream, ctx, policy, move |(), _id, _ctx, _policy| {
+			let drive_count = Arc::clone(&drive_count);
+			async move {
+				drive_count.fetch_add(1, Ordering::SeqCst);
+			}
+		})
+		.await
+		.expect("the loop ends cleanly when the circuit stream ends");
+
+		// The drained-circuit `forget` happens on a spawned task; yield until the
+		// spawned work has run rather than sleeping for a fixed duration.
+		for _ in 0..64 {
+			tokio::task::yield_now().await;
+		}
+
+		let outcomes = outcomes.lock().expect("not poisoned").clone();
+		let forgotten = forgotten.lock().expect("not poisoned").clone();
+		(outcomes, forgotten, drives.load(Ordering::SeqCst), metrics.snapshot())
+	}
+
+	#[tokio::test]
+	async fn an_accepted_circuit_is_accepted_driven_and_then_forgotten() {
+		let (outcomes, forgotten, drives, metrics) = run(CircuitAction::Accept, 3, false).await;
+		assert_eq!(outcomes, vec![CircuitOutcome::Accepted; 3]);
+		assert_eq!(drives, 3, "every accepted circuit's streams are driven exactly once");
+		assert_eq!(forgotten.len(), 3, "each drained circuit's accounting is dropped");
+		assert_eq!(metrics.circuits_offered, 3);
+		assert_eq!(metrics.circuits_accepted, 3);
+		assert_eq!(metrics.circuits_rejected, 0);
+	}
+
+	#[tokio::test]
+	async fn a_policy_rejected_circuit_is_never_accepted_and_yields_no_streams() {
+		let (outcomes, forgotten, drives, metrics) = run(CircuitAction::Reject, 3, false).await;
+		// The property that matters: not one `Accepted` in the log. A regression that
+		// accepted first and rejected after would still "reject" the circuit, and every
+		// counter-only assertion would still pass.
+		assert_eq!(outcomes, vec![CircuitOutcome::Rejected; 3]);
+		assert_eq!(drives, 0, "a refused circuit must never reach the stream driver");
+		assert_eq!(forgotten.len(), 3, "accounting registered by on_new_circuit is dropped again");
+		assert_eq!(metrics.circuits_offered, 3, "a refused circuit is still counted as offered");
+		assert_eq!(metrics.circuits_accepted, 0);
+		assert_eq!(metrics.circuits_rejected, 3);
+	}
+
+	#[tokio::test]
+	async fn a_shutdown_verdict_refuses_the_circuit_at_the_offer() {
+		// `Shutdown` at the circuit boundary means the same thing as `Reject` — there is
+		// nothing yet to tear down — and `circuit_gate::circuit_disposition` maps it so.
+		// Pinned here because the loop, not the gate, is what acts on it.
+		let (outcomes, _forgotten, drives, metrics) = run(CircuitAction::Shutdown, 2, false).await;
+		assert_eq!(outcomes, vec![CircuitOutcome::Rejected; 2]);
+		assert_eq!(drives, 0);
+		assert_eq!(metrics.circuits_rejected, 2);
+	}
+
+	#[tokio::test]
+	async fn a_failed_accept_is_not_counted_as_an_accepted_circuit() {
+		let (outcomes, forgotten, drives, metrics) = run(CircuitAction::Accept, 2, true).await;
+		assert!(outcomes.is_empty(), "the fake records neither outcome when accept fails");
+		assert_eq!(drives, 0, "no streams are driven for a circuit that never opened");
+		assert!(forgotten.is_empty(), "nothing was ever driven, so nothing reaches the drained-circuit forget");
+		assert_eq!(metrics.circuits_offered, 2, "the offer happened regardless");
+		assert_eq!(metrics.circuits_accepted, 0, "the counter tracks accepts that succeeded, not accepts attempted");
+		assert_eq!(metrics.circuits_rejected, 0, "an arti-side accept failure is not a policy rejection");
+	}
+
+	#[tokio::test]
+	async fn every_circuit_gets_a_distinct_id() {
+		let (_outcomes, forgotten, _drives, _metrics) = run(CircuitAction::Reject, 5, false).await;
+		let mut ids = forgotten;
+		ids.sort_unstable();
+		ids.dedup();
+		assert_eq!(ids.len(), 5, "the allocator must not reuse an id within one loop run");
+	}
 }

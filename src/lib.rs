@@ -70,6 +70,7 @@ pub use raw_tcp::RawTcpHandler;
 pub use status::{ServiceHealth, ServiceProblem, ServiceProblemKind, ServiceStatus};
 pub use stream_auth::{AuthFuture, AuthGate, AuthOutcome, SharedSecretAuth, StreamAuthorizer};
 pub use tls_policy::Tls;
+pub use tor_client::OnionTorClient;
 pub use vanity::{VanityKey, address_from_expanded_secret, address_from_secret_seed, address_from_tor_secret_key_file, expanded_secret_from_tor_file, mine, mine_parallel, mine_within, tor_secret_key_file_from_expanded, validate_prefix};
 
 #[cfg(test)]
@@ -86,7 +87,7 @@ mod tests {
 	use tracing::{Level, event};
 
 	use super::*;
-	use crate::tor_client::storage_dirs;
+	use crate::tor_client::{OnionTorClient, storage_dirs};
 
 	#[test]
 	fn arti_stack_is_reexported() {
@@ -94,6 +95,11 @@ mod tests {
 		// downstream needn't add its own version-skew-prone arti dependency. If any
 		// re-export path breaks, this stops compiling.
 		type _Client = crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime>;
+		// The alias is transparent: it must stay *equal* to the spelled-out type, not
+		// merely resemble it, or a caller who mixes the two would stop compiling.
+		const fn _alias_is_the_same_type(c: crate::OnionTorClient) -> crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime> {
+			c
+		}
 		type _Key = crate::tor_hscrypto::pk::HsClientDescEncKey;
 		type _Cfg = crate::tor_hsservice::config::OnionServiceConfigBuilder;
 		type _Cell = crate::tor_cell::relaycell::msg::End;
@@ -126,7 +132,7 @@ mod tests {
 
 	/// One HTTPS `GET /` against `address` over `client`: rendezvous circuit → TLS
 	/// handshake (self-signed accepted) → HTTP/1.1 request → full response text.
-	async fn live_fetch_once(client: &TorClient<TokioNativeTlsRuntime>, address: &OnionAddress) -> Result<String> {
+	async fn live_fetch_once(client: &OnionTorClient, address: &OnionAddress) -> Result<String> {
 		use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 		let stream = client.connect((address.host(), 443)).await.map_err(|e| anyhow::anyhow!("rendezvous connect failed: {e}"))?;

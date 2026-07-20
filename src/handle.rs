@@ -17,15 +17,13 @@
 
 use std::sync::{Arc, Mutex};
 
-use arti_client::TorClient;
 use futures::{Stream, StreamExt};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tor_hsservice::RunningOnionService;
-use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 
 use crate::{
-	address::OnionAddress, metrics::{CircuitMetrics, ServiceMetrics, service_metrics_prometheus}, status::{ServiceHealth, ServiceProblem, ServiceStatus, await_status, project_service_problem, project_service_status}, tor_client::{EphemeralIdentity, spawn_ephemeral_cleanup}
+	address::OnionAddress, metrics::{CircuitMetrics, ServiceMetrics, service_metrics_prometheus}, status::{ServiceHealth, ServiceProblem, ServiceStatus, await_status, project_service_problem, project_service_status}, tor_client::{EphemeralIdentity, OnionTorClient, spawn_ephemeral_cleanup}
 };
 
 /// A running onion service plus its controls.
@@ -43,7 +41,7 @@ pub struct OnionServiceHandle {
 	// Kept alive so the onion service's background machinery (intro points,
 	// descriptor publishing) keeps running for the lifetime of the handle; also handed
 	// out by `tor_client()` for launching sibling services on the same bootstrap.
-	client: Arc<TorClient<TokioNativeTlsRuntime>>,
+	client: Arc<OnionTorClient>,
 	cancel: CancellationToken,
 	task: Mutex<Option<JoinHandle<()>>>,
 	// Shared with the accept loop's `ServeContext`; the loop increments, `metrics()`
@@ -66,7 +64,7 @@ impl OnionServiceHandle {
 	/// loop task; the metrics counters are the ones *that* loop increments). Taking the
 	/// raw parts and doing the `Mutex` wrapping here keeps those fields private to this
 	/// module rather than exposing seven of them to lib.rs.
-	pub(crate) const fn new(address: OnionAddress, service: Arc<RunningOnionService>, client: Arc<TorClient<TokioNativeTlsRuntime>>, cancel: CancellationToken, task: JoinHandle<()>, metrics: Arc<CircuitMetrics>, ephemeral: Option<EphemeralIdentity>) -> Self {
+	pub(crate) const fn new(address: OnionAddress, service: Arc<RunningOnionService>, client: Arc<OnionTorClient>, cancel: CancellationToken, task: JoinHandle<()>, metrics: Arc<CircuitMetrics>, ephemeral: Option<EphemeralIdentity>) -> Self {
 		Self { address, service, client, cancel, task: Mutex::new(Some(task)), metrics, ephemeral: Mutex::new(ephemeral) }
 	}
 
@@ -107,7 +105,7 @@ impl OnionServiceHandle {
 	/// # }
 	/// ```
 	#[must_use]
-	pub fn tor_client(&self) -> Arc<TorClient<TokioNativeTlsRuntime>> {
+	pub fn tor_client(&self) -> Arc<OnionTorClient> {
 		self.client.clone()
 	}
 

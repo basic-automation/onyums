@@ -19,18 +19,16 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use arti_client::TorClient;
 use axum::Router;
 use futures::Stream;
 use onyums_skin::{AccountingCircuitPolicy, AdaptiveDifficulty, CircuitPolicy, RestrictedDiscovery, SecurityEventSink, Skin};
 use safelog::DisplayRedacted;
 use tokio_util::sync::CancellationToken;
 use tor_hsservice::{RendRequest, RunningOnionService, config::OnionServiceConfig};
-use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tracing::{Level, event, span};
 
 use crate::{
-	address::OnionAddress, handle::OnionServiceHandle, http_stack::{SkinChoice, build_serve_router}, metrics::CircuitMetrics, port_router::{PortRouter, StreamHandler}, serve_loop::{ServeContext, serve_circuits}, service_config::build_onion_service_config, tls_policy::Tls, tls_setup::tls_acceptor, tor_client::{prepare_ephemeral_dir, setup_tor_client, storage_dirs, sweep_stale_ephemeral_dirs}
+	address::OnionAddress, handle::OnionServiceHandle, http_stack::{SkinChoice, build_serve_router}, metrics::CircuitMetrics, port_router::{PortRouter, StreamHandler}, serve_loop::{ServeContext, serve_circuits}, service_config::build_onion_service_config, tls_policy::Tls, tls_setup::tls_acceptor, tor_client::{OnionTorClient, prepare_ephemeral_dir, setup_tor_client, storage_dirs, sweep_stale_ephemeral_dirs}
 };
 
 /// Launches an onion service from an already-built [`OnionServiceConfig`].
@@ -38,7 +36,7 @@ use crate::{
 /// The returned request stream is self-contained (`use<>`) — it does not borrow
 /// the client — so callers can move the client elsewhere (e.g. into a handle)
 /// while keeping the stream.
-fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
+fn launch_onion_service(client: &OnionTorClient, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
 	event!(Level::INFO, "Launching onion service...");
 	client.launch_onion_service(svc_cfg).map_err(|e| anyhow::anyhow!("Failed to launch onion service: {e}"))?.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
 }
@@ -56,7 +54,7 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 
 /// Initializes the onion service from a built config and returns the service and
 /// request stream.
-fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
+fn initialize_onion_service(client: &OnionTorClient, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
 	let (service, request_stream) = launch_onion_service(client, svc_cfg)?;
 	let address = get_onion_address(&service)?;
 	Ok((service, address, request_stream))
@@ -127,7 +125,7 @@ pub struct OnionServiceBuilder {
 	// A caller-supplied, already-bootstrapped Tor client to launch this service on,
 	// instead of bootstrapping a fresh one (Phase 4 multi-service — bootstrap once,
 	// launch N). `None` keeps today's behaviour: `serve` bootstraps its own client.
-	tor_client: Option<Arc<TorClient<TokioNativeTlsRuntime>>>,
+	tor_client: Option<Arc<OnionTorClient>>,
 }
 
 impl OnionServiceBuilder {
@@ -335,7 +333,7 @@ impl OnionServiceBuilder {
 	/// on one shared client).
 	///
 	/// Tor bootstrap (fetching the consensus, building circuits) is the slow part of
-	/// coming up; a single [`TorClient`] can host any number of onion services, each
+	/// coming up; a single [`TorClient`](arti_client::TorClient) can host any number of onion services, each
 	/// keyed by its own nickname in the client's keystore. Bootstrap once with
 	/// [`OnionService::shared_client`] (or your own re-exported [`arti_client`] client),
 	/// then hand the same `Arc` to several builders so N services share one bootstrap
@@ -369,7 +367,7 @@ impl OnionServiceBuilder {
 	/// identity `ephemeral` promises — setting both is an error surfaced from
 	/// [`Self::serve`] (offline, before any launch).
 	#[must_use]
-	pub fn tor_client(mut self, client: Arc<TorClient<TokioNativeTlsRuntime>>) -> Self {
+	pub fn tor_client(mut self, client: Arc<OnionTorClient>) -> Self {
 		self.tor_client = Some(client);
 		self
 	}
@@ -519,7 +517,7 @@ impl OnionService {
 	/// # Errors
 	/// Returns an error if the Tor client fails to build or bootstrap, or if called
 	/// outside a tokio runtime.
-	pub async fn shared_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
+	pub async fn shared_client() -> Result<Arc<OnionTorClient>> {
 		let (state_dir, cache_dir) = storage_dirs(false);
 		setup_tor_client(&state_dir, &cache_dir).await
 	}

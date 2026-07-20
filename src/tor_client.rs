@@ -18,6 +18,24 @@ use tracing::{Level, event};
 
 use crate::keystore_perms::{Hardening, harden_state_tree};
 
+/// The arti [`TorClient`] onyums bootstraps and serves on, with its runtime fixed.
+///
+/// Every public onyums signature that hands back or accepts an arti client names *this*
+/// rather than spelling out `TorClient<TokioNativeTlsRuntime>` — `OnionServiceHandle::tor_client`,
+/// `OnionServiceBuilder::tor_client`, and `OnionService::shared_client`.
+///
+/// The indirection is deliberate and has a specific job. The runtime parameter is an
+/// implementation choice, not something a caller of onyums picks: it is which TLS
+/// implementation *arti* uses for its relay connections. The ROADMAP's "no FFI" item
+/// wants to move it from `native-tls` to `rustls` (which would drop `openssl-sys` from
+/// the tree and retire an advisory), and with the type spelled out at the API boundary
+/// that swap is a breaking change for everyone holding an `Arc<TorClient<…>>` from
+/// onyums. Behind the alias it is a one-line edit here.
+///
+/// This is a transparent type alias, so it changes nothing for existing callers today —
+/// it only stops the runtime from being part of the API's spelling.
+pub type OnionTorClient = TorClient<TokioNativeTlsRuntime>;
+
 /// The default persistent onyums state directory — home of the Arti keystore that
 /// holds the onion service's v3 identity key, so the `.onion` address is stable
 /// across restarts (onyums ROADMAP Phase 1). Kept under `./tor/onyums` rather than
@@ -81,7 +99,7 @@ fn tor_client_config(state_dir: &str, cache_dir: &str) -> Result<TorClientConfig
 /// # Errors
 /// Returns an error if the current tokio runtime is unavailable or arti fails to
 /// bootstrap a client (e.g. the network is unreachable).
-pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
+pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<OnionTorClient>> {
 	event!(Level::INFO, "Creating Tor client...");
 	harden_keystore(std::path::Path::new(state_dir))?;
 	let config = tor_client_config(state_dir, cache_dir)?;

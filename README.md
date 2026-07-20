@@ -184,16 +184,16 @@ cover every row below.
 |---|---|---|
 | `serve()` / builder API, config validation | 🟢 | Nickname, port, TLS, and client-choice validation all fail offline before any bootstrap. |
 | TLS policy (`Upgrade` / `Strict` / `Provided`) | 🟢 | Composition (gate + HSTS + app) is `oneshot`-tested; `ProvidedCert` parses/validates up front. |
-| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 428 unit tests in `onyums-skin`, no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
+| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 476 unit tests in `onyums-skin`, no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
 | Restricted discovery / client-auth keys | 🟢 | Key generation, `.auth` rendering/parsing, and allowlist assembly are offline-tested and byte-checked against Tor's file format. Descriptor encryption itself is arti's. |
 | Identity: persistent + `.ephemeral()` keystore | 🟢 | Directory resolution, uniqueness, and cleanup tested offline. |
 | Keystore permission hardening (0700/0600) | 🟢 | Unix-only; the syscall path runs on CI's Linux runner. A no-op on Windows (see [Deployment](#deployment)). |
 | Vanity mining, address helpers, QR | 🟢 | Pure computation; derives the exact address arti serves. |
 | `ServiceStatus` / `ServiceProblem` projection | 🟢 | Mapping tested against every arti state. The *emission* of transitions is 🟡. |
-| Host-side metrics + Prometheus exposition | 🟢 | Counter mechanics and text format tested offline; the accept loop's increment sites are 🟡. |
-| **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path. Covered by the manual `--ignored` live test, not by CI. |
+| Host-side metrics + Prometheus exposition | 🟢 | Counter mechanics and text format tested offline, and the accept loop's circuit/stream increment sites are now covered too (offered-before-verdict, accepted, rejected, served, shut down). |
+| **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path: TLS termination and the axum handoff only run against real Tor. The `--ignored` live test covers it and CI does not run it — and note that test is currently unreliable (it has been observed hanging well past its own internal timeouts), so treat this row as genuinely unverified rather than verified-elsewhere. |
 | Raw-port serving (`route_port`) | 🟡 | The routing table and the `RawTcpHandler` proxy are offline-tested against a loopback backend; the live path is not. |
-| Circuit-policy gate, Under Attack mode | 🟡 | Decision logic is offline-tested; it is driven from the live rendezvous loop. |
+| Circuit-policy gate, Under Attack mode | 🟢 | Both the decisions *and* the accept loop's sequencing around them are offline-tested: that a refused circuit is never accepted and yields no streams, that a rejected stream leaves the circuit alive, that a `Shutdown` verdict stops the loop, that a challenge fails closed on a raw port, and that per-circuit accounting is always dropped. What remains live-only is the TLS/serve step itself (next row). |
 | Multiple services on one shared client | 🟡 | The offline surface (`shared_client()`, conflict rejection, fleet status) is tested; N-services-actually-reachable is not verified. |
 | `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
 | Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
@@ -362,6 +362,13 @@ async fn main() {
 	}
 }
 ```
+
+The shared client's type is `onyums::OnionTorClient` — an alias for arti's
+`TorClient<..>` with the runtime onyums bootstraps on. Name the alias rather than
+spelling the runtime out: which TLS implementation arti uses for its relay connections
+is onyums' choice, not yours, and it is expected to change (see the roadmap's "no FFI"
+item). Code written against the alias keeps compiling when it does.
+
 
 `.ephemeral()` conflicts with `.tor_client(...)` — a shared client has a fixed
 keystore and cannot supply a throwaway per-launch identity — and that pairing is

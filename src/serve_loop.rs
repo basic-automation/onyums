@@ -1063,13 +1063,26 @@ mod tests {
 	struct DuplexStreamReq {
 		request: IncomingStreamRequest,
 		server_side: tokio::io::DuplexStream,
+		/// Set when `accept` is called. The refusal tests assert on *this* rather than on
+		/// the returned `Result`: a dispatch regression that wrongly accepted a stream
+		/// would then sit waiting on a client that never writes, so a Result-only test
+		/// would **hang** instead of failing. Asserting "was never accepted" fails fast
+		/// and names the actual defect. (Confirmed by mutation: flipping the plaintext
+		/// policy in the strict test does hang the Result-only form.)
+		accepted: Arc<std::sync::atomic::AtomicBool>,
 	}
 
 	impl DuplexStreamReq {
 		fn pair(port: u16) -> (Self, tokio::io::DuplexStream) {
+			let (req, client, _accepted) = Self::pair_tracked(port);
+			(req, client)
+		}
+
+		fn pair_tracked(port: u16) -> (Self, tokio::io::DuplexStream, Arc<std::sync::atomic::AtomicBool>) {
 			let begin = tor_cell::relaycell::msg::Begin::new("example.onion", port, 0).expect("a valid BEGIN cell");
 			let (client_side, server_side) = tokio::io::duplex(64 * 1024);
-			(Self { request: IncomingStreamRequest::Begin(begin), server_side }, client_side)
+			let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+			(Self { request: IncomingStreamRequest::Begin(begin), server_side, accepted: Arc::clone(&accepted) }, client_side, accepted)
 		}
 	}
 
@@ -1081,6 +1094,7 @@ mod tests {
 		}
 
 		fn accept(self, _connected: Connected) -> impl Future<Output = Result<Self::Stream>> + Send {
+			self.accepted.store(true, Ordering::SeqCst);
 			std::future::ready(Ok(self.server_side))
 		}
 
@@ -1188,5 +1202,85 @@ Connection: close
 		assert!(response.contains("location: https://example.onion/a/b?c=d") || response.contains("Location: https://example.onion/a/b?c=d"), "redirect must preserve path and query, got: {response:?}");
 
 		let _ = server.await.expect("the redirect task joins");
+	}
+
+	/// A `StreamHandler` that echoes back whatever it is sent, upper-cased — so a test can
+	/// prove the bytes really traversed the dispatch path rather than merely that a
+	/// handler was selected.
+	struct ShoutingEcho;
+
+	impl StreamHandler for ShoutingEcho {
+		fn serve(&self, mut stream: crate::port_router::OnionStream) -> crate::port_router::ServeFuture {
+			Box::pin(async move {
+				use tokio::io::{AsyncReadExt, AsyncWriteExt};
+				let mut buf = vec![0u8; 1024];
+				let n = stream.read(&mut buf).await?;
+				stream.write_all(buf[..n].to_ascii_uppercase().as_slice()).await?;
+				stream.flush().await?;
+				Ok(())
+			})
+		}
+	}
+
+	/// A `ServeContext` whose port table and plaintext policy the caller chooses.
+	fn routed_context(metrics: &Arc<CircuitMetrics>, router: PortRouter, plaintext: tls_policy::PlaintextPolicy) -> ServeContext {
+		let mut ctx = context(metrics);
+		ctx.port_router = Arc::new(router);
+		ctx.plaintext = plaintext;
+		ctx
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_registered_raw_port_reaches_its_handler_offline() {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let mut router = PortRouter::new();
+		router.register(9735, Arc::new(ShoutingEcho)).expect("9735 is a legal raw port");
+
+		let metrics = Arc::new(CircuitMetrics::default());
+		let ctx = routed_context(&metrics, router, tls_policy::PlaintextPolicy::Upgrade);
+
+		let (stream_request, mut client_side) = DuplexStreamReq::pair(9735);
+		let server = tokio::spawn(handle_stream_request(stream_request, ctx, CircuitId(31)));
+
+		client_side.write_all(b"hello raw port").await.expect("write");
+		client_side.flush().await.expect("flush");
+
+		let mut response = Vec::new();
+		client_side.read_to_end(&mut response).await.expect("read");
+
+		// The bytes went out through the dispatch, into the handler, and back — the raw
+		// path is not merely selected, it is connected.
+		assert_eq!(response, b"HELLO RAW PORT", "the registered handler must actually see and answer the stream");
+		server.await.expect("join").expect("serving the raw stream succeeds");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn an_unregistered_port_is_refused_rather_than_served() {
+		let metrics = Arc::new(CircuitMetrics::default());
+		// Empty port table: nothing is registered on 9999.
+		let ctx = routed_context(&metrics, PortRouter::new(), tls_policy::PlaintextPolicy::Upgrade);
+
+		let (stream_request, _client_side, accepted) = DuplexStreamReq::pair_tracked(9999);
+		// Bounded deliberately. A dispatch regression that accepted this stream would go
+		// on to *serve* it and block on a client that never writes, so an unbounded await
+		// would hang the suite rather than report a defect (confirmed by mutation).
+		tokio::time::timeout(std::time::Duration::from_secs(5), handle_stream_request(stream_request, ctx, CircuitId(32))).await.expect("refusing an unregistered port must return immediately, not start serving it").expect("an unregistered port is a clean refusal, not an error");
+		assert!(!accepted.load(Ordering::SeqCst), "an unregistered port must be refused without ever accepting the stream");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn strict_tls_refuses_the_plaintext_port_instead_of_redirecting() {
+		let metrics = Arc::new(CircuitMetrics::default());
+		let ctx = routed_context(&metrics, PortRouter::new(), tls_policy::PlaintextPolicy::Reject);
+
+		let (stream_request, _client_side, accepted) = DuplexStreamReq::pair_tracked(80);
+		// Bounded for the same reason: falling through to the redirect handler would
+		// accept the plaintext stream and then wait on it forever.
+		tokio::time::timeout(std::time::Duration::from_secs(5), handle_stream_request(stream_request, ctx, CircuitId(33))).await.expect("strict TLS must refuse port 80 immediately, not accept and serve a redirect on it").expect("strict plaintext policy refuses port 80");
+		// The property that matters: under `Tls::Strict` the plaintext stream is never
+		// accepted at all — not accepted-then-redirected. Serving a redirect would mean
+		// answering on a plaintext circuit, which is exactly what Strict forbids.
+		assert!(!accepted.load(Ordering::SeqCst), "strict TLS must refuse port 80 without accepting the plaintext stream");
 	}
 }

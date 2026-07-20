@@ -29,7 +29,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 
 use super::{Challenge, Gate, png::GrayImage};
@@ -275,7 +275,7 @@ fn fill_cell(img: &mut GrayImage, ox: u32, oy: u32) {
 }
 
 /// A random `f64` in `[0, 1)` from the CSPRNG (no `rand` distribution import needed).
-fn unit(rng: &mut impl RngCore) -> f64 {
+fn unit(rng: &mut impl Rng) -> f64 {
 	#[expect(clippy::cast_precision_loss, reason = "53-bit mantissa exactly represents the 53-bit value taken from the u64")]
 	{
 		(rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64
@@ -285,7 +285,7 @@ fn unit(rng: &mut impl RngCore) -> f64 {
 /// Warp `src` by an independent sine shear on each axis: every output column is nudged
 /// vertically and every output row horizontally, both by a smoothly varying amount. The
 /// amplitudes, frequencies, and phases are randomized so the warp differs each render.
-fn warp(src: &GrayImage, rng: &mut impl RngCore) -> GrayImage {
+fn warp(src: &GrayImage, rng: &mut impl Rng) -> GrayImage {
 	let w = src.width();
 	let h = src.height();
 	let amp_y = 1.5 + unit(rng) * f64::from(SCALE) * 0.6; // vertical push, up to ~0.8 cells
@@ -316,7 +316,7 @@ fn warp(src: &GrayImage, rng: &mut impl RngCore) -> GrayImage {
 /// Speckle `img` with random dark noise dots and a couple of thin sine "strike-through"
 /// lines — cheap texture that ruins connected-component OCR without hiding the glyphs from
 /// a human. Returns the same image for call chaining.
-fn add_noise(mut img: GrayImage, rng: &mut impl RngCore) -> GrayImage {
+fn add_noise(mut img: GrayImage, rng: &mut impl Rng) -> GrayImage {
 	let w = img.width();
 	let h = img.height();
 

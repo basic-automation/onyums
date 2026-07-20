@@ -25,7 +25,7 @@ use axum::{
 	body::Body, http::{HeaderValue, StatusCode, header, request::Parts}, response::{IntoResponse, Response}
 };
 use http_body_util::{BodyExt, Limited};
-use rand::RngCore;
+use rand::Rng;
 use tower_layer::Layer;
 use tower_service::Service;
 

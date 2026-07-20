@@ -1351,4 +1351,67 @@ Connection: close
 		let response = https_roundtrip(crate::http_stack::SkinChoice::Disabled, tls_policy::PlaintextPolicy::Reject).await;
 		assert!(response.to_ascii_lowercase().contains("strict-transport-security: max-age=63072000; includesubdomains"), "strict mode must emit HSTS on the wire, got: {response:?}");
 	}
+
+	/// Drive one raw-port stream through the full dispatch into `handler`, writing
+	/// `to_send` and returning what comes back plus whether the stream was accepted.
+	async fn raw_roundtrip(port: u16, handler: Arc<dyn StreamHandler>, to_send: &[u8]) -> Vec<u8> {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let mut router = PortRouter::new();
+		router.register(port, handler).expect("a legal raw port");
+		let metrics = Arc::new(CircuitMetrics::default());
+		let ctx = routed_context(&metrics, router, tls_policy::PlaintextPolicy::Upgrade);
+
+		let (stream_request, mut client_side) = DuplexStreamReq::pair(port);
+		let server = tokio::spawn(handle_stream_request(stream_request, ctx, CircuitId(51)));
+
+		client_side.write_all(to_send).await.expect("write");
+		client_side.flush().await.expect("flush");
+
+		let mut response = Vec::new();
+		client_side.read_to_end(&mut response).await.expect("read");
+		let _ = server.await.expect("join");
+		response
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_shared_secret_gated_raw_port_admits_only_the_right_preamble() {
+		use crate::stream_auth::{AuthGate, SharedSecretAuth};
+
+		// The wrappers have standalone tests, but never through the dispatch — this is
+		// the composition an operator actually deploys: `.route_port(p, AuthGate::new(..))`.
+		let gate = Arc::new(AuthGate::new(ShoutingEcho, SharedSecretAuth::new(b"s3cret".to_vec()).expect("non-empty secret")));
+
+		// Right preamble: admitted, and the backend sees only what follows it — the
+		// secret must be stripped, or every backend would receive credential bytes as
+		// application data.
+		let ok = raw_roundtrip(9736, Arc::clone(&gate) as Arc<dyn StreamHandler>, b"s3crethello").await;
+		assert_eq!(ok, b"HELLO", "the backend must see the payload with the secret stripped");
+
+		// Wrong preamble: refused, backend never reached, nothing echoed back.
+		let bad = raw_roundtrip(9736, Arc::clone(&gate) as Arc<dyn StreamHandler>, b"wrongXXhello").await;
+		assert!(bad.is_empty(), "a stream failing the authorizer must reach no backend, got: {bad:?}");
+
+		assert_eq!(gate.admitted(), 1, "exactly one stream was admitted");
+		assert_eq!(gate.refused(), 1, "and exactly one refused");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn a_connection_limited_raw_port_releases_its_permit_through_the_dispatch() {
+		use crate::connection_limit::ConnectionLimit;
+
+		// A limit of 1 with a handler that answers immediately: the first stream is
+		// served, and because it completes, the permit is back for the second. This
+		// pins that the wrapper releases through the dispatch path too, which is where
+		// a leaked permit would wedge the port shut.
+		let limited = Arc::new(ConnectionLimit::new(ShoutingEcho, 1).expect("a positive limit"));
+
+		let first = raw_roundtrip(9737, Arc::clone(&limited) as Arc<dyn StreamHandler>, b"one").await;
+		let second = raw_roundtrip(9737, Arc::clone(&limited) as Arc<dyn StreamHandler>, b"two").await;
+
+		assert_eq!(first, b"ONE");
+		assert_eq!(second, b"TWO", "the permit must be released when a connection ends, or the port wedges shut after `max` streams");
+		assert_eq!(limited.admitted(), 2);
+		assert_eq!(limited.refused(), 0);
+	}
 }

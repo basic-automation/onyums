@@ -549,9 +549,32 @@ mod tests {
 
 		// The whole point: HELP/TYPE metadata appears exactly once per metric family, even
 		// though two services report — this is what raw concatenation would get wrong.
-		for name in ["onyums_circuits_offered_total", "onyums_circuits_accepted_total", "onyums_circuits_rejected_total", "onyums_streams_served_total", "onyums_streams_rejected_total", "onyums_streams_shutdown_total"] {
-			assert_eq!(text.matches(&format!("# TYPE {name} counter\n")).count(), 1, "{name} declared exactly once");
+		// The family list is *derived* from `prometheus_series` rather than written out here.
+		// It used to be a hardcoded list of six names, which silently stopped covering the
+		// families added later (found 2026-07-20, when three were added in one night and none
+		// of them were checked here). Deriving it means a new counter is covered the moment it
+		// exists, instead of the day someone remembers this list.
+		// Deriving the list cannot catch a family being *removed* — the loop would simply
+		// iterate one fewer. So pin the count too: changing the exposition's shape should be
+		// a deliberate edit here, not a silent consequence.
+		let families = ServiceMetrics::default().prometheus_series();
+		assert_eq!(families.len(), 9, "the exposition has nine counter families");
+
+		for (name, _help, _value) in families {
+			assert_eq!(
+				text.matches(&format!(
+					"# TYPE {name} counter
+"
+				))
+				.count(),
+				1,
+				"{name} declared exactly once"
+			);
 			assert_eq!(text.matches(&format!("# HELP {name} ")).count(), 1, "{name} HELP exactly once");
+			// And every service contributes exactly one sample to every family.
+			for service in ["aaa.onion", "bbb.onion"] {
+				assert_eq!(text.matches(&format!("{name}{{service=\"{service}\"}} ")).count(), 1, "{name} carries one sample for {service}");
+			}
 		}
 
 		// Both services' samples are present, each under its own service label.

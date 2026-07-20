@@ -32,6 +32,7 @@ use onyums_skin::{AdaptiveDifficulty, CircuitId, CircuitPolicy};
 use tokio_rustls::TlsAcceptor;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{RendRequest, StreamRequest};
+use tor_proto::stream::IncomingStreamRequest;
 use tower_service::Service;
 use tracing::{Level, event, span};
 
@@ -75,9 +76,49 @@ pub struct ServeContext {
 /// accounting is dropped via [`CircuitPolicy::forget`] once its stream drains.
 pub async fn serve_circuits(rend_requests: impl Stream<Item = RendRequest> + Send + Unpin, ctx: ServeContext, policy: Arc<dyn CircuitPolicy>) -> Result<()> {
 	serve_circuits_with(rend_requests, ctx, policy, |streams, id, ctx, policy| async move {
-		handle_circuit_streams(streams, id, ctx, policy.as_ref()).await;
+		handle_circuit_streams(streams, id, ctx, policy.as_ref(), |req, ctx, id| async move { handle_stream_request(req, ctx, id).await }).await;
 	})
 	.await
+}
+
+/// What [`handle_circuit_streams`] needs from one stream offered on an accepted circuit.
+///
+/// The per-stream counterpart to [`IncomingCircuit`], and it exists for the same reason:
+/// `tor_hsservice::StreamRequest` wraps a `tor_proto` `IncomingStream` on a live tunnel
+/// and has no public constructor, so the loop's per-stream sequencing could not be
+/// exercised offline. The trait names the three operations the loop performs on a stream
+/// that it does *not* serve; serving is left to a callback so this seam stops short of
+/// TLS (see [`handle_circuit_streams`]).
+///
+/// The inputs are already constructible outside arti, which is what makes a test double
+/// possible at all: `IncomingStreamRequest` is a public enum and
+/// `tor_cell::relaycell::msg::Begin::new` is public, so a test builds a *real* BEGIN cell
+/// rather than approximating one.
+pub trait IncomingStreamReq: Send + 'static {
+	/// The `BEGIN`/`BEGIN_DIR` cell this stream opened with — the input to
+	/// [`circuit_gate::requested_port`].
+	fn request(&self) -> &IncomingStreamRequest;
+
+	/// Refuse this stream, leaving the circuit and its other streams alive.
+	fn reject(self, reason: End) -> impl Future<Output = Result<()>> + Send;
+
+	/// Tear down the whole rendezvous circuit this stream arrived on. Takes `self` by
+	/// value, mirroring arti — the stream is spent either way.
+	fn shutdown_circuit(self) -> Result<()>;
+}
+
+impl IncomingStreamReq for StreamRequest {
+	fn request(&self) -> &IncomingStreamRequest {
+		Self::request(self)
+	}
+
+	async fn reject(self, reason: End) -> Result<()> {
+		Self::reject(self, reason).await.map_err(|e| anyhow::anyhow!("failed to reject stream: {e}"))
+	}
+
+	fn shutdown_circuit(self) -> Result<()> {
+		Self::shutdown_circuit(self).map_err(|e| anyhow::anyhow!("failed to shut down circuit: {e}"))
+	}
 }
 
 /// What [`serve_circuits_with`] needs from one offered rendezvous circuit.
@@ -194,7 +235,12 @@ where
 
 /// Handles every stream on one accepted rendezvous circuit, consulting the policy per
 /// stream and spawning a task to serve each one the policy admits.
-pub async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamRequest> + Send + Unpin, id: CircuitId, ctx: ServeContext, policy: &dyn CircuitPolicy) {
+pub async fn handle_circuit_streams<R, F, Fut>(mut streams: impl Stream<Item = R> + Send + Unpin, id: CircuitId, ctx: ServeContext, policy: &dyn CircuitPolicy, serve: F)
+where
+	R: IncomingStreamReq,
+	F: Fn(R, ServeContext, CircuitId) -> Fut + Clone + Send + 'static,
+	Fut: Future<Output = Result<()>> + Send + 'static
+{
 	while let Some(stream_request) = streams.next().await {
 		let stream_span = span!(Level::INFO, "onyums - incoming_stream");
 		let _stream_guard = stream_span.enter();
@@ -206,8 +252,9 @@ pub async fn handle_circuit_streams(mut streams: impl Stream<Item = StreamReques
 		match disposition {
 			StreamDisposition::Serve => {
 				let ctx = ctx.clone();
+				let serve = serve.clone();
 				tokio::spawn(async move {
-					if let Err(err) = handle_stream_request(stream_request, ctx, id).await {
+					if let Err(err) = serve(stream_request, ctx, id).await {
 						event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
 					}
 				});
@@ -515,5 +562,130 @@ mod tests {
 		ids.sort_unstable();
 		ids.dedup();
 		assert_eq!(ids.len(), 5, "the allocator must not reuse an id within one loop run");
+	}
+
+	/// What one test stream did, in order.
+	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+	enum StreamOutcome {
+		Served(u16),
+		Rejected(u16),
+		ShutDown(u16)
+	}
+
+	/// A test stand-in for `StreamRequest`, carrying a *real* BEGIN cell — `Begin::new`
+	/// is public, so the port the gate reads is decoded from a genuine cell rather than
+	/// mocked around.
+	struct FakeStream {
+		request: IncomingStreamRequest,
+		port: u16,
+		outcomes: Arc<Mutex<Vec<StreamOutcome>>>
+	}
+
+	impl FakeStream {
+		fn new(port: u16, outcomes: &Arc<Mutex<Vec<StreamOutcome>>>) -> Self {
+			let begin = tor_cell::relaycell::msg::Begin::new("example.onion", port, 0).expect("a valid BEGIN cell");
+			Self { request: IncomingStreamRequest::Begin(begin), port, outcomes: Arc::clone(outcomes) }
+		}
+	}
+
+	impl IncomingStreamReq for FakeStream {
+		fn request(&self) -> &IncomingStreamRequest {
+			&self.request
+		}
+
+		fn reject(self, _reason: End) -> impl Future<Output = Result<()>> + Send {
+			self.outcomes.lock().expect("not poisoned").push(StreamOutcome::Rejected(self.port));
+			std::future::ready(Ok(()))
+		}
+
+		fn shutdown_circuit(self) -> Result<()> {
+			self.outcomes.lock().expect("not poisoned").push(StreamOutcome::ShutDown(self.port));
+			Ok(())
+		}
+	}
+
+	/// Drive `ports` through the per-stream half of the loop under a fixed stream
+	/// verdict, returning what happened to each stream and the metrics snapshot.
+	async fn run_streams(stream_verdict: CircuitAction, ports: &[u16]) -> (Vec<StreamOutcome>, crate::metrics::ServiceMetrics) {
+		struct StreamPolicy(CircuitAction);
+		impl CircuitPolicy for StreamPolicy {
+			fn on_new_circuit(&self, _id: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+
+			fn on_new_stream(&self, _id: &CircuitId, _target: &StreamTarget) -> CircuitAction {
+				self.0
+			}
+
+			fn on_request(&self, _id: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+		}
+
+		let metrics = Arc::new(CircuitMetrics::default());
+		let ctx = context(&metrics);
+		let policy = StreamPolicy(stream_verdict);
+		let outcomes = Arc::new(Mutex::new(Vec::new()));
+
+		let streams: Vec<_> = ports.iter().map(|p| FakeStream::new(*p, &outcomes)).collect();
+		let served = Arc::clone(&outcomes);
+		handle_circuit_streams(futures::stream::iter(streams), CircuitId(7), ctx, &policy, move |req: FakeStream, _ctx, _id| {
+			let served = Arc::clone(&served);
+			async move {
+				served.lock().expect("not poisoned").push(StreamOutcome::Served(req.port));
+				Ok(())
+			}
+		})
+		.await;
+
+		for _ in 0..64 {
+			tokio::task::yield_now().await;
+		}
+
+		let outcomes = outcomes.lock().expect("not poisoned").clone();
+		(outcomes, metrics.snapshot())
+	}
+
+	#[tokio::test]
+	async fn an_admitted_stream_reaches_the_server_on_the_https_port() {
+		let (outcomes, metrics) = run_streams(CircuitAction::Accept, &[443, 443]).await;
+		assert_eq!(outcomes, vec![StreamOutcome::Served(443); 2]);
+		assert_eq!(metrics.streams_served, 2);
+		assert_eq!(metrics.streams_rejected, 0);
+	}
+
+	#[tokio::test]
+	async fn a_rejected_stream_leaves_the_circuit_alive_for_the_next_one() {
+		// The property: rejection is per *stream*. Every stream in the batch is still
+		// pulled and refused — the loop must not stop on the first refusal.
+		let (outcomes, metrics) = run_streams(CircuitAction::Reject, &[443, 443, 443]).await;
+		assert_eq!(outcomes, vec![StreamOutcome::Rejected(443); 3]);
+		assert_eq!(metrics.streams_rejected, 3);
+		assert_eq!(metrics.streams_served, 0);
+	}
+
+	#[tokio::test]
+	async fn a_shutdown_verdict_tears_down_the_circuit_and_stops_pulling_streams() {
+		// The sequencing property that only this seam can observe: after `Shutdown` the
+		// loop must `break`, so the *second* stream is never touched at all. A
+		// regression that kept looping would still shut the circuit down and would
+		// still pass any counter-only assertion.
+		let (outcomes, metrics) = run_streams(CircuitAction::Shutdown, &[443, 443]).await;
+		assert_eq!(outcomes, vec![StreamOutcome::ShutDown(443)], "exactly one stream is handled; the loop stops");
+		assert_eq!(metrics.streams_shutdown, 1);
+	}
+
+	#[tokio::test]
+	async fn a_challenge_verdict_is_served_on_http_ports_but_fails_closed_on_a_raw_port() {
+		// `Challenge` only means something where the Skin gate can render one — the
+		// reserved HTTP ports. On a raw port there is no gate, so it must fail closed
+		// to a rejection rather than being served ungated. The decision lives in
+		// `circuit_gate::stream_disposition`; this pins that the loop *acts* on it.
+		let (http, _) = run_streams(CircuitAction::Challenge, &[443, 80]).await;
+		assert_eq!(http, vec![StreamOutcome::Served(443), StreamOutcome::Served(80)]);
+
+		let (raw, metrics) = run_streams(CircuitAction::Challenge, &[22, 6379]).await;
+		assert_eq!(raw, vec![StreamOutcome::Rejected(22), StreamOutcome::Rejected(6379)], "a challenge on a raw port must not be served");
+		assert_eq!(metrics.streams_rejected, 2);
 	}
 }

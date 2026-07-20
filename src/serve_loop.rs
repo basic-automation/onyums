@@ -183,7 +183,7 @@ pub async fn serve_circuits_with<C, F, Fut>(mut rend_requests: impl Stream<Item 
 where
 	C: IncomingCircuit,
 	F: Fn(C::Streams, CircuitId, ServeContext, Arc<dyn CircuitPolicy>) -> Fut + Clone + Send + 'static,
-	Fut: Future<Output = ()> + Send + 'static
+	Fut: Future<Output = ()> + Send + 'static,
 {
 	event!(Level::INFO, "Waiting for incoming rendezvous circuits...");
 	let allocator = Arc::new(CircuitIdAllocator::new());
@@ -239,7 +239,7 @@ pub async fn handle_circuit_streams<R, F, Fut>(mut streams: impl Stream<Item = R
 where
 	R: IncomingStreamReq,
 	F: Fn(R, ServeContext, CircuitId) -> Fut + Clone + Send + 'static,
-	Fut: Future<Output = Result<()>> + Send + 'static
+	Fut: Future<Output = Result<()>> + Send + 'static,
 {
 	while let Some(stream_request) = streams.next().await {
 		let stream_span = span!(Level::INFO, "onyums - incoming_stream");
@@ -397,7 +397,7 @@ mod tests {
 			plaintext: tls_policy::PlaintextPolicy::Upgrade,
 			port_router: Arc::new(PortRouter::default()),
 			metrics: Arc::clone(metrics),
-			adaptive: None
+			adaptive: None,
 		}
 	}
 
@@ -405,7 +405,7 @@ mod tests {
 	#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 	enum CircuitOutcome {
 		Accepted,
-		Rejected
+		Rejected,
 	}
 
 	/// A test stand-in for `RendRequest`. It records whether it was accepted or
@@ -416,7 +416,7 @@ mod tests {
 		outcomes: Arc<Mutex<Vec<CircuitOutcome>>>,
 		/// When true, `accept()` fails — standing in for arti failing to accept a
 		/// circuit that the policy admitted.
-		accept_fails: bool
+		accept_fails: bool,
 	}
 
 	impl IncomingCircuit for FakeCircuit {
@@ -445,7 +445,7 @@ mod tests {
 	/// A policy that answers every circuit with a fixed verdict and counts `forget`s.
 	struct ScriptedPolicy {
 		circuit_verdict: CircuitAction,
-		forgotten: Arc<Mutex<Vec<u64>>>
+		forgotten: Arc<Mutex<Vec<u64>>>,
 	}
 
 	impl ScriptedPolicy {
@@ -569,7 +569,7 @@ mod tests {
 	enum StreamOutcome {
 		Served(u16),
 		Rejected(u16),
-		ShutDown(u16)
+		ShutDown(u16),
 	}
 
 	/// A test stand-in for `StreamRequest`, carrying a *real* BEGIN cell — `Begin::new`
@@ -578,7 +578,7 @@ mod tests {
 	struct FakeStream {
 		request: IncomingStreamRequest,
 		port: u16,
-		outcomes: Arc<Mutex<Vec<StreamOutcome>>>
+		outcomes: Arc<Mutex<Vec<StreamOutcome>>>,
 	}
 
 	impl FakeStream {

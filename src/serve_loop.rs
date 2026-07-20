@@ -1283,4 +1283,72 @@ Connection: close
 		// answering on a plaintext circuit, which is exactly what Strict forbids.
 		assert!(!accepted.load(Ordering::SeqCst), "strict TLS must refuse port 80 without accepting the plaintext stream");
 	}
+
+	/// Drive one HTTPS request through the *whole* composed serve path — TLS handshake,
+	/// hyper, the Skin gate, HSTS, and the app — and return the raw response text.
+	///
+	/// This is deliberately not a `oneshot` on the router: `http_stack`'s tests already
+	/// cover the composition at the tower level, and what this adds is that the same
+	/// stack still behaves when it is reached the way a real client reaches it, through
+	/// TLS on an accepted stream.
+	async fn https_roundtrip(skin: crate::http_stack::SkinChoice, plaintext: tls_policy::PlaintextPolicy) -> String {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let address = address();
+		let acceptor = tls_acceptor(&address, &Tls::Upgrade).expect("self-signed acceptor assembles offline");
+		let app = crate::http_stack::build_serve_router(Router::new().route("/", axum::routing::get(|| async { "SECRET APP BODY" })), skin, plaintext);
+
+		let (stream_request, client_side) = DuplexStreamReq::pair(443);
+		let server = tokio::spawn(handle_tls_connection(stream_request, acceptor, app, CircuitId(41)));
+
+		let tls_config = tokio_rustls::rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(AcceptAnyCert)).with_no_client_auth();
+		let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+		let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(address.host().to_string()).expect("valid server name");
+		let mut tls = connector.connect(server_name, client_side).await.expect("TLS handshake");
+
+		tls.write_all(
+			format!(
+				"GET / HTTP/1.1
+Host: {}
+Connection: close
+
+",
+				address.host()
+			)
+			.as_bytes(),
+		)
+		.await
+		.expect("write");
+		tls.flush().await.expect("flush");
+
+		let mut response = String::new();
+		tls.read_to_string(&mut response).await.expect("read");
+		let _ = server.await.expect("join");
+		response
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn the_secure_default_gate_holds_over_the_real_tls_path() {
+		// The posture claim onyums makes loudest — "the gate is already on" — asserted
+		// end to end rather than at the router level: a first, uncleared request over a
+		// real TLS connection must NOT get the application's response body.
+		let response = https_roundtrip(crate::http_stack::SkinChoice::Default, tls_policy::PlaintextPolicy::Upgrade).await;
+		assert!(!response.contains("SECRET APP BODY"), "an uncleared request must not reach the app through the live serve path, got: {response:?}");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn opting_out_of_the_gate_serves_the_app_over_the_real_tls_path() {
+		// The control for the test above: with the gate explicitly disabled the same
+		// request does reach the app. Without this, a broken TLS path would make the
+		// gate test pass for entirely the wrong reason.
+		let response = https_roundtrip(crate::http_stack::SkinChoice::Disabled, tls_policy::PlaintextPolicy::Upgrade).await;
+		assert!(response.starts_with("HTTP/1.1 200"), "expected 200, got: {}", response.lines().next().unwrap_or(""));
+		assert!(response.contains("SECRET APP BODY"), "with no gate the app body must come back, got: {response:?}");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn strict_tls_emits_hsts_over_the_real_tls_path() {
+		let response = https_roundtrip(crate::http_stack::SkinChoice::Disabled, tls_policy::PlaintextPolicy::Reject).await;
+		assert!(response.to_ascii_lowercase().contains("strict-transport-security: max-age=63072000; includesubdomains"), "strict mode must emit HSTS on the wire, got: {response:?}");
+	}
 }

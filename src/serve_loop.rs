@@ -83,6 +83,20 @@ pub struct ServeContext {
 	/// may open many streams. Same stance at capacity: **refuse this stream**, leaving
 	/// the circuit and its other streams alive, exactly as a policy `Reject` does.
 	pub max_streams: Option<Arc<Semaphore>>,
+	/// Optional ceiling on how long one served stream may run
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits). `None` is today's
+	/// behaviour: a stream runs until it ends on its own.
+	///
+	/// This is the limit the two semaphores need to mean anything under an attack that
+	/// does not close connections: without it a client can hold a permit forever simply
+	/// by going quiet mid-request, so `max_circuits`/`max_streams` bound how many slow
+	/// clients it takes to fill the service rather than bounding the damage. A timeout
+	/// is what turns a permit into a *lease*.
+	///
+	/// Deliberately not on by default: a legitimate long-lived stream is a real use of
+	/// an onion service (the README's own websocket example is one), so a default here
+	/// would silently sever working applications.
+	pub handler_timeout: Option<std::time::Duration>,
 }
 
 /// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
@@ -339,10 +353,26 @@ where
 				ctx.metrics.record_stream(disposition);
 				let ctx = ctx.clone();
 				let serve = serve.clone();
+				let timeout = ctx.handler_timeout;
+				// Taken before `ctx` moves into the handler future.
+				let metrics = Arc::clone(&ctx.metrics);
 				tokio::spawn(async move {
-					// Held for the stream's lifetime; returned however it ends.
+					// Held for the stream's lifetime; returned however it ends — which is
+					// why the timeout below matters: it bounds that lifetime, so a client
+					// that goes quiet cannot hold a permit for ever.
 					let _permit: Option<OwnedSemaphorePermit> = permit;
-					if let Err(err) = serve(stream_request, ctx, id).await {
+					let handler = serve(stream_request, ctx, id);
+					let served = if let Some(limit) = timeout {
+						let Ok(result) = tokio::time::timeout(limit, handler).await else {
+							event!(Level::WARN, "Stream on circuit {} timed out after {limit:?}; dropping it.", id.0);
+							metrics.record_stream_timed_out();
+							return;
+						};
+						result
+					} else {
+						handler.await
+					};
+					if let Err(err) = served {
 						event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
 					}
 				});
@@ -490,6 +520,7 @@ mod tests {
 			adaptive: None,
 			max_circuits: None,
 			max_streams: None,
+			handler_timeout: None,
 		}
 	}
 
@@ -935,5 +966,69 @@ mod tests {
 		assert_eq!(outcomes.len(), 12);
 		assert_eq!(metrics.streams_served, 12);
 		assert_eq!(metrics.streams_refused_at_capacity, 0);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn a_stream_exceeding_the_handler_timeout_is_dropped_and_counted() {
+		struct AcceptAll;
+		impl CircuitPolicy for AcceptAll {
+			fn on_new_circuit(&self, _id: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+
+			fn on_new_stream(&self, _id: &CircuitId, _target: &StreamTarget) -> CircuitAction {
+				CircuitAction::Accept
+			}
+
+			fn on_request(&self, _id: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+		}
+
+		let metrics = Arc::new(CircuitMetrics::default());
+		let mut ctx = context(&metrics);
+		ctx.handler_timeout = Some(std::time::Duration::from_secs(30));
+
+		let outcomes = Arc::new(Mutex::new(Vec::new()));
+		let served = Arc::clone(&outcomes);
+		let streams = vec![FakeStream::new(443, &outcomes)];
+
+		handle_circuit_streams(futures::stream::iter(streams), CircuitId(11), ctx, &AcceptAll, move |req: FakeStream, _ctx, _id| {
+			let served = Arc::clone(&served);
+			async move {
+				served.lock().expect("not poisoned").push(StreamOutcome::Served(req.port));
+				// Far longer than the timeout. The clock is paused, so this costs no real
+				// wall time and the assertion is not a race against a real 30 seconds.
+				tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+				Ok(())
+			}
+		})
+		.await;
+
+		// Let the spawned task actually start and register its timer *before* moving the
+		// clock — advancing first would land before the timeout exists and do nothing.
+		for _ in 0..16 {
+			tokio::task::yield_now().await;
+		}
+		tokio::time::advance(std::time::Duration::from_secs(60)).await;
+		for _ in 0..16 {
+			tokio::task::yield_now().await;
+		}
+
+		let snapshot = metrics.snapshot();
+		assert_eq!(outcomes.lock().expect("not poisoned").clone(), vec![StreamOutcome::Served(443)], "the stream was admitted and the handler ran");
+		assert_eq!(snapshot.streams_served, 1, "it counts as served — it was admitted, it just did not finish");
+		assert_eq!(snapshot.streams_timed_out, 1, "and separately as timed out, which is the signal for a slow client");
+		assert_eq!(snapshot.streams_rejected, 0, "a timeout is not a policy rejection");
+		assert_eq!(snapshot.streams_refused_at_capacity, 0, "nor a capacity refusal");
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn an_unset_handler_timeout_never_drops_a_slow_stream() {
+		// The default must not acquire a deadline: a long-lived stream (a websocket, say)
+		// is a legitimate use of an onion service.
+		let (outcomes, metrics) = run_stream_capped(4, 4).await;
+		assert_eq!(outcomes.iter().filter(|o| matches!(o, StreamOutcome::Served(_))).count(), 4);
+		assert_eq!(metrics.streams_timed_out, 0);
 	}
 }

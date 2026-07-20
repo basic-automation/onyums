@@ -168,6 +168,8 @@ pub struct OnionServiceBuilder {
 	// Host-global cap on concurrently-served streams across all circuits. Same shape and
 	// same offline `0` rejection as `max_circuits`.
 	max_streams: Option<usize>,
+	// Ceiling on how long one served stream may run. `None` is today's behaviour.
+	handler_timeout: Option<std::time::Duration>,
 }
 
 impl OnionServiceBuilder {
@@ -465,6 +467,32 @@ impl OnionServiceBuilder {
 		self
 	}
 
+	/// Bound how long a single served stream may run
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits).
+	///
+	/// This is the limit that makes [`max_circuits`](Self::max_circuits) and
+	/// [`max_streams`](Self::max_streams) mean something under an attack that never
+	/// closes connections. Without it a client holds its permit for as long as it likes
+	/// simply by going quiet mid-request, so the two caps bound how many slow clients it
+	/// takes to fill the service rather than bounding the damage. A timeout turns a
+	/// permit into a lease.
+	///
+	/// A stream that exceeds `limit` is dropped and counted as
+	/// [`ServiceMetrics::streams_timed_out`](crate::ServiceMetrics::streams_timed_out) —
+	/// separate from the capacity counters, because a rising timeout count with flat
+	/// refusals means *slow* clients rather than *too many* of them, and the two call for
+	/// different responses.
+	///
+	/// **Off by default, deliberately.** A long-lived stream is a legitimate use of an
+	/// onion service — the README's websocket example is one — so a default here would
+	/// silently sever working applications. Set it when your handlers are
+	/// request/response shaped, and leave it unset (or generous) when they are not.
+	#[must_use]
+	pub const fn handler_timeout(mut self, limit: std::time::Duration) -> Self {
+		self.handler_timeout = Some(limit);
+		self
+	}
+
 	/// Launch the onion service and return a handle once the address is known.
 	///
 	/// The Tor client is bootstrapped and the service launched before this
@@ -562,7 +590,18 @@ impl OnionServiceBuilder {
 		// cheaply-cloned context (see [`ServeContext`]). The metrics counters are shared
 		// with the handle so `metrics()` reads what the loop increments.
 		let metrics = Arc::new(CircuitMetrics::default());
-		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics), adaptive: self.adaptive_difficulty, max_circuits, max_streams };
+		let ctx = ServeContext {
+			app,
+			tls_acceptor,
+			address: address.clone(),
+			plaintext,
+			port_router,
+			metrics: Arc::clone(&metrics),
+			adaptive: self.adaptive_difficulty,
+			max_circuits,
+			max_streams,
+			handler_timeout: self.handler_timeout,
+		};
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();

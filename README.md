@@ -194,7 +194,7 @@ cover every row below.
 | **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path: TLS termination and the axum handoff only run against real Tor. The `--ignored` live test covers it and CI does not run it — and note that test is currently unreliable (it has been observed hanging well past its own internal timeouts), so treat this row as genuinely unverified rather than verified-elsewhere. |
 | Raw-port serving (`route_port`) | 🟡 | The routing table and the `RawTcpHandler` proxy are offline-tested against a loopback backend; the live path is not. |
 | Circuit-policy gate, Under Attack mode | 🟢 | Both the decisions *and* the accept loop's sequencing around them are offline-tested: that a refused circuit is never accepted and yields no streams, that a rejected stream leaves the circuit alive, that a `Shutdown` verdict stops the loop, that a challenge fails closed on a raw port, and that per-circuit accounting is always dropped. What remains live-only is the TLS/serve step itself (next row). |
-| Host-global caps (`max_circuits` / `max_streams`) | 🟢 | Refusal-at-capacity, permit release, the unbounded defaults, and the `0` rejections are all offline-tested; refusals are counted separately from policy rejections, and a capacity-refused stream is counted once. |
+| Backpressure (`max_circuits` / `max_streams` / `handler_timeout`) | 🟢 | Refusal-at-capacity, the unbounded defaults, the `0` rejections, and timeout expiry (on a paused clock) are all offline-tested; refusals, timeouts, and policy rejections are counted separately, and a capacity-refused stream is counted once. |
 | Multiple services on one shared client | 🟡 | The offline surface (`shared_client()`, conflict rejection, fleet status) is tested; N-services-actually-reachable is not verified. |
 | `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
 | Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
@@ -429,6 +429,7 @@ async fn main() {
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits (custom CircuitPolicy)
 		// .max_circuits(256)                    // host-global cap: refuse (never queue) circuits beyond N
 		// .max_streams(1024)                    // host-global cap on concurrent streams across all circuits
+		// .handler_timeout(Duration::from_secs(30)) // drop a stream that runs longer than this
 		// .under_attack(true)                   // force EVERY new circuit through the gate (flood mode)
 		// .circuit_events(my_sink)              // observe circuit rejects/teardowns/challenges
 		// .adaptive_difficulty(controller)      // feed circuit-flood load into Skin's adaptive PoW
@@ -483,7 +484,20 @@ policy rejection does. It is counted as `ServiceMetrics::streams_refused_at_capa
 Both `max_circuits(0)` and `max_streams(0)` are rejected by `serve()` before any
 bootstrap, rather than becoming a live onion address that answers nothing.
 
-Not implemented yet: a max body size before WAF inspection, and per-handler timeouts.
+`.handler_timeout(d)` is what makes both caps mean anything. Without it a client holds
+its permit for as long as it likes just by going quiet mid-request, so the caps bound how
+many slow clients it takes to fill the service rather than bounding the damage — a
+timeout turns a permit into a lease. Exceeding it drops the stream and counts it as
+`ServiceMetrics::streams_timed_out`, separately from the capacity counters: a rising
+timeout count against flat refusals means *slow* clients rather than *too many*, and you
+would respond to those differently.
+
+It is **off by default on purpose**. A long-lived stream is a legitimate use of an onion
+service — the websocket example further down is one — so a default deadline would
+silently sever working applications. Set it when your handlers are request/response
+shaped; leave it unset, or generous, when they are not.
+
+Not implemented yet: a max body size before WAF inspection.
 
 ## Restricted discovery — v3 client authorization
 

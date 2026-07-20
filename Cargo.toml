@@ -142,5 +142,9 @@ bytes = { workspace = true }
 safelog = { workspace = true }
 
 [dev-dependencies]
+# `test-util` (not part of tokio's `full`) gives the tests tokio's *paused clock*, so the
+# per-handler-timeout tests assert on a 30s timeout firing without spending 30s of real
+# wall time — and without the flakiness a short real timeout would bring.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 tower = { workspace = true }

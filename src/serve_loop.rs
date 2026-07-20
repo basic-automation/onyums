@@ -29,6 +29,7 @@ use hyper_util::{
 	rt::{TokioExecutor, TokioIo}, service::TowerToHyperService
 };
 use onyums_skin::{AdaptiveDifficulty, CircuitId, CircuitPolicy};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 use tor_cell::relaycell::msg::{Connected, End, EndReason};
 use tor_hsservice::{RendRequest, StreamRequest};
@@ -60,6 +61,18 @@ pub struct ServeContext {
 	/// Optional Skin adaptive-PoW controller, shared with the caller's `Skin`. Each
 	/// offered circuit is recorded here (see `circuit_gate::observe_circuit`).
 	pub adaptive: Option<Arc<AdaptiveDifficulty>>,
+	/// Optional host-global cap on concurrently-served rendezvous circuits
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits). `None` is today's
+	/// behaviour: unbounded, one task per circuit.
+	///
+	/// A permit is taken *after* the policy verdict and held for the circuit's whole
+	/// lifetime, so it is released however the circuit ends. At capacity the loop
+	/// **refuses** rather than queues — the same stance `ConnectionLimit` takes on raw
+	/// ports, and for the same reason: queueing turns a circuit flood into unbounded
+	/// memory growth plus a latency cliff for the clients already being served, which
+	/// is the exact failure a limit exists to prevent. A refused client can retry; one
+	/// parked in an invisible queue cannot tell slow from dead.
+	pub max_circuits: Option<Arc<Semaphore>>,
 }
 
 /// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
@@ -166,6 +179,30 @@ impl IncomingCircuit for RendRequest {
 	}
 }
 
+/// Whether a newly-offered circuit may be served, under the host-global cap.
+///
+/// Three outcomes rather than an `Option`, because "no limit configured" and "a permit
+/// was granted" are different facts that happen to allow the same next step — and
+/// collapsing them is how a future edit accidentally starts counting unbounded service as
+/// grants.
+enum Admission {
+	/// No host-global cap is configured; serve without taking a permit.
+	Unbounded,
+	/// A permit was taken; hold it for the circuit's lifetime.
+	Granted(OwnedSemaphorePermit),
+	/// The cap is full; refuse this circuit.
+	Full,
+}
+
+/// Try to take a circuit permit without waiting.
+///
+/// `try_acquire_owned` is what makes the cap a *refusal* rather than a stall: it never
+/// queues, so a circuit arriving at capacity is turned away immediately instead of
+/// parking a task and a rendezvous circuit for an unbounded time.
+fn admit_circuit(limit: Option<&Arc<Semaphore>>) -> Admission {
+	limit.map_or(Admission::Unbounded, |limit| Arc::clone(limit).try_acquire_owned().map_or(Admission::Full, Admission::Granted))
+}
+
 /// The generic core of [`serve_circuits`]: everything the loop *decides and sequences*,
 /// with the two arti-owned pieces abstracted away — the circuit type behind
 /// [`IncomingCircuit`], and what to do with an accepted circuit's streams behind
@@ -210,6 +247,24 @@ where
 			continue;
 		}
 
+		// Host-global backpressure, after the policy verdict and before any work: a
+		// circuit that cannot get a permit is refused outright rather than queued.
+		// `try_acquire_owned` never waits, which is what makes this a refusal and not a
+		// stall; the permit rides with the spawned task and is released when it ends.
+		let permit = match admit_circuit(ctx.max_circuits.as_ref()) {
+			Admission::Unbounded => None,
+			Admission::Granted(permit) => Some(permit),
+			Admission::Full => {
+				event!(Level::WARN, "Circuit {} refused: at the host-global concurrency limit.", id.0);
+				ctx.metrics.record_circuit_refused_at_capacity();
+				if let Err(err) = rend_request.reject().await {
+					event!(Level::INFO, "Failed to refuse circuit {}: {err}", id.0);
+				}
+				policy.forget(&id);
+				continue;
+			}
+		};
+
 		let streams = match rend_request.accept().await {
 			Ok(streams) => streams,
 			Err(err) => {
@@ -223,6 +278,9 @@ where
 		let policy = policy.clone();
 		let drive = drive.clone();
 		tokio::spawn(async move {
+			// Bound to the task, so the permit returns however the circuit ends —
+			// normally, by teardown, or by a panic in the driver.
+			let _permit: Option<OwnedSemaphorePermit> = permit;
 			drive(streams, id, ctx, Arc::clone(&policy)).await;
 			// The circuit has drained; drop its accounting so the policy's map does not
 			// grow without bound (there is no per-stream close hook).
@@ -398,6 +456,7 @@ mod tests {
 			port_router: Arc::new(PortRouter::default()),
 			metrics: Arc::clone(metrics),
 			adaptive: None,
+			max_circuits: None,
 		}
 	}
 
@@ -687,5 +746,78 @@ mod tests {
 		let (raw, metrics) = run_streams(CircuitAction::Challenge, &[22, 6379]).await;
 		assert_eq!(raw, vec![StreamOutcome::Rejected(22), StreamOutcome::Rejected(6379)], "a challenge on a raw port must not be served");
 		assert_eq!(metrics.streams_rejected, 2);
+	}
+
+	/// Circuits offered under a host-global cap of `max`, where every admitted circuit
+	/// parks in its driver and never finishes — so its permit is still held when the
+	/// next circuit is offered. That is the only way to observe the limit: with a driver
+	/// that returns immediately the permit is back before the next offer and no cap of
+	/// any size would ever be reached.
+	async fn run_capped(max: usize, count: usize) -> (Vec<CircuitOutcome>, crate::metrics::ServiceMetrics) {
+		let metrics = Arc::new(CircuitMetrics::default());
+		let mut ctx = context(&metrics);
+		ctx.max_circuits = Some(Arc::new(Semaphore::new(max)));
+
+		let (policy, _forgotten) = ScriptedPolicy::scripted(CircuitAction::Accept);
+		let outcomes = Arc::new(Mutex::new(Vec::new()));
+		let circuits: Vec<_> = (0..count).map(|_| FakeCircuit { outcomes: Arc::clone(&outcomes), accept_fails: false }).collect();
+
+		let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+		let held = release_rx.clone();
+		serve_circuits_with(futures::stream::iter(circuits), ctx, policy, move |(), _id, _ctx, _policy| {
+			let mut held = held.clone();
+			async move {
+				// Park until the test releases: the permit stays taken meanwhile.
+				while !*held.borrow() {
+					if held.changed().await.is_err() {
+						break;
+					}
+				}
+			}
+		})
+		.await
+		.expect("the loop ends cleanly when the circuit stream ends");
+
+		// Let the parked drivers finish so the run does not leak tasks.
+		let _ = release_tx.send(true);
+		for _ in 0..64 {
+			tokio::task::yield_now().await;
+		}
+
+		let outcomes = outcomes.lock().expect("not poisoned").clone();
+		(outcomes, metrics.snapshot())
+	}
+
+	#[tokio::test]
+	async fn circuits_beyond_the_host_global_limit_are_refused_not_queued() {
+		// Two permits, four circuits, none of them finishing: the first two are accepted
+		// and the rest must be refused *immediately*. If the loop queued instead of
+		// refusing, this test would hang rather than fail — which is precisely the
+		// failure mode a cap exists to prevent, so the shape of the assertion matters.
+		let (outcomes, metrics) = run_capped(2, 4).await;
+		assert_eq!(outcomes, vec![CircuitOutcome::Accepted, CircuitOutcome::Accepted, CircuitOutcome::Rejected, CircuitOutcome::Rejected]);
+		assert_eq!(metrics.circuits_offered, 4);
+		assert_eq!(metrics.circuits_accepted, 2);
+		assert_eq!(metrics.circuits_refused_at_capacity, 2);
+		// The refusals are NOT policy rejections — the policy admitted all four.
+		assert_eq!(metrics.circuits_rejected, 0, "being full is a fact about the service, not a verdict about the circuit");
+	}
+
+	#[tokio::test]
+	async fn a_limit_at_or_above_the_offered_load_refuses_nothing() {
+		let (outcomes, metrics) = run_capped(4, 4).await;
+		assert_eq!(outcomes, vec![CircuitOutcome::Accepted; 4]);
+		assert_eq!(metrics.circuits_refused_at_capacity, 0);
+		assert_eq!(metrics.circuits_accepted, 4);
+	}
+
+	#[tokio::test]
+	async fn an_unset_limit_stays_unbounded() {
+		// The default must not quietly acquire a ceiling: with no cap, circuits that
+		// never finish still all get served.
+		let (outcomes, _forgotten, drives, metrics) = run(CircuitAction::Accept, 16, false).await;
+		assert_eq!(outcomes.len(), 16);
+		assert_eq!(drives, 16);
+		assert_eq!(metrics.circuits_refused_at_capacity, 0);
 	}
 }

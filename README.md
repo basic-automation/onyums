@@ -194,6 +194,7 @@ cover every row below.
 | **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path: TLS termination and the axum handoff only run against real Tor. The `--ignored` live test covers it and CI does not run it — and note that test is currently unreliable (it has been observed hanging well past its own internal timeouts), so treat this row as genuinely unverified rather than verified-elsewhere. |
 | Raw-port serving (`route_port`) | 🟡 | The routing table and the `RawTcpHandler` proxy are offline-tested against a loopback backend; the live path is not. |
 | Circuit-policy gate, Under Attack mode | 🟢 | Both the decisions *and* the accept loop's sequencing around them are offline-tested: that a refused circuit is never accepted and yields no streams, that a rejected stream leaves the circuit alive, that a `Shutdown` verdict stops the loop, that a challenge fails closed on a raw port, and that per-circuit accounting is always dropped. What remains live-only is the TLS/serve step itself (next row). |
+| Host-global circuit cap (`max_circuits`) | 🟢 | Refusal-at-capacity, permit release, the unbounded default, and the `max_circuits(0)` rejection are all offline-tested; refusals are counted separately from policy rejections. |
 | Multiple services on one shared client | 🟡 | The offline surface (`shared_client()`, conflict rejection, fleet status) is tested; N-services-actually-reachable is not verified. |
 | `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
 | Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
@@ -426,6 +427,7 @@ async fn main() {
 		// The secure-default gate is ALREADY ON. Use these only to tune or relax it:
 		// .skin(Skin::secure_default())        // tune via Skin::builder() (difficulty, store, WAF, ...)
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits (custom CircuitPolicy)
+		// .max_circuits(256)                    // host-global cap: refuse (never queue) circuits beyond N
 		// .under_attack(true)                   // force EVERY new circuit through the gate (flood mode)
 		// .circuit_events(my_sink)              // observe circuit rejects/teardowns/challenges
 		// .adaptive_difficulty(controller)      // feed circuit-flood load into Skin's adaptive PoW
@@ -448,6 +450,32 @@ async fn main() {
 The full Skin API (clearance tokens, the challenge chain, the WAF, per-circuit `CircuitPolicy`, adaptive difficulty, and security metrics/events) is re-exported under `onyums::onyums_skin`. The design and roadmap live in [`crates/onyums-skin/ROADMAP.md`](crates/onyums-skin/ROADMAP.md).
 
 ****
+
+## Host-global backpressure
+
+`.circuit_policy(...)` bounds what a *single* circuit may do (streams, request rate, byte
+budget). `.max_circuits(n)` bounds how many circuits exist at once — without it a service
+spawns a task per offered circuit and a flood is bounded only by memory.
+
+At capacity onyums **refuses** the circuit; it never queues it. Queueing would convert a
+flood into unbounded memory growth plus a latency cliff for the clients already being
+served, which is the failure the cap exists to prevent — and a refused client can retry,
+while one parked in an invisible queue cannot tell slow from dead. The permit is taken
+after the circuit policy admits the circuit and released when the circuit ends, however
+it ends.
+
+Refusals are reported separately from policy rejections, as
+`ServiceMetrics::circuits_refused_at_capacity` (`onyums_circuits_refused_at_capacity_total`
+in the Prometheus exposition). That distinction is the useful part: a policy rejection is
+a verdict about the circuit, while a capacity refusal means the service is full. If you
+alarm on the two together, an under-provisioned service looks like one under attack, and
+you will tune the wrong knob.
+
+`max_circuits(0)` is rejected by `serve()` before any bootstrap rather than becoming a
+live onion address that refuses every client.
+
+This is the *host-global* half of the roadmap's backpressure item; a total-concurrent-
+**streams** cap and per-handler timeouts are not implemented yet.
 
 ## Restricted discovery — v3 client authorization
 

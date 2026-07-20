@@ -23,6 +23,7 @@ use axum::Router;
 use futures::Stream;
 use onyums_skin::{AccountingCircuitPolicy, AdaptiveDifficulty, CircuitPolicy, RestrictedDiscovery, SecurityEventSink, Skin};
 use safelog::DisplayRedacted;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tor_hsservice::{RendRequest, RunningOnionService, config::OnionServiceConfig};
 use tracing::{Level, event, span};
@@ -95,6 +96,24 @@ fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: 
 /// disposable identity. Every other pairing is valid (a fresh persistent client, a
 /// fresh ephemeral client, or a shared persistent client). Extracted from
 /// [`OnionServiceBuilder::serve`] so the rule is unit-testable with no live Tor network.
+/// Turn the builder's optional circuit cap into a semaphore, rejecting `0` offline
+/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits).
+///
+/// A cap of `0` would be a service that refuses every circuit it is ever offered — a
+/// silently dead onion address. That is never what a caller means by "limit the
+/// concurrency", so it is a clean `serve()` error before any bootstrap, exactly as
+/// `ConnectionLimit::new` rejects a limit of `0` at construction.
+///
+/// # Errors
+/// Returns an error if `max` is `Some(0)`.
+fn resolve_circuit_limit(max: Option<usize>) -> Result<Option<Arc<Semaphore>>> {
+	match max {
+		Some(0) => bail!("max_circuits(0) would refuse every rendezvous circuit, making the service unreachable: pass a positive limit, or drop max_circuits() to stay unbounded"),
+		Some(max) => Ok(Some(Arc::new(Semaphore::new(max)))),
+		None => Ok(None),
+	}
+}
+
 fn validate_client_choice(ephemeral: bool, has_shared_client: bool) -> Result<()> {
 	if ephemeral && has_shared_client {
 		bail!("ephemeral() conflicts with tor_client(): a shared Tor client has a fixed keystore and cannot provide a throwaway per-launch identity; use one or the other");
@@ -126,6 +145,11 @@ pub struct OnionServiceBuilder {
 	// instead of bootstrapping a fresh one (Phase 4 multi-service — bootstrap once,
 	// launch N). `None` keeps today's behaviour: `serve` bootstraps its own client.
 	tor_client: Option<Arc<OnionTorClient>>,
+	// Host-global cap on concurrently-served rendezvous circuits (Phase 0 backpressure).
+	// `None` is today's behaviour: unbounded. Stored as the raw count and turned into a
+	// semaphore at launch, so the builder stays cheaply cloneable and a `0` is rejected
+	// offline rather than becoming a service that refuses everything.
+	max_circuits: Option<usize>,
 }
 
 impl OnionServiceBuilder {
@@ -372,6 +396,35 @@ impl OnionServiceBuilder {
 		self
 	}
 
+	/// Cap how many rendezvous circuits the service will serve at once
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits).
+	///
+	/// Unset, a service spawns a task per offered circuit with no ceiling, so a circuit
+	/// flood is bounded only by memory. With a cap, a circuit arriving while `max` are
+	/// already in service is **refused**, not queued — the same stance
+	/// [`ConnectionLimit`](crate::ConnectionLimit) takes on raw ports: queueing converts
+	/// a flood into unbounded memory growth and a latency cliff for the clients already
+	/// being served, and a refused client can retry where one parked in an invisible
+	/// queue cannot tell slow from dead.
+	///
+	/// This is *host-global* and complements — does not replace — the per-circuit caps
+	/// in [`AccountingCircuitPolicy`](onyums_skin::AccountingCircuitPolicy)
+	/// (`max_streams` / `max_request_rate` / `max_bytes`), which bound what a single
+	/// circuit may do. Refusals are counted separately from policy rejections, as
+	/// [`ServiceMetrics::circuits_refused_at_capacity`](crate::ServiceMetrics::circuits_refused_at_capacity):
+	/// being full is a fact about the service, not a verdict about the circuit.
+	///
+	/// The permit is taken after the circuit policy admits the circuit and released when
+	/// the circuit ends, however it ends.
+	///
+	/// A `max` of `0` is rejected by [`Self::serve`] offline, rather than silently
+	/// becoming a service that refuses every circuit.
+	#[must_use]
+	pub const fn max_circuits(mut self, max: usize) -> Self {
+		self.max_circuits = Some(max);
+		self
+	}
+
 	/// Launch the onion service and return a handle once the address is known.
 	///
 	/// The Tor client is bootstrapped and the service launched before this
@@ -434,6 +487,7 @@ impl OnionServiceBuilder {
 		// else the fixed persistent onyums tree. A shared client cannot be ephemeral
 		// (fixed keystore), rejected here before any launch.
 		validate_client_choice(self.ephemeral, self.tor_client.is_some())?;
+		let max_circuits = resolve_circuit_limit(self.max_circuits)?;
 		let (client, ephemeral) = if let Some(shared) = self.tor_client {
 			(shared, None)
 		} else {
@@ -467,7 +521,7 @@ impl OnionServiceBuilder {
 		// cheaply-cloned context (see [`ServeContext`]). The metrics counters are shared
 		// with the handle so `metrics()` reads what the loop increments.
 		let metrics = Arc::new(CircuitMetrics::default());
-		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics), adaptive: self.adaptive_difficulty };
+		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics), adaptive: self.adaptive_difficulty, max_circuits };
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
@@ -609,6 +663,21 @@ mod tests {
 		assert!(validate_client_choice(false, false).is_ok());
 		assert!(validate_client_choice(true, false).is_ok());
 		assert!(validate_client_choice(false, true).is_ok());
+	}
+
+	#[test]
+	fn circuit_limit_of_zero_is_rejected_offline() {
+		// A cap of 0 would refuse every circuit the service is ever offered — a live
+		// onion address that is silently unreachable. That must be a launch error, not
+		// a runtime surprise, and it must be caught before any Tor bootstrap.
+		assert!(resolve_circuit_limit(Some(0)).is_err(), "max_circuits(0) would make the service unreachable");
+
+		// A positive cap yields a semaphore with exactly that many permits.
+		let limit = resolve_circuit_limit(Some(3)).expect("a positive limit is valid").expect("a limit was requested");
+		assert_eq!(limit.available_permits(), 3);
+
+		// Unset stays unbounded — the default must not acquire a ceiling.
+		assert!(resolve_circuit_limit(None).expect("no limit is valid").is_none());
 	}
 
 	#[tokio::test]

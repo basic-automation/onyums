@@ -194,7 +194,7 @@ cover every row below.
 | **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path: TLS termination and the axum handoff only run against real Tor. The `--ignored` live test covers it and CI does not run it — and note that test is currently unreliable (it has been observed hanging well past its own internal timeouts), so treat this row as genuinely unverified rather than verified-elsewhere. |
 | Raw-port serving (`route_port`) | 🟡 | The routing table and the `RawTcpHandler` proxy are offline-tested against a loopback backend; the live path is not. |
 | Circuit-policy gate, Under Attack mode | 🟢 | Both the decisions *and* the accept loop's sequencing around them are offline-tested: that a refused circuit is never accepted and yields no streams, that a rejected stream leaves the circuit alive, that a `Shutdown` verdict stops the loop, that a challenge fails closed on a raw port, and that per-circuit accounting is always dropped. What remains live-only is the TLS/serve step itself (next row). |
-| Host-global circuit cap (`max_circuits`) | 🟢 | Refusal-at-capacity, permit release, the unbounded default, and the `max_circuits(0)` rejection are all offline-tested; refusals are counted separately from policy rejections. |
+| Host-global caps (`max_circuits` / `max_streams`) | 🟢 | Refusal-at-capacity, permit release, the unbounded defaults, and the `0` rejections are all offline-tested; refusals are counted separately from policy rejections, and a capacity-refused stream is counted once. |
 | Multiple services on one shared client | 🟡 | The offline surface (`shared_client()`, conflict rejection, fleet status) is tested; N-services-actually-reachable is not verified. |
 | `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
 | Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
@@ -428,6 +428,7 @@ async fn main() {
 		// .skin(Skin::secure_default())        // tune via Skin::builder() (difficulty, store, WAF, ...)
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits (custom CircuitPolicy)
 		// .max_circuits(256)                    // host-global cap: refuse (never queue) circuits beyond N
+		// .max_streams(1024)                    // host-global cap on concurrent streams across all circuits
 		// .under_attack(true)                   // force EVERY new circuit through the gate (flood mode)
 		// .circuit_events(my_sink)              // observe circuit rejects/teardowns/challenges
 		// .adaptive_difficulty(controller)      // feed circuit-flood load into Skin's adaptive PoW
@@ -471,11 +472,18 @@ a verdict about the circuit, while a capacity refusal means the service is full.
 alarm on the two together, an under-provisioned service looks like one under attack, and
 you will tune the wrong knob.
 
-`max_circuits(0)` is rejected by `serve()` before any bootstrap rather than becoming a
-live onion address that refuses every client.
+`.max_streams(n)` is the companion cap, on concurrently-served **streams** across every
+circuit. It is not a duplicate: the circuit cap bounds how many clients are in service,
+this bounds the total work in flight — one circuit may open many streams, so a circuit
+cap alone does not bound sockets or memory. A stream refused for capacity gets Tor's
+`RESOURCELIMIT` end reason (which says the service is full, rather than claiming the
+request was simply done) and leaves the circuit and its other streams alive, exactly as a
+policy rejection does. It is counted as `ServiceMetrics::streams_refused_at_capacity`.
 
-This is the *host-global* half of the roadmap's backpressure item; a total-concurrent-
-**streams** cap and per-handler timeouts are not implemented yet.
+Both `max_circuits(0)` and `max_streams(0)` are rejected by `serve()` before any
+bootstrap, rather than becoming a live onion address that answers nothing.
+
+Not implemented yet: a max body size before WAF inspection, and per-handler timeouts.
 
 ## Restricted discovery — v3 client authorization
 

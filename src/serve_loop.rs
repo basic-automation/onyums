@@ -73,6 +73,16 @@ pub struct ServeContext {
 	/// is the exact failure a limit exists to prevent. A refused client can retry; one
 	/// parked in an invisible queue cannot tell slow from dead.
 	pub max_circuits: Option<Arc<Semaphore>>,
+	/// Optional host-global cap on concurrently-served *streams*, across all circuits
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits). `None` is today's
+	/// behaviour: unbounded.
+	///
+	/// Complements [`max_circuits`](Self::max_circuits) rather than duplicating it: a
+	/// circuit cap bounds how many clients are in service, while this bounds the total
+	/// work in flight, which is what actually consumes sockets and memory — one circuit
+	/// may open many streams. Same stance at capacity: **refuse this stream**, leaving
+	/// the circuit and its other streams alive, exactly as a policy `Reject` does.
+	pub max_streams: Option<Arc<Semaphore>>,
 }
 
 /// Drives the rendezvous-circuit loop with a [`CircuitPolicy`], preserving the
@@ -306,18 +316,39 @@ where
 		let target = circuit_gate::stream_target(port);
 
 		let disposition = circuit_gate::stream_disposition(policy.on_new_stream(&id, &target), port);
-		ctx.metrics.record_stream(disposition);
 		match disposition {
 			StreamDisposition::Serve => {
+				// Host-global stream backpressure. Checked *before* the stream is recorded
+				// as served, so a stream refused for capacity is counted once, as a
+				// refusal — recording the disposition first would count it as both served
+				// and refused, and make the served total a lie.
+				let permit = match admit_circuit(ctx.max_streams.as_ref()) {
+					Admission::Unbounded => None,
+					Admission::Granted(permit) => Some(permit),
+					Admission::Full => {
+						event!(Level::WARN, "Stream on circuit {} refused: at the host-global stream limit.", id.0);
+						ctx.metrics.record_stream_refused_at_capacity();
+						// Refuse just this stream; the circuit and its others live on, the
+						// same shape as a policy rejection.
+						if let Err(err) = stream_request.reject(End::new_with_reason(EndReason::RESOURCELIMIT)).await {
+							event!(Level::INFO, "Failed to refuse stream on circuit {}: {err}", id.0);
+						}
+						continue;
+					}
+				};
+				ctx.metrics.record_stream(disposition);
 				let ctx = ctx.clone();
 				let serve = serve.clone();
 				tokio::spawn(async move {
+					// Held for the stream's lifetime; returned however it ends.
+					let _permit: Option<OwnedSemaphorePermit> = permit;
 					if let Err(err) = serve(stream_request, ctx, id).await {
 						event!(Level::INFO, "Connection closed: Error handling stream request: {err}");
 					}
 				});
 			}
 			StreamDisposition::Reject => {
+				ctx.metrics.record_stream(disposition);
 				event!(Level::INFO, "Stream on circuit {} rejected by policy.", id.0);
 				// Reject just this stream (DONE keeps onyums indistinguishable from other
 				// onion services); the circuit and its other streams live on.
@@ -326,6 +357,7 @@ where
 				}
 			}
 			StreamDisposition::Shutdown => {
+				ctx.metrics.record_stream(disposition);
 				event!(Level::INFO, "Tearing down circuit {} by policy.", id.0);
 				if let Err(err) = stream_request.shutdown_circuit() {
 					event!(Level::INFO, "Failed to shut down circuit {}: {err}", id.0);
@@ -457,6 +489,7 @@ mod tests {
 			metrics: Arc::clone(metrics),
 			adaptive: None,
 			max_circuits: None,
+			max_streams: None,
 		}
 	}
 
@@ -819,5 +852,88 @@ mod tests {
 		assert_eq!(outcomes.len(), 16);
 		assert_eq!(drives, 16);
 		assert_eq!(metrics.circuits_refused_at_capacity, 0);
+	}
+
+	/// Streams offered under a host-global stream cap of `max`, where every served
+	/// stream parks and never finishes — so its permit is still held for the next one.
+	async fn run_stream_capped(max: usize, count: usize) -> (Vec<StreamOutcome>, crate::metrics::ServiceMetrics) {
+		struct AcceptAll;
+		impl CircuitPolicy for AcceptAll {
+			fn on_new_circuit(&self, _id: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+
+			fn on_new_stream(&self, _id: &CircuitId, _target: &StreamTarget) -> CircuitAction {
+				CircuitAction::Accept
+			}
+
+			fn on_request(&self, _id: &CircuitId) -> CircuitAction {
+				CircuitAction::Accept
+			}
+		}
+
+		let metrics = Arc::new(CircuitMetrics::default());
+		let mut ctx = context(&metrics);
+		ctx.max_streams = Some(Arc::new(Semaphore::new(max)));
+
+		let outcomes = Arc::new(Mutex::new(Vec::new()));
+		let streams: Vec<_> = (0..count).map(|_| FakeStream::new(443, &outcomes)).collect();
+
+		let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+		let served = Arc::clone(&outcomes);
+		let held = release_rx.clone();
+		handle_circuit_streams(futures::stream::iter(streams), CircuitId(9), ctx, &AcceptAll, move |req: FakeStream, _ctx, _id| {
+			let served = Arc::clone(&served);
+			let mut held = held.clone();
+			async move {
+				served.lock().expect("not poisoned").push(StreamOutcome::Served(req.port));
+				while !*held.borrow() {
+					if held.changed().await.is_err() {
+						break;
+					}
+				}
+				Ok(())
+			}
+		})
+		.await;
+
+		let _ = release_tx.send(true);
+		for _ in 0..64 {
+			tokio::task::yield_now().await;
+		}
+
+		let outcomes = outcomes.lock().expect("not poisoned").clone();
+		(outcomes, metrics.snapshot())
+	}
+
+	#[tokio::test]
+	async fn streams_beyond_the_host_global_stream_limit_are_refused_not_queued() {
+		// Two permits, five streams, none finishing: two served, three refused. As with
+		// the circuit cap, a loop that queued would hang here rather than fail.
+		let (outcomes, metrics) = run_stream_capped(2, 5).await;
+		assert_eq!(outcomes.iter().filter(|o| matches!(o, StreamOutcome::Served(_))).count(), 2);
+		assert_eq!(outcomes.iter().filter(|o| matches!(o, StreamOutcome::Rejected(_))).count(), 3);
+		assert_eq!(metrics.streams_refused_at_capacity, 3);
+		// The refused streams must NOT also show up as served — the disposition is
+		// recorded after the permit is taken, precisely so the served total stays true.
+		assert_eq!(metrics.streams_served, 2, "a capacity-refused stream is counted once, as a refusal");
+		assert_eq!(metrics.streams_rejected, 0, "being full is not a policy verdict");
+	}
+
+	#[tokio::test]
+	async fn a_stream_limit_at_or_above_the_offered_load_refuses_nothing() {
+		let (outcomes, metrics) = run_stream_capped(5, 5).await;
+		assert_eq!(outcomes.iter().filter(|o| matches!(o, StreamOutcome::Served(_))).count(), 5);
+		assert_eq!(metrics.streams_refused_at_capacity, 0);
+		assert_eq!(metrics.streams_served, 5);
+	}
+
+	#[tokio::test]
+	async fn an_unset_stream_limit_stays_unbounded() {
+		// `run_streams` leaves `max_streams` at None; all 12 must be served.
+		let (outcomes, metrics) = run_streams(CircuitAction::Accept, &[443; 12]).await;
+		assert_eq!(outcomes.len(), 12);
+		assert_eq!(metrics.streams_served, 12);
+		assert_eq!(metrics.streams_refused_at_capacity, 0);
 	}
 }

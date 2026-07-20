@@ -38,7 +38,7 @@ use tower_service::Service;
 use tracing::{Level, event, span};
 
 use crate::{
-	address::OnionAddress, circuit_gate::{self, CircuitDisposition, CircuitIdAllocator, StreamDisposition}, connection::ConnectionInfo, metrics::CircuitMetrics, port_router::{PortDispatch, PortRouter, StreamHandler}, tls_policy
+	address::OnionAddress, circuit_gate::{self, CircuitDisposition, CircuitIdAllocator, StreamDisposition}, connection::ConnectionInfo, metrics::CircuitMetrics, port_router::{AsyncStream, PortDispatch, PortRouter, StreamHandler}, tls_policy
 };
 
 /// The shared, per-service context threaded through the rendezvous loop down to
@@ -136,6 +136,15 @@ pub trait IncomingStreamReq: Send + 'static {
 	/// [`circuit_gate::requested_port`].
 	fn request(&self) -> &IncomingStreamRequest;
 
+	/// The accepted bidirectional stream. `AsyncRead + AsyncWrite + Send + Unpin` is the
+	/// whole contract the serve path needs, which is why a `tokio::io::duplex` pair can
+	/// stand in for an accepted onion stream in tests — the same trick `raw_tcp` and
+	/// `ConnectionLimit` already rely on.
+	type Stream: AsyncStream + 'static;
+
+	/// Accept this stream, answering the client's BEGIN with `connected`.
+	fn accept(self, connected: Connected) -> impl Future<Output = Result<Self::Stream>> + Send;
+
 	/// Refuse this stream, leaving the circuit and its other streams alive.
 	fn reject(self, reason: End) -> impl Future<Output = Result<()>> + Send;
 
@@ -145,8 +154,14 @@ pub trait IncomingStreamReq: Send + 'static {
 }
 
 impl IncomingStreamReq for StreamRequest {
+	type Stream = tor_proto::client::stream::DataStream;
+
 	fn request(&self) -> &IncomingStreamRequest {
 		Self::request(self)
+	}
+
+	async fn accept(self, connected: Connected) -> Result<Self::Stream> {
+		Self::accept(self, connected).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))
 	}
 
 	async fn reject(self, reason: End) -> Result<()> {
@@ -400,9 +415,9 @@ where
 }
 
 /// Handles a TLS connection on port 443.
-pub async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: TlsAcceptor, app: Router, circuit_id: CircuitId) -> Result<()> {
+pub async fn handle_tls_connection<R: IncomingStreamReq>(stream_request: R, tls_acceptor: TlsAcceptor, app: Router, circuit_id: CircuitId) -> Result<()> {
 	event!(Level::INFO, "Accepting the incoming stream and wrapping it in a TLS stream...");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await?;
 
 	// Surface the host-assigned per-circuit id to the application (and the Skin HTTP
 	// gate) via the axum connect-info, replacing the long-hardcoded `None`.
@@ -435,9 +450,9 @@ pub async fn handle_tls_connection(stream_request: StreamRequest, tls_acceptor: 
 }
 
 /// Handles a plain HTTP request on port 80 by redirecting to HTTPS.
-pub async fn handle_http_redirect(stream_request: StreamRequest, requested_host: String) -> Result<()> {
+pub async fn handle_http_redirect<R: IncomingStreamReq>(stream_request: R, requested_host: String) -> Result<()> {
 	event!(Level::INFO, "Accepting plain HTTP request on port 80 and redirecting to HTTPS.");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await?;
 
 	let stream = TokioIo::new(onion_service_stream);
 
@@ -452,7 +467,7 @@ pub async fn handle_http_redirect(stream_request: StreamRequest, requested_host:
 }
 
 // Then handle_stream_request
-pub async fn handle_stream_request(stream_request: StreamRequest, ctx: ServeContext, circuit_id: CircuitId) -> Result<()> {
+pub async fn handle_stream_request<R: IncomingStreamReq>(stream_request: R, ctx: ServeContext, circuit_id: CircuitId) -> Result<()> {
 	let handling_request_trace_span = span!(Level::INFO, "onyums - handling_request");
 	let _handling_request_trace_guard = handling_request_trace_span.enter();
 	// The per-port dispatch is factored into the pure, offline-tested
@@ -484,9 +499,9 @@ pub async fn handle_stream_request(stream_request: StreamRequest, ctx: ServeCont
 /// the handler's protocol negotiates its own end-to-end security over the
 /// onion-encrypted channel. The accepted onion stream is boxed into an
 /// [`OnionStream`] and handed to the handler, which owns it for the connection.
-pub async fn handle_raw_stream(stream_request: StreamRequest, handler: Arc<dyn StreamHandler>, port: u16) -> Result<()> {
+pub async fn handle_raw_stream<R: IncomingStreamReq>(stream_request: R, handler: Arc<dyn StreamHandler>, port: u16) -> Result<()> {
 	event!(Level::INFO, "Accepting a raw stream on port {port} for a registered handler...");
-	let onion_service_stream = stream_request.accept(Connected::new_empty()).await.map_err(|e| anyhow::anyhow!("failed to accept onion service stream: {e}"))?;
+	let onion_service_stream = stream_request.accept(Connected::new_empty()).await?;
 	handler.serve(Box::pin(onion_service_stream)).await
 }
 
@@ -712,8 +727,16 @@ mod tests {
 	}
 
 	impl IncomingStreamReq for FakeStream {
+		// This double covers the *disposition* path only; nothing in its tests accepts a
+		// stream, so the accepted type is a duplex half purely to satisfy the bound.
+		type Stream = tokio::io::DuplexStream;
+
 		fn request(&self) -> &IncomingStreamRequest {
 			&self.request
+		}
+
+		fn accept(self, _connected: Connected) -> impl Future<Output = Result<Self::Stream>> + Send {
+			std::future::ready(Err(anyhow::anyhow!("FakeStream does not model the accept path; see DuplexStreamReq")))
 		}
 
 		fn reject(self, _reason: End) -> impl Future<Output = Result<()>> + Send {
@@ -1030,5 +1053,140 @@ mod tests {
 		let (outcomes, metrics) = run_stream_capped(4, 4).await;
 		assert_eq!(outcomes.iter().filter(|o| matches!(o, StreamOutcome::Served(_))).count(), 4);
 		assert_eq!(metrics.streams_timed_out, 0);
+	}
+
+	/// A stream request whose `accept` hands back one half of a `tokio::io::duplex` pair —
+	/// the offline stand-in for an accepted onion stream. This is what lets the TLS +
+	/// hyper + axum path run with no Tor network: `handle_tls_connection` only ever
+	/// needed `AsyncRead + AsyncWrite + Send + Unpin` from arti, and a duplex half is
+	/// exactly that.
+	struct DuplexStreamReq {
+		request: IncomingStreamRequest,
+		server_side: tokio::io::DuplexStream,
+	}
+
+	impl DuplexStreamReq {
+		fn pair(port: u16) -> (Self, tokio::io::DuplexStream) {
+			let begin = tor_cell::relaycell::msg::Begin::new("example.onion", port, 0).expect("a valid BEGIN cell");
+			let (client_side, server_side) = tokio::io::duplex(64 * 1024);
+			(Self { request: IncomingStreamRequest::Begin(begin), server_side }, client_side)
+		}
+	}
+
+	impl IncomingStreamReq for DuplexStreamReq {
+		type Stream = tokio::io::DuplexStream;
+
+		fn request(&self) -> &IncomingStreamRequest {
+			&self.request
+		}
+
+		fn accept(self, _connected: Connected) -> impl Future<Output = Result<Self::Stream>> + Send {
+			std::future::ready(Ok(self.server_side))
+		}
+
+		fn reject(self, _reason: End) -> impl Future<Output = Result<()>> + Send {
+			std::future::ready(Ok(()))
+		}
+
+		fn shutdown_circuit(self) -> Result<()> {
+			Ok(())
+		}
+	}
+
+	/// Accepts any server certificate — the service presents a self-signed cert for its
+	/// onion host by design (the onion address is the authenticator), so certificate
+	/// verification is not the subject under test here; the served payload is.
+	#[derive(Debug)]
+	struct AcceptAnyCert;
+
+	impl tokio_rustls::rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+		fn verify_server_cert(&self, _end_entity: &tokio_rustls::rustls::pki_types::CertificateDer<'_>, _intermediates: &[tokio_rustls::rustls::pki_types::CertificateDer<'_>], _server_name: &tokio_rustls::rustls::pki_types::ServerName<'_>, _ocsp: &[u8], _now: tokio_rustls::rustls::pki_types::UnixTime) -> std::result::Result<tokio_rustls::rustls::client::danger::ServerCertVerified, tokio_rustls::rustls::Error> {
+			Ok(tokio_rustls::rustls::client::danger::ServerCertVerified::assertion())
+		}
+
+		fn verify_tls12_signature(&self, _message: &[u8], _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>, _dss: &tokio_rustls::rustls::DigitallySignedStruct) -> std::result::Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+			Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+		}
+
+		fn verify_tls13_signature(&self, _message: &[u8], _cert: &tokio_rustls::rustls::pki_types::CertificateDer<'_>, _dss: &tokio_rustls::rustls::DigitallySignedStruct) -> std::result::Result<tokio_rustls::rustls::client::danger::HandshakeSignatureValid, tokio_rustls::rustls::Error> {
+			Ok(tokio_rustls::rustls::client::danger::HandshakeSignatureValid::assertion())
+		}
+
+		fn supported_verify_schemes(&self) -> Vec<tokio_rustls::rustls::SignatureScheme> {
+			tokio_rustls::rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+		}
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn the_tls_and_axum_serve_path_answers_a_real_request_offline() {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let address = address();
+		let acceptor = tls_acceptor(&address, &Tls::Upgrade).expect("self-signed acceptor assembles offline");
+		let app = Router::new().route("/", axum::routing::get(|| async { "Hello, World!" }));
+
+		let (stream_request, client_side) = DuplexStreamReq::pair(443);
+
+		// Serve one connection on the "onion" side.
+		let server = tokio::spawn(handle_tls_connection(stream_request, acceptor, app, CircuitId(21)));
+
+		// Drive a real rustls client over the other half: handshake, then HTTP/1.1.
+		let tls_config = tokio_rustls::rustls::ClientConfig::builder().dangerous().with_custom_certificate_verifier(Arc::new(AcceptAnyCert)).with_no_client_auth();
+		let connector = tokio_rustls::TlsConnector::from(Arc::new(tls_config));
+		let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(address.host().to_string()).expect("the onion host is a valid server name");
+		let mut tls = connector.connect(server_name, client_side).await.expect("TLS handshake against the self-signed acceptor");
+
+		tls.write_all(
+			format!(
+				"GET / HTTP/1.1
+Host: {}
+Connection: close
+
+",
+				address.host()
+			)
+			.as_bytes(),
+		)
+		.await
+		.expect("write request");
+		tls.flush().await.expect("flush");
+
+		let mut response = String::new();
+		tls.read_to_string(&mut response).await.expect("read response");
+
+		assert!(response.starts_with("HTTP/1.1 200"), "expected a 200, got: {}", response.lines().next().unwrap_or(""));
+		assert!(response.contains("Hello, World!"), "the app body must come back through TLS + hyper + axum, got: {response:?}");
+
+		server.await.expect("the serve task joins").expect("serving the connection succeeds");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn the_port_80_arm_redirects_to_https_offline() {
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+		let (stream_request, mut client_side) = DuplexStreamReq::pair(80);
+		let server = tokio::spawn(handle_http_redirect(stream_request, "example.onion".to_string()));
+
+		client_side
+			.write_all(
+				b"GET /a/b?c=d HTTP/1.1
+Host: example.onion
+Connection: close
+
+",
+			)
+			.await
+			.expect("write request");
+		client_side.flush().await.expect("flush");
+
+		let mut response = String::new();
+		client_side.read_to_string(&mut response).await.expect("read response");
+
+		assert!(response.starts_with("HTTP/1.1 301"), "expected a 301, got: {}", response.lines().next().unwrap_or(""));
+		// The path and query must survive the redirect — dropping them would silently
+		// send every deep link to the site root.
+		assert!(response.contains("location: https://example.onion/a/b?c=d") || response.contains("Location: https://example.onion/a/b?c=d"), "redirect must preserve path and query, got: {response:?}");
+
+		let _ = server.await.expect("the redirect task joins");
 	}
 }

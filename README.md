@@ -38,7 +38,7 @@ inside the onion-encrypted stream; the Skin abuse-defense gate runs before the r
                    │  decrypted HTTP request
                    ▼
         ┌───────────────────────┐
-        │   Skin gate           │  clearance check · PoW / tarpit challenge ·
+        │   Skin gate           │  clearance check · PoW → CAPTCHA → tarpit challenge ·
         │   (abuse defense)     │  WAF · rate-limit (keyed on the clearance token)
         └──────────┬────────────┘
                    │  cleared request
@@ -374,7 +374,7 @@ rejected offline, before any launch.
 Onyums bundles [`onyums-skin`](crates/onyums-skin), a "Cloudflare for Tor" abuse-defense layer, and **wires it in by default**. With no extra work, every served router sits behind a secure gate:
 
 - a **proof-of-work** challenge for JavaScript clients (a few hundred ms of browser work to mint a clearance),
-- a no-JS **patience tarpit** fallback, so a Tor "Safer"/"Safest" client (JS and WASM disabled) always has a path through,
+- a no-JS **server-rendered CAPTCHA** fallback (a distorted-image human check, answered in a plain GET form) and, behind it, a **patience tarpit** — so a Tor "Safer"/"Safest" client (JS and WASM disabled) always has a path through, with a human-verification tier before the last-resort delay,
 - **rate limiting** keyed on a stateless, signed clearance token — a synthetic per-client identity, since there are no client IPs over Tor, and
 - a pure-Rust **WAF** with a starter signature ruleset (SQLi / XSS / path traversal / command & code injection / SSRF / protocol anomalies).
 

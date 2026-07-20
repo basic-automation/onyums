@@ -13,8 +13,9 @@ app can use, Tor or not; the Tor half is a single `CircuitPolicy` trait the host
 ## Status
 
 **Phases 1–4 are implemented; Phase 5 (frontier) is in progress.** A plain axum app
-can require a PoW-or-tarpit gate that mints a stateless clearance token and rate-limits
-by it, with a working path for no-JS (Tor "Safer"/"Safest") clients:
+can require a challenge gate that degrades PoW → server-rendered CAPTCHA → patience
+tarpit, mints a stateless clearance token, and rate-limits by it — with a real
+human-verification path for no-JS (Tor "Safer"/"Safest") clients:
 
 ```rust
 use axum::{Router, routing::get};
@@ -24,7 +25,7 @@ let app: Router = Router::new().route("/", get(|| async { "hello" }));
 let gated: Router = app.layer(Skin::secure_default().into_layer());
 ```
 
-Built out: the gate core (PoW/tarpit challenge chain, `hmac`-signed clearance,
+Built out: the gate core (PoW → CAPTCHA → patience-tarpit challenge chain, `hmac`-signed clearance,
 `governor` rate limiting), the Tor dimension (`CircuitPolicy` + `AccountingCircuitPolicy`
 with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
 expression language + a curated OWASP-CRS-derived ruleset — SQLi (incl. error-based
@@ -134,7 +135,7 @@ identity costs a fresh proof-of-work solve.
 | PoW | pluggable `Pow` trait, **SHA-256 hashcash default** | hand-rolled; pure-Rust Equi-X behind the opt-in `equix` feature | MIT (equix: LGPL, gated) |
 | Rate limiter | reuse | `governor` (keyed on the clearance token) | MIT/Apache |
 | Clearance token | reuse | `hmac` + `sha2` | MIT |
-| No-JS fallbacks | **patience tarpit shipped**; server-rendered CAPTCHA *not built yet* | hand-rolled (`PatienceChallenge`); the CAPTCHA tier is planned — see the note below | MIT |
+| No-JS fallbacks | **server-rendered CAPTCHA + patience tarpit** | hand-rolled (`CaptchaChallenge` with a dependency-free PNG renderer; `PatienceChallenge`) — no image/captcha dependency taken | MIT |
 | WAF | build | `regex` + `aho-corasick` + the in-house `FilterExpr` rule language | MIT |
 
 ## Principles
@@ -142,12 +143,13 @@ identity costs a fresh proof-of-work solve.
 - **Tor-native substitutes, not IP-based defense** — every mechanism is re-keyed onto
   the per-rendezvous-circuit and an app-issued clearance token.
 - **Secure and complete by default; you opt *down*, never *up*.**
-- **No-JS is a first-class client** — Skin degrades rather than failing. **Today that
-  degradation is PoW → patience tarpit: the CAPTCHA tier is designed but not
-  implemented** (`ClearanceLevel::Captcha` exists in the token vocabulary; no
-  `Challenge` implements it). A no-JS client therefore reaches the tarpit, which serves
-  them — it is a real fallback, not a dead end — but it is a *delay*, not a
-  human-verification step. Do not read "CAPTCHA" into the current build.
+- **No-JS is a first-class client** — Skin degrades rather than failing. The degradation
+  is **PoW → server-rendered CAPTCHA → patience tarpit**: a Tor "Safer"/"Safest" client
+  that cannot run the JS proof-of-work is served a distorted-image CAPTCHA (a human-
+  verification step, no JS required — the answer rides back in a plain GET form), and only
+  if that too is unmet does it reach the timed tarpit as a last resort. The CAPTCHA's
+  answer never leaves the server in the clear: it is encrypted-then-MAC'd into the envelope
+  the client echoes back, so the gate stays stateless.
 - **Cost, not prevention** — a fresh synthetic identity costs a fresh proof-of-work solve.
 - **100% Rust — no FFI, ever** (MIT, no copyleft in the default build).
 

@@ -13,6 +13,7 @@ pub mod captcha;
 #[cfg(feature = "equix")]
 pub mod equix;
 pub mod patience;
+mod png;
 pub mod pow;
 
 /// Outcome of presenting/evaluating a gate.
@@ -34,6 +35,12 @@ pub trait Challenge: Send + Sync {
 	/// Whether this challenge requires client-side JS/WASM. Drives selection of a
 	/// no-JS fallback for Tor "Safer"/"Safest" clients.
 	fn needs_js(&self) -> bool;
+	/// The [`ClearanceLevel`] minted when this challenge's [`verify`](Self::verify)
+	/// succeeds. The host mints *this* level rather than assuming one, so a no-JS CAPTCHA
+	/// solve is recorded as [`ClearanceLevel::Captcha`], a PoW solve as
+	/// [`ClearanceLevel::Pow`], and an aged patience ticket as [`ClearanceLevel::Patience`]
+	/// — the event stream and the token itself then read honestly per gate.
+	fn granted_level(&self) -> ClearanceLevel;
 }
 
 /// An ordered fallback chain of challenges.
@@ -77,11 +84,13 @@ impl ChallengeChain {
 		}
 	}
 
-	/// Accept the request if *any* challenge in the chain validates it — whichever
-	/// gate the client actually solved, regardless of which one would be issued now.
+	/// The [`ClearanceLevel`] to mint if *any* challenge in the chain validates the
+	/// request — the granting level of the first challenge whose [`verify`](Challenge::verify)
+	/// accepts it, or `None` if none does. "First" so a client that solved a stronger gate
+	/// than the one now selected still clears at the level it actually passed.
 	#[must_use]
-	pub fn verify(&self, req: &Parts) -> bool {
-		self.challenges.iter().any(|challenge| challenge.verify(req))
+	pub fn verify(&self, req: &Parts) -> Option<ClearanceLevel> {
+		self.challenges.iter().find(|challenge| challenge.verify(req)).map(|challenge| challenge.granted_level())
 	}
 }
 
@@ -96,6 +105,14 @@ mod tests {
 	struct Stub {
 		needs_js: bool,
 		verifies: bool,
+		level: ClearanceLevel,
+	}
+
+	impl Stub {
+		/// A stub at the default `Pow` level, for tests that don't care which level.
+		fn new(needs_js: bool, verifies: bool) -> Self {
+			Self { needs_js, verifies, level: ClearanceLevel::Pow }
+		}
 	}
 
 	impl Challenge for Stub {
@@ -110,6 +127,10 @@ mod tests {
 		fn needs_js(&self) -> bool {
 			self.needs_js
 		}
+
+		fn granted_level(&self) -> ClearanceLevel {
+			self.level
+		}
 	}
 
 	fn bare_parts() -> Parts {
@@ -118,38 +139,41 @@ mod tests {
 
 	#[test]
 	fn select_prefers_first_when_client_has_js() {
-		let chain = ChallengeChain::new(vec![Box::new(Stub { needs_js: true, verifies: false }), Box::new(Stub { needs_js: false, verifies: false })]);
+		let chain = ChallengeChain::new(vec![Box::new(Stub::new(true, false)), Box::new(Stub::new(false, false))]);
 		assert!(chain.select(true).expect("a challenge fits").needs_js());
 	}
 
 	#[test]
 	fn select_skips_js_challenges_for_no_js_client() {
-		let chain = ChallengeChain::new(vec![Box::new(Stub { needs_js: true, verifies: false }), Box::new(Stub { needs_js: false, verifies: false })]);
+		let chain = ChallengeChain::new(vec![Box::new(Stub::new(true, false)), Box::new(Stub::new(false, false))]);
 		assert!(!chain.select(false).expect("a no-JS fallback fits").needs_js());
 	}
 
 	#[test]
 	fn no_js_client_against_js_only_chain_fails_closed() {
-		let chain = ChallengeChain::new(vec![Box::new(Stub { needs_js: true, verifies: false })]);
+		let chain = ChallengeChain::new(vec![Box::new(Stub::new(true, false))]);
 		assert!(chain.select(false).is_none());
 		assert!(matches!(chain.issue(&bare_parts(), false), Gate::Reject));
 	}
 
 	#[test]
 	fn fitting_client_is_presented_an_interstitial() {
-		let chain = ChallengeChain::new(vec![Box::new(Stub { needs_js: false, verifies: false })]);
+		let chain = ChallengeChain::new(vec![Box::new(Stub::new(false, false))]);
 		assert!(matches!(chain.issue(&bare_parts(), false), Gate::Present(_)));
 	}
 
 	#[test]
-	fn verify_accepts_if_any_challenge_validates() {
-		let chain = ChallengeChain::new(vec![Box::new(Stub { needs_js: true, verifies: false }), Box::new(Stub { needs_js: false, verifies: true })]);
-		assert!(chain.verify(&bare_parts()));
+	fn verify_accepts_if_any_challenge_validates_and_reports_its_level() {
+		// The validating stub grants Patience; the chain must surface *that* level, not the
+		// first challenge's, so the host mints what the client actually passed.
+		let validating = Stub { needs_js: false, verifies: true, level: ClearanceLevel::Patience };
+		let chain = ChallengeChain::new(vec![Box::new(Stub::new(true, false)), Box::new(validating)]);
+		assert_eq!(chain.verify(&bare_parts()), Some(ClearanceLevel::Patience));
 	}
 
 	#[test]
 	fn verify_rejects_when_no_challenge_validates() {
-		let chain = ChallengeChain::new(vec![Box::new(Stub { needs_js: false, verifies: false })]);
-		assert!(!chain.verify(&bare_parts()));
+		let chain = ChallengeChain::new(vec![Box::new(Stub::new(false, false))]);
+		assert!(chain.verify(&bare_parts()).is_none());
 	}
 }

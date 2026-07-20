@@ -31,8 +31,8 @@ use tower_service::Service;
 
 use crate::{
 	cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_cacheable_method}, challenge::{
-		Challenge, ChallengeChain, Gate, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}
-	}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
+		Challenge, ChallengeChain, Gate, captcha::CaptchaChallenge, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}
+	}, clearance::{Clearance, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -78,8 +78,10 @@ impl Skin {
 	}
 
 	/// The batteries-included secure gate, in one call: a JS proof-of-work challenge
-	/// with a no-JS patience-tarpit fallback (so a Tor "Safer"/"Safest" client always
-	/// has a path), token-keyed rate limiting, and a fresh random signing store.
+	/// degrading to a no-JS server-rendered CAPTCHA and then a patience tarpit (so a Tor
+	/// "Safer"/"Safest" client always has a path — a human-verification tier first, the
+	/// timed tarpit as the last resort), token-keyed rate limiting, and a fresh random
+	/// signing store.
 	///
 	/// This is the "secure and complete by default" entry point — relax it by building
 	/// with [`Skin::builder`] instead (lower difficulty, no rate limit, a shared store
@@ -101,8 +103,21 @@ impl Skin {
 		let store = HmacClearanceStore::generate();
 		let mut pow_secret = [0u8; 32];
 		rand::rng().fill_bytes(&mut pow_secret);
+		let mut captcha_secret = [0u8; 32];
+		rand::rng().fill_bytes(&mut captcha_secret);
 		let rate = SkinRateLimit::per_second(NonZeroU32::new(DEFAULT_RATE_PER_SEC).expect("DEFAULT_RATE_PER_SEC is nonzero"));
-		Skin::builder().store(Arc::new(store.clone())).challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY))).challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY))).rate_limit(rate).waf(Waf::starter()).build()
+		// The fallback chain, most-preferred first: JS PoW → no-JS CAPTCHA → no-JS tarpit.
+		// All three submit to the one Skin-owned route (`DEFAULT_SUBMIT_PATH`); the chain
+		// disambiguates by which challenge's `verify` accepts the submission, and mints that
+		// challenge's own clearance level.
+		Skin::builder()
+			.store(Arc::new(store.clone()))
+			.challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY)))
+			.challenge(Box::new(CaptchaChallenge::new(captcha_secret.to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH)))
+			.challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY)))
+			.rate_limit(rate)
+			.waf(Waf::starter())
+			.build()
 	}
 
 	/// Turn this gate into a [`SkinLayer`] for `Router::layer`.
@@ -190,14 +205,13 @@ impl Skin {
 			return Decision::Forward { response_headers: edge_headers };
 		}
 
-		// 3. A submission to the Skin-owned route: verify and, on success, mint.
+		// 3. A submission to the Skin-owned route: verify and, on success, mint at the level
+		//    the *verifying* challenge grants — a PoW solve mints Pow, a CAPTCHA solve mints
+		//    Captcha — so the token and the event stream read honestly per gate.
 		if parts.uri.path() == self.submit_path {
-			if self.challenge.verify(parts) {
-				// Phase 1: the submission route is the JS PoW path, so the minted level
-				// is Pow. When CAPTCHA lands as a second submitting gate, the level
-				// should come from the verifying challenge rather than be assumed here.
-				self.sink.record(&SecurityEvent::ChallengePassed { level: ClearanceLevel::Pow });
-				let token = self.store.mint(ClearanceLevel::Pow, self.clearance_ttl);
+			if let Some(level) = self.challenge.verify(parts) {
+				self.sink.record(&SecurityEvent::ChallengePassed { level });
+				let token = self.store.mint(level, self.clearance_ttl);
 				return Decision::Respond(self.cleared_redirect(&token));
 			}
 			// A bad/again submission re-presents the challenge (which itself emits a
@@ -530,7 +544,7 @@ mod tests {
 	use crate::{
 		challenge::{
 			patience::PatienceChallenge, pow::{Hashcash, PowChallenge, Puzzle}
-		}, clearance::ClearanceStore, observe::CapturingSink, ratelimit::SkinRateLimit
+		}, clearance::{ClearanceLevel, ClearanceStore}, observe::CapturingSink, ratelimit::SkinRateLimit
 	};
 
 	/// Test difficulty kept low so the in-test PoW solve returns instantly.
@@ -628,6 +642,52 @@ mod tests {
 		let token = set_cookie.split(';').next().unwrap().strip_prefix(&format!("{DEFAULT_COOKIE}=")).unwrap();
 		let clearance = store.verify(token).expect("minted clearance must verify");
 		assert_eq!(clearance.level, ClearanceLevel::Pow);
+	}
+
+	#[test]
+	fn submission_mints_the_verifying_challenges_level() {
+		// The layer must mint the level the *verifying* challenge grants, not a hardcoded
+		// one. A patience tarpit (delay 0) grants Patience, so a valid aged ticket submitted
+		// to the Skin route must mint a *Patience*-level clearance — proving the level now
+		// flows from the gate that actually cleared, per the Challenge::granted_level wiring.
+		let store = Arc::new(HmacClearanceStore::new(b"lvl-secret".to_vec()));
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::ZERO))).build();
+		// A freshly-minted patience ticket is immediately old enough at delay 0.
+		let ticket = store.mint(ClearanceLevel::Patience, Duration::from_secs(300));
+		let submission = parts_with_cookie(DEFAULT_SUBMIT_PATH, &format!("skin_patience={ticket}"));
+		let resp = match skin.decide(&submission) {
+			Decision::Respond(resp) => resp,
+			Decision::Forward { .. } => panic!("a fresh submission has no clearance cookie, so it cannot forward"),
+		};
+		assert_eq!(resp.status(), StatusCode::SEE_OTHER);
+		let set_cookie = resp.headers().get(header::SET_COOKIE).unwrap().to_str().unwrap();
+		let token = set_cookie.split(';').next().unwrap().strip_prefix(&format!("{DEFAULT_COOKIE}=")).unwrap();
+		let clearance = store.verify(token).expect("minted clearance must verify");
+		assert_eq!(clearance.level, ClearanceLevel::Patience, "the minted level must match the challenge that verified, not a hardcoded Pow");
+	}
+
+	#[tokio::test]
+	async fn no_js_client_is_served_the_captcha_tier() {
+		use crate::challenge::captcha::CaptchaChallenge;
+
+		// The secure_default chain shape (PoW → CAPTCHA → tarpit) with JS assumed off: an
+		// uncleared no-JS client must be served the CAPTCHA (a no-JS image form), skipping
+		// the JS PoW and stopping before the last-resort tarpit.
+		let store = Arc::new(HmacClearanceStore::new(b"nojs-secret".to_vec()));
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
+			.challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH)))
+			.challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5))))
+			.client_has_js(false)
+			.build();
+		let resp = match skin.decide(&bare_parts("/")) {
+			Decision::Respond(resp) => resp,
+			Decision::Forward { .. } => panic!("an uncleared request must be challenged"),
+		};
+		let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+		assert!(body.contains("data:image/png;base64,"), "the no-JS client gets the CAPTCHA image, not the PoW solver or the tarpit");
+		assert!(!body.contains("function sha256"), "must not serve the JS PoW solver to a no-JS client");
 	}
 
 	#[test]

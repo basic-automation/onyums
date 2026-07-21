@@ -113,7 +113,9 @@ impl Skin {
 		Skin::builder()
 			.store(Arc::new(store.clone()))
 			.challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY)))
-			.challenge(Box::new(CaptchaChallenge::new(captcha_secret.to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH)))
+			// The CAPTCHA advertises the no-visual escape because a non-visual tarpit tier sits
+			// behind it in this chain — a low-vision no-JS client can fall through to it.
+			.challenge(Box::new(CaptchaChallenge::new(captcha_secret.to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH).with_no_image_escape(true)))
 			.challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY)))
 			.rate_limit(rate)
 			.waf(Waf::starter())
@@ -688,6 +690,42 @@ mod tests {
 		let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
 		assert!(body.contains("data:image/png;base64,"), "the no-JS client gets the CAPTCHA image, not the PoW solver or the tarpit");
 		assert!(!body.contains("function sha256"), "must not serve the JS PoW solver to a no-JS client");
+	}
+
+	#[tokio::test]
+	async fn no_visual_escape_routes_a_no_js_client_to_the_tarpit() {
+		// The accessibility escape end to end through the gate: a no-JS client that clicks
+		// "continue without the image" (the request carries the no-visual marker) is served
+		// the non-visual patience tarpit — a 503 wait page with a `skin_patience` ticket —
+		// rather than the CAPTCHA image it cannot read. Same chain shape as secure_default.
+		use crate::challenge::{NO_VISUAL_HINT, captcha::CaptchaChallenge};
+
+		let store = Arc::new(HmacClearanceStore::new(b"escape-secret".to_vec()));
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
+			.challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH).with_no_image_escape(true)))
+			.challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5))))
+			.client_has_js(false)
+			.build();
+
+		// Without the hint: the CAPTCHA image tier.
+		let plain = match skin.decide(&bare_parts("/")) {
+			Decision::Respond(resp) => String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap(),
+			Decision::Forward { .. } => panic!("an uncleared request must be challenged"),
+		};
+		assert!(plain.contains("data:image/png;base64,"), "no hint ⇒ the CAPTCHA image");
+
+		// With the hint: the tarpit, identified by its `skin_patience` Set-Cookie and no image.
+		let escaped = match skin.decide(&bare_parts(&format!("/?{NO_VISUAL_HINT}=1"))) {
+			Decision::Respond(resp) => resp,
+			Decision::Forward { .. } => panic!("an uncleared escaping request must be challenged"),
+		};
+		assert_eq!(escaped.status(), StatusCode::SERVICE_UNAVAILABLE, "the tarpit answers 503");
+		let set_cookie = escaped.headers().get(header::SET_COOKIE).map(|c| c.to_str().unwrap().to_owned());
+		assert!(set_cookie.is_some_and(|c| c.starts_with("skin_patience=")), "the escape lands on the patience tarpit (its ticket cookie), not the CAPTCHA");
+		let body = String::from_utf8(escaped.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+		assert!(!body.contains("data:image/png;base64,"), "the escaping client must not be served the image it cannot see");
 	}
 
 	#[test]

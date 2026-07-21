@@ -150,6 +150,13 @@ identity costs a fresh proof-of-work solve.
   if that too is unmet does it reach the timed tarpit as a last resort. The CAPTCHA's
   answer never leaves the server in the clear: it is encrypted-then-MAC'd into the envelope
   the client echoes back, so the gate stays stateless.
+- **Low-vision clients aren't stuck on the image** — [W3C's *Inaccessibility of CAPTCHA*
+  note](https://www.w3.org/TR/turingtest/) calls a distorted-image CAPTCHA the task blind,
+  low-vision, and dyslexic users are least able to accomplish. So the CAPTCHA page carries a
+  "Can't see the image? Continue without it." link (`CaptchaChallenge::with_no_image_escape`,
+  on in `secure_default`) that routes the client *past* the visual tier to the non-visual
+  patience tarpit — the chain honors a `needs_vision()` capability the same way it honors
+  `needs_js()`, so no-JS *and* no-vision both have a working path.
 - **Cost, not prevention** — a fresh synthetic identity costs a fresh proof-of-work solve.
 - **100% Rust — no FFI, ever** (MIT, no copyleft in the default build).
 

@@ -1380,6 +1380,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		// Cloud metadata reachable by DNS name rather than the 169.254.169.254 link-local IP —
 		// GCP's `metadata.google.internal`. A value-inspection SSRF target the IP/path rules miss.
 		Rule { id: "ssrf_metadata_hostname", category: WafCategory::Ssrf, pattern: r"(?i)\bmetadata\.google\.internal\b" },
+		// Kubernetes in-cluster API-server SSRF: the stable service DNS name `kubernetes.default.svc`
+		// (optionally `.cluster.local`) that every pod resolves to the API server. A classic
+		// cloud-native SSRF pivot — reaching it with a mounted service-account token is a cluster
+		// takeover — and one the cloud-metadata IP/path rules never see (it is a DNS name, not
+		// 169.254.169.254). Value-inspection, near-zero FP (the FQDN does not occur in ordinary
+		// external traffic). <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery/cloud-ssrf>
+		Rule { id: "ssrf_k8s_api_service", category: WafCategory::Ssrf, pattern: r"(?i)\bkubernetes\.default\.svc\b" },
 		// Non-AWS cloud metadata endpoints the 169.254.169.254 IP + AWS/GCP/Azure path rules miss:
 		// Alibaba Cloud's distinct link-local metadata IP `100.100.100.200` (cloud-agnostic SSRF
 		// tooling routinely forgets it), and Oracle OCI's `/opc/v{1,2}/` metadata path (OCI keeps the
@@ -2903,6 +2910,9 @@ mod tests {
 		// The AWS IMDS IPv6 endpoint — the bypass past a filter that only blocks the IPv4 IP.
 		assert_eq!(waf.inspect_str("url=http://[fd00:ec2::254]/latest/meta-data/", "target").unwrap().rule_id, "ssrf_aws_ipv6_imds");
 		assert_eq!(waf.inspect_str("u=http://[FD00:EC2::254]/", "query").unwrap().category, WafCategory::Ssrf, "case-insensitive");
+		// The Kubernetes in-cluster API-server service name — a DNS-name SSRF pivot the IP rules miss.
+		assert_eq!(waf.inspect_str("url=https://kubernetes.default.svc/api/v1/secrets", "target").unwrap().rule_id, "ssrf_k8s_api_service");
+		assert_eq!(waf.inspect_str("u=https://kubernetes.default.svc.cluster.local/", "query").unwrap().category, WafCategory::Ssrf);
 	}
 
 	#[test]

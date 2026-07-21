@@ -27,10 +27,13 @@ let gated: Router = app.layer(Skin::secure_default().into_layer());
 
 Built out: the gate core (PoW → CAPTCHA → patience-tarpit challenge chain, `hmac`-signed clearance,
 `governor` rate limiting), the Tor dimension (`CircuitPolicy` + `AccountingCircuitPolicy`
-with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
+with Under-Attack Mode and adaptive PoW difficulty driven by any of three signals —
+raw request rate, request-shape deviation from a learned baseline, and bot suspicion —
+combined by max so the strongest attack indicator wins), the pure-Rust WAF (`FilterExpr`
 expression language + a curated OWASP-CRS-derived ruleset — SQLi (incl. error-based
-`EXTRACTVALUE`/`UPDATEXML` and MySQL file/privilege functions) / XSS (incl. dangerous
-HTML tags, CSS `-moz-binding`/`behavior:url()` script-binding, and the full
+`EXTRACTVALUE`/`UPDATEXML` and MySQL file/privilege functions) / NoSQLi (incl. MongoDB
+server-side-JS `$function`/`$accumulator`) / XSS (incl. dangerous
+HTML tags, CSS `-moz-binding`/`behavior:url()`/`expression()` script execution, and the full
 mouse/keyboard/clipboard/drag/media event-handler families) / traversal (incl.
 overlong-UTF-8 dot-slash evasion) / SSRF
 (incl. Alibaba & Oracle-OCI cloud-metadata endpoints, `nip.io`/`sslip.io` wildcard-DNS

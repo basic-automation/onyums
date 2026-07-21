@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use super::{Challenge, Gate};
 use crate::{
-	clearance::ClearanceLevel, difficulty::{AdaptiveDifficulty, ShapeDifficulty}, shape::RequestShape
+	clearance::ClearanceLevel, difficulty::{AdaptiveDifficulty, BotDifficulty, ShapeDifficulty}, shape::RequestShape
 };
 
 type HmacSha256 = Hmac<Sha256>;
@@ -157,6 +157,10 @@ pub struct PowChallenge<P: Pow> {
 	/// raises difficulty toward its `max` for shapes that deviate from the learned
 	/// baseline — complementary to `adaptive`, which keys on raw request *rate*.
 	shape: Option<Arc<ShapeDifficulty>>,
+	/// Optional bot-suspicion controller. When set, a scripted-looking request (non-browser
+	/// UA, sparse/missing headers) raises difficulty toward its `max` — the third signal
+	/// alongside `adaptive` (raw rate) and `shape` (deviation from the learned baseline).
+	bot: Option<Arc<BotDifficulty>>,
 	ttl: Duration,
 	submit_path: String,
 	/// Seeds of puzzles already redeemed, with the instant their entry can be pruned
@@ -168,7 +172,7 @@ impl<P: Pow> PowChallenge<P> {
 	/// Build a challenge over `pow` (typically [`Hashcash`]) signing puzzles with
 	/// `secret` at the given leading-zero-bit `difficulty`.
 	pub fn new(pow: P, secret: impl Into<Vec<u8>>, difficulty: u32) -> Self {
-		Self { pow, secret: secret.into(), difficulty, adaptive: None, shape: None, ttl: DEFAULT_PUZZLE_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
+		Self { pow, secret: secret.into(), difficulty, adaptive: None, shape: None, bot: None, ttl: DEFAULT_PUZZLE_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
 	}
 
 	/// Record `seed` as redeemed, returning `false` if it was already redeemed (a
@@ -222,9 +226,23 @@ impl<P: Pow> PowChallenge<P> {
 		self
 	}
 
-	/// The difficulty to issue at right now: the static floor, raised by whichever
-	/// controllers are attached (the max of the rate-driven and shape-driven signals). The
-	/// shape signal needs the request [`Parts`]; pass `None` to skip it.
+	/// Drive issued-puzzle difficulty from a [`BotDifficulty`] controller — the bot-suspicion
+	/// signal, the third alongside [`with_adaptive_difficulty`](Self::with_adaptive_difficulty)'s
+	/// raw rate and [`with_shape_difficulty`](Self::with_shape_difficulty)'s deviation-from-baseline.
+	/// A scripted-looking request (non-browser UA, sparse/missing headers) raises difficulty toward
+	/// the controller's `max`; a browser-shaped request leaves the static floor in place. The
+	/// controller never lowers difficulty below the floor. Assessing the request also emits a
+	/// [`BotFlagged`](crate::observe::SecurityEvent::BotFlagged) event when it clears the
+	/// controller's threshold.
+	#[must_use]
+	pub fn with_bot_difficulty(mut self, controller: Arc<BotDifficulty>) -> Self {
+		self.bot = Some(controller);
+		self
+	}
+
+	/// The difficulty to issue at right now: the static floor, raised by whichever controllers
+	/// are attached — the max of the rate-driven, shape-driven, and bot-suspicion signals. The
+	/// shape and bot signals need the request [`Parts`]; pass `None` to skip them.
 	fn current_difficulty(&self, req: Option<&Parts>) -> u32 {
 		let mut difficulty = self.difficulty;
 		if let Some(adaptive) = &self.adaptive {
@@ -232,6 +250,9 @@ impl<P: Pow> PowChallenge<P> {
 		}
 		if let (Some(shape), Some(req)) = (&self.shape, req) {
 			difficulty = difficulty.max(shape.observe(&RequestShape::from_parts(req)));
+		}
+		if let (Some(bot), Some(req)) = (&self.bot, req) {
+			difficulty = difficulty.max(bot.assess(req));
 		}
 		difficulty
 	}
@@ -673,6 +694,61 @@ mod challenge_tests {
 		// A never-seen shape deviates fully → difficulty jumps to the controller max.
 		let novel = Request::builder().uri("/wp-login.php").header("user-agent", "curl/8.4").body(()).unwrap().into_parts().0;
 		assert_eq!(chal.make_puzzle(Some(&novel)).0.difficulty, 18);
+	}
+
+	#[test]
+	fn bot_difficulty_raises_issued_puzzle_difficulty_for_scripted_request() {
+		use crate::difficulty::BotDifficulty;
+
+		// The third signal wired through the gate: a bot-suspicion controller that ramps 0 -> 16.
+		let bot = Arc::new(BotDifficulty::new(0, 16));
+		// Static floor 2; the bot controller can raise toward 16 for scripted-looking requests.
+		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 2).with_bot_difficulty(bot);
+
+		// A browser-shaped request scores ~0 → stays at the floor.
+		let browser = Request::builder()
+			.uri("/")
+			.header("host", "x.onion")
+			.header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0")
+			.header("accept", "text/html")
+			.header("accept-language", "en-US,en")
+			.header("accept-encoding", "gzip, deflate, br")
+			.header("connection", "keep-alive")
+			.body(())
+			.unwrap()
+			.into_parts()
+			.0;
+		assert_eq!(chal.make_puzzle(Some(&browser)).0.difficulty, 2);
+
+		// A curl request (non-browser UA, sparse headers) scores ~1.0 → difficulty jumps to the max.
+		let scripted = Request::builder().uri("/").header("host", "x.onion").header("user-agent", "curl/8.0.1").header("accept", "*/*").body(()).unwrap().into_parts().0;
+		assert_eq!(chal.make_puzzle(Some(&scripted)).0.difficulty, 16);
+
+		// With no request Parts the bot signal is skipped (floor applies).
+		assert_eq!(chal.make_puzzle(None).0.difficulty, 2);
+	}
+
+	#[test]
+	fn all_three_difficulty_signals_combine_by_max() {
+		// rate + shape + bot attached at once: the issued difficulty is the max across every
+		// attached signal, so the strongest attack indicator wins (defense in depth).
+		use crate::{difficulty::BotDifficulty, shape::{RequestShape, ShapeBaseline}};
+
+		// A shape baseline primed on a browser shape so a curl request reads as both novel *and*
+		// bot-scripted; the rate controller stays dormant (no recorded traffic).
+		let baseline = ShapeBaseline::new().min_observations(5.0);
+		let browser_shape = || Request::builder().uri("/").header("user-agent", "Mozilla/5.0 Firefox/115.0").header("accept", "text/html").body(()).unwrap().into_parts().0;
+		for _ in 0..20 {
+			baseline.observe(&RequestShape::from_parts(&browser_shape()));
+		}
+		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 3)
+			.with_adaptive_difficulty(Arc::new(AdaptiveDifficulty::new(0, 8))) // dormant → 0
+			.with_shape_difficulty(Arc::new(ShapeDifficulty::new(0, 14).with_baseline(baseline))) // novel → up to 14
+			.with_bot_difficulty(Arc::new(BotDifficulty::new(0, 20))); // scripted → up to 20
+
+		let scripted = Request::builder().uri("/wp-login.php").header("host", "x.onion").header("user-agent", "curl/8.0.1").header("accept", "*/*").body(()).unwrap().into_parts().0;
+		// bot (≈20) dominates shape (≤14) and the dormant rate (0) and the floor (3).
+		assert_eq!(chal.make_puzzle(Some(&scripted)).0.difficulty, 20);
 	}
 
 	/// A [`Pow`] backend with no in-browser solver: relies on the trait's default

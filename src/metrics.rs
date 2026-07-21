@@ -27,19 +27,43 @@ pub struct ServiceMetrics {
 	pub circuits_accepted: u64,
 	/// Circuits the circuit-level policy rejected (or tore down) at the offer.
 	pub circuits_rejected: u64,
+	/// Circuits refused because the host-global concurrency limit was already full.
+	///
+	/// Deliberately its own counter rather than folded into
+	/// [`circuits_rejected`](Self::circuits_rejected): a policy rejection is a verdict
+	/// about *that* circuit, while this one says nothing about the circuit and
+	/// everything about the service being at capacity. Conflating them would make a
+	/// service that is simply too small look like it is under attack, and vice versa —
+	/// which is exactly backwards for the operator deciding whether to raise the limit
+	/// or to start refusing traffic upstream.
+	pub circuits_refused_at_capacity: u64,
 	/// Streams handed to a handler after passing the per-stream policy gate.
 	pub streams_served: u64,
 	/// Streams the per-stream policy rejected while leaving the circuit alive.
 	pub streams_rejected: u64,
 	/// Streams whose policy action tore down the whole circuit.
 	pub streams_shutdown: u64,
+	/// Streams dropped because they exceeded the configured per-handler timeout.
+	///
+	/// Distinct from every other stream counter: the stream was admitted and served, and
+	/// then failed to finish in time. A rising value here with a flat
+	/// [`streams_refused_at_capacity`](Self::streams_refused_at_capacity) is the
+	/// signature of slow clients rather than too many of them.
+	pub streams_timed_out: u64,
+	/// Streams refused because the host-global concurrent-stream limit was already full.
+	///
+	/// The per-stream counterpart to
+	/// [`circuits_refused_at_capacity`](Self::circuits_refused_at_capacity), and separate
+	/// from [`streams_rejected`](Self::streams_rejected) for the same reason: a policy
+	/// rejection is a verdict about that stream, this one means the service is full.
+	pub streams_refused_at_capacity: u64,
 }
 
-/// One service's six counter samples as `(prometheus_metric_name, HELP_text, value)`
+/// One service's nine counter samples as `(prometheus_metric_name, HELP_text, value)`
 /// triples in the shared family order — the return of
 /// `prometheus_series`, named so the per-service and fleet exporters
 /// share one type.
-type PrometheusSeries = [(&'static str, &'static str, u64); 6];
+type PrometheusSeries = [(&'static str, &'static str, u64); 9];
 
 impl ServiceMetrics {
 	/// The per-counter activity between an `earlier` snapshot and this one: `self`
@@ -55,9 +79,12 @@ impl ServiceMetrics {
 			circuits_offered: self.circuits_offered.saturating_sub(earlier.circuits_offered),
 			circuits_accepted: self.circuits_accepted.saturating_sub(earlier.circuits_accepted),
 			circuits_rejected: self.circuits_rejected.saturating_sub(earlier.circuits_rejected),
+			circuits_refused_at_capacity: self.circuits_refused_at_capacity.saturating_sub(earlier.circuits_refused_at_capacity),
 			streams_served: self.streams_served.saturating_sub(earlier.streams_served),
 			streams_rejected: self.streams_rejected.saturating_sub(earlier.streams_rejected),
 			streams_shutdown: self.streams_shutdown.saturating_sub(earlier.streams_shutdown),
+			streams_refused_at_capacity: self.streams_refused_at_capacity.saturating_sub(earlier.streams_refused_at_capacity),
+			streams_timed_out: self.streams_timed_out.saturating_sub(earlier.streams_timed_out),
 		}
 	}
 
@@ -92,9 +119,12 @@ impl ServiceMetrics {
 			("onyums_circuits_offered_total", "Rendezvous circuits offered to the service (one per arti RendRequest).", self.circuits_offered),
 			("onyums_circuits_accepted_total", "Circuits accepted after the circuit-level policy gate.", self.circuits_accepted),
 			("onyums_circuits_rejected_total", "Circuits the circuit-level policy rejected or tore down at the offer.", self.circuits_rejected),
+			("onyums_circuits_refused_at_capacity_total", "Circuits refused because the host-global concurrency limit was full.", self.circuits_refused_at_capacity),
 			("onyums_streams_served_total", "Streams handed to a handler after passing the per-stream policy gate.", self.streams_served),
 			("onyums_streams_rejected_total", "Streams the per-stream policy rejected while leaving the circuit alive.", self.streams_rejected),
 			("onyums_streams_shutdown_total", "Streams whose policy action tore down the whole circuit.", self.streams_shutdown),
+			("onyums_streams_refused_at_capacity_total", "Streams refused because the host-global concurrent-stream limit was full.", self.streams_refused_at_capacity),
+			("onyums_streams_timed_out_total", "Streams dropped for exceeding the per-handler timeout.", self.streams_timed_out),
 		]
 	}
 
@@ -243,9 +273,12 @@ pub struct CircuitMetrics {
 	circuits_offered: AtomicU64,
 	circuits_accepted: AtomicU64,
 	circuits_rejected: AtomicU64,
+	circuits_refused_at_capacity: AtomicU64,
 	streams_served: AtomicU64,
 	streams_rejected: AtomicU64,
 	streams_shutdown: AtomicU64,
+	streams_refused_at_capacity: AtomicU64,
+	streams_timed_out: AtomicU64,
 }
 
 impl CircuitMetrics {
@@ -255,6 +288,21 @@ impl CircuitMetrics {
 
 	pub fn record_circuit_accepted(&self) {
 		self.circuits_accepted.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// A served stream exceeded the per-handler timeout and was dropped.
+	pub fn record_stream_timed_out(&self) {
+		self.streams_timed_out.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// A stream was refused because the host-global concurrent-stream limit was full.
+	pub fn record_stream_refused_at_capacity(&self) {
+		self.streams_refused_at_capacity.fetch_add(1, Ordering::Relaxed);
+	}
+
+	/// A circuit was refused because the host-global concurrency limit was full.
+	pub fn record_circuit_refused_at_capacity(&self) {
+		self.circuits_refused_at_capacity.fetch_add(1, Ordering::Relaxed);
 	}
 
 	pub fn record_circuit_rejected(&self) {
@@ -277,9 +325,12 @@ impl CircuitMetrics {
 			circuits_offered: self.circuits_offered.load(Ordering::Relaxed),
 			circuits_accepted: self.circuits_accepted.load(Ordering::Relaxed),
 			circuits_rejected: self.circuits_rejected.load(Ordering::Relaxed),
+			circuits_refused_at_capacity: self.circuits_refused_at_capacity.load(Ordering::Relaxed),
 			streams_served: self.streams_served.load(Ordering::Relaxed),
 			streams_rejected: self.streams_rejected.load(Ordering::Relaxed),
 			streams_shutdown: self.streams_shutdown.load(Ordering::Relaxed),
+			streams_refused_at_capacity: self.streams_refused_at_capacity.load(Ordering::Relaxed),
+			streams_timed_out: self.streams_timed_out.load(Ordering::Relaxed),
 		}
 	}
 }
@@ -339,12 +390,45 @@ mod tests {
 
 	#[test]
 	fn service_metrics_since_is_a_saturating_per_field_delta() {
-		let earlier = ServiceMetrics { circuits_offered: 10, circuits_accepted: 7, circuits_rejected: 3, streams_served: 20, streams_rejected: 4, streams_shutdown: 1 };
-		let later = ServiceMetrics { circuits_offered: 15, circuits_accepted: 10, circuits_rejected: 5, streams_served: 26, streams_rejected: 4, streams_shutdown: 2 };
+		let earlier = ServiceMetrics {
+			circuits_offered: 10,
+			circuits_accepted: 7,
+			circuits_rejected: 3,
+			circuits_refused_at_capacity: 2,
+			streams_served: 20,
+			streams_rejected: 4,
+			streams_shutdown: 1,
+			streams_refused_at_capacity: 3,
+			streams_timed_out: 3,
+		};
+		let later = ServiceMetrics {
+			circuits_offered: 15,
+			circuits_accepted: 10,
+			circuits_rejected: 5,
+			circuits_refused_at_capacity: 6,
+			streams_served: 26,
+			streams_rejected: 4,
+			streams_shutdown: 2,
+			streams_refused_at_capacity: 9,
+			streams_timed_out: 9,
+		};
 
 		// The interval delta is the per-field difference.
 		let delta = later.since(earlier);
-		assert_eq!(delta, ServiceMetrics { circuits_offered: 5, circuits_accepted: 3, circuits_rejected: 2, streams_served: 6, streams_rejected: 0, streams_shutdown: 1 });
+		assert_eq!(
+			delta,
+			ServiceMetrics {
+				circuits_offered: 5,
+				circuits_accepted: 3,
+				circuits_rejected: 2,
+				circuits_refused_at_capacity: 4,
+				streams_served: 6,
+				streams_rejected: 0,
+				streams_shutdown: 1,
+				streams_refused_at_capacity: 6,
+				streams_timed_out: 6
+			}
+		);
 
 		// Swapped operands saturate to zero rather than underflow-panicking.
 		assert_eq!(earlier.since(later), ServiceMetrics::default());
@@ -376,16 +460,26 @@ mod tests {
 	}
 
 	#[test]
-	fn to_prometheus_renders_all_six_counters_in_exposition_format() {
-		let m = ServiceMetrics { circuits_offered: 15, circuits_accepted: 10, circuits_rejected: 5, streams_served: 26, streams_rejected: 4, streams_shutdown: 2 };
+	fn to_prometheus_renders_all_nine_counters_in_exposition_format() {
+		let m = ServiceMetrics {
+			circuits_offered: 15,
+			circuits_accepted: 10,
+			circuits_rejected: 5,
+			circuits_refused_at_capacity: 3,
+			streams_served: 26,
+			streams_rejected: 4,
+			streams_shutdown: 2,
+			streams_refused_at_capacity: 9,
+			streams_timed_out: 9,
+		};
 		let text = m.to_prometheus();
 
-		// One HELP + one TYPE + one value line per counter → exactly 18 lines, trailing newline.
+		// One HELP + one TYPE + one value line per counter → exactly 27 lines, trailing newline.
 		assert!(text.ends_with('\n'), "exposition format ends with a newline");
-		assert_eq!(text.lines().count(), 18, "6 counters × (HELP, TYPE, value)");
+		assert_eq!(text.lines().count(), 27, "9 counters × (HELP, TYPE, value)");
 
 		// Each counter appears as a typed counter carrying its snapshot value, unlabeled.
-		for (name, value) in [("onyums_circuits_offered_total", 15), ("onyums_circuits_accepted_total", 10), ("onyums_circuits_rejected_total", 5), ("onyums_streams_served_total", 26), ("onyums_streams_rejected_total", 4), ("onyums_streams_shutdown_total", 2)] {
+		for (name, value) in [("onyums_circuits_offered_total", 15), ("onyums_circuits_accepted_total", 10), ("onyums_circuits_rejected_total", 5), ("onyums_circuits_refused_at_capacity_total", 3), ("onyums_streams_served_total", 26), ("onyums_streams_rejected_total", 4), ("onyums_streams_shutdown_total", 2), ("onyums_streams_refused_at_capacity_total", 9), ("onyums_streams_timed_out_total", 9)] {
 			assert!(text.contains(&format!("# TYPE {name} counter\n")), "{name} declared as a counter");
 			assert!(text.contains(&format!("\n{name} {value}\n")), "{name} carries value {value} with no label block");
 		}
@@ -397,7 +491,7 @@ mod tests {
 		// Every counter is present and zero — a scraped fresh service is well-formed, not empty.
 		assert!(text.contains("\nonyums_circuits_offered_total 0\n"));
 		assert!(text.contains("\nonyums_streams_shutdown_total 0\n"));
-		assert_eq!(text.lines().count(), 18);
+		assert_eq!(text.lines().count(), 27);
 	}
 
 	#[test]
@@ -455,9 +549,32 @@ mod tests {
 
 		// The whole point: HELP/TYPE metadata appears exactly once per metric family, even
 		// though two services report — this is what raw concatenation would get wrong.
-		for name in ["onyums_circuits_offered_total", "onyums_circuits_accepted_total", "onyums_circuits_rejected_total", "onyums_streams_served_total", "onyums_streams_rejected_total", "onyums_streams_shutdown_total"] {
-			assert_eq!(text.matches(&format!("# TYPE {name} counter\n")).count(), 1, "{name} declared exactly once");
+		// The family list is *derived* from `prometheus_series` rather than written out here.
+		// It used to be a hardcoded list of six names, which silently stopped covering the
+		// families added later (found 2026-07-20, when three were added in one night and none
+		// of them were checked here). Deriving it means a new counter is covered the moment it
+		// exists, instead of the day someone remembers this list.
+		// Deriving the list cannot catch a family being *removed* — the loop would simply
+		// iterate one fewer. So pin the count too: changing the exposition's shape should be
+		// a deliberate edit here, not a silent consequence.
+		let families = ServiceMetrics::default().prometheus_series();
+		assert_eq!(families.len(), 9, "the exposition has nine counter families");
+
+		for (name, _help, _value) in families {
+			assert_eq!(
+				text.matches(&format!(
+					"# TYPE {name} counter
+"
+				))
+				.count(),
+				1,
+				"{name} declared exactly once"
+			);
 			assert_eq!(text.matches(&format!("# HELP {name} ")).count(), 1, "{name} HELP exactly once");
+			// And every service contributes exactly one sample to every family.
+			for service in ["aaa.onion", "bbb.onion"] {
+				assert_eq!(text.matches(&format!("{name}{{service=\"{service}\"}} ")).count(), 1, "{name} carries one sample for {service}");
+			}
 		}
 
 		// Both services' samples are present, each under its own service label.

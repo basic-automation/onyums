@@ -112,9 +112,22 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # `-D unused-wrapper` is load-bearing, not tidiness. A ban entry whose crate has
+      # been renamed upstream matches nothing and cargo-deny still reports `bans ok` —
+      # the ban goes dead and the C dependency it guards sits in the graph unbanned.
+      # That happened: the `lzma-sys`/`xz2` entry was silently dead after upstream
+      # renamed them to `liblzma-sys`/`liblzma` (fixed 2026-07-20), and the only signal
+      # was a warning. Promoting it to an error means a rename fails CI instead of
+      # quietly disarming the no-FFI guard.
+      #
+      # Deliberately NOT also `-D advisory-not-detected`: that one fires legitimately
+      # here, because the RUSTSEC-2026-0173 ignore is needed for the all-features graph
+      # and is genuinely not encountered on the default one. Denying it would fail CI
+      # for a correct config.
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+          arguments: -D unused-wrapper
       # The second run is not redundant with the first. The default graph carries no
       # copyleft (onyums-skin's LGPL `equix` backend is opt-in), which is precisely what
       # `cargo deny check` above enforces. This run turns `equix` on and checks it under
@@ -125,7 +138,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          arguments: --workspace --all-features
+          arguments: --workspace --all-features -D unused-wrapper
 
   docs:
     name: docs

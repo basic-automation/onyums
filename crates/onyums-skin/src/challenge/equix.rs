@@ -36,7 +36,7 @@
 //! [`Hashcash`](super::pow::Hashcash) stays the JS-interactive default.
 
 use equix::{EquiXBuilder, Runtime, RuntimeOption, SolutionByteArray};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 use super::pow::{Pow, Puzzle, leading_zero_bits};

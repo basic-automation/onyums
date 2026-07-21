@@ -19,18 +19,17 @@
 use std::sync::Arc;
 
 use anyhow::{Result, bail};
-use arti_client::TorClient;
 use axum::Router;
 use futures::Stream;
 use onyums_skin::{AccountingCircuitPolicy, AdaptiveDifficulty, CircuitPolicy, RestrictedDiscovery, SecurityEventSink, Skin};
 use safelog::DisplayRedacted;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tor_hsservice::{RendRequest, RunningOnionService, config::OnionServiceConfig};
-use tor_rtcompat::tokio::TokioNativeTlsRuntime;
 use tracing::{Level, event, span};
 
 use crate::{
-	address::OnionAddress, handle::OnionServiceHandle, http_stack::{SkinChoice, build_serve_router}, metrics::CircuitMetrics, port_router::{PortRouter, StreamHandler}, serve_loop::{ServeContext, serve_circuits}, service_config::build_onion_service_config, tls_policy::Tls, tls_setup::tls_acceptor, tor_client::{prepare_ephemeral_dir, setup_tor_client, storage_dirs, sweep_stale_ephemeral_dirs}
+	address::OnionAddress, handle::OnionServiceHandle, http_stack::{SkinChoice, build_serve_router}, metrics::CircuitMetrics, port_router::{PortRouter, StreamHandler}, serve_loop::{ServeContext, serve_circuits}, service_config::build_onion_service_config, tls_policy::Tls, tls_setup::tls_acceptor, tor_client::{OnionTorClient, prepare_ephemeral_dir, setup_tor_client, storage_dirs, sweep_stale_ephemeral_dirs}
 };
 
 /// Launches an onion service from an already-built [`OnionServiceConfig`].
@@ -38,7 +37,7 @@ use crate::{
 /// The returned request stream is self-contained (`use<>`) — it does not borrow
 /// the client — so callers can move the client elsewhere (e.g. into a handle)
 /// while keeping the stream.
-fn launch_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
+fn launch_onion_service(client: &OnionTorClient, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, impl Stream<Item = RendRequest> + use<>)> {
 	event!(Level::INFO, "Launching onion service...");
 	client.launch_onion_service(svc_cfg).map_err(|e| anyhow::anyhow!("Failed to launch onion service: {e}"))?.ok_or_else(|| anyhow::anyhow!("Onion service launch returned None"))
 }
@@ -56,7 +55,7 @@ fn get_onion_address(service: &Arc<RunningOnionService>) -> Result<OnionAddress>
 
 /// Initializes the onion service from a built config and returns the service and
 /// request stream.
-fn initialize_onion_service(client: &TorClient<TokioNativeTlsRuntime>, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
+fn initialize_onion_service(client: &OnionTorClient, svc_cfg: OnionServiceConfig) -> Result<(Arc<RunningOnionService>, OnionAddress, impl Stream<Item = RendRequest> + use<>)> {
 	let (service, request_stream) = launch_onion_service(client, svc_cfg)?;
 	let address = get_onion_address(&service)?;
 	Ok((service, address, request_stream))
@@ -97,6 +96,39 @@ fn resolve_circuit_policy(custom: Option<Arc<dyn CircuitPolicy>>, under_attack: 
 /// disposable identity. Every other pairing is valid (a fresh persistent client, a
 /// fresh ephemeral client, or a shared persistent client). Extracted from
 /// [`OnionServiceBuilder::serve`] so the rule is unit-testable with no live Tor network.
+/// Turn the builder's optional circuit cap into a semaphore, rejecting `0` offline
+/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits).
+///
+/// A cap of `0` would be a service that refuses every circuit it is ever offered — a
+/// silently dead onion address. That is never what a caller means by "limit the
+/// concurrency", so it is a clean `serve()` error before any bootstrap, exactly as
+/// `ConnectionLimit::new` rejects a limit of `0` at construction.
+///
+/// # Errors
+/// Returns an error if `max` is `Some(0)`.
+fn resolve_circuit_limit(max: Option<usize>) -> Result<Option<Arc<Semaphore>>> {
+	match max {
+		Some(0) => bail!("max_circuits(0) would refuse every rendezvous circuit, making the service unreachable: pass a positive limit, or drop max_circuits() to stay unbounded"),
+		Some(max) => Ok(Some(Arc::new(Semaphore::new(max)))),
+		None => Ok(None),
+	}
+}
+
+/// Turn the builder's optional stream cap into a semaphore, rejecting `0` offline.
+///
+/// Same reasoning as [`resolve_circuit_limit`]: a cap of `0` would refuse every stream,
+/// so the service would answer nothing while looking healthy.
+///
+/// # Errors
+/// Returns an error if `max` is `Some(0)`.
+fn resolve_stream_limit(max: Option<usize>) -> Result<Option<Arc<Semaphore>>> {
+	match max {
+		Some(0) => bail!("max_streams(0) would refuse every stream, so the service would answer nothing: pass a positive limit, or drop max_streams() to stay unbounded"),
+		Some(max) => Ok(Some(Arc::new(Semaphore::new(max)))),
+		None => Ok(None),
+	}
+}
+
 fn validate_client_choice(ephemeral: bool, has_shared_client: bool) -> Result<()> {
 	if ephemeral && has_shared_client {
 		bail!("ephemeral() conflicts with tor_client(): a shared Tor client has a fixed keystore and cannot provide a throwaway per-launch identity; use one or the other");
@@ -127,7 +159,17 @@ pub struct OnionServiceBuilder {
 	// A caller-supplied, already-bootstrapped Tor client to launch this service on,
 	// instead of bootstrapping a fresh one (Phase 4 multi-service — bootstrap once,
 	// launch N). `None` keeps today's behaviour: `serve` bootstraps its own client.
-	tor_client: Option<Arc<TorClient<TokioNativeTlsRuntime>>>,
+	tor_client: Option<Arc<OnionTorClient>>,
+	// Host-global cap on concurrently-served rendezvous circuits (Phase 0 backpressure).
+	// `None` is today's behaviour: unbounded. Stored as the raw count and turned into a
+	// semaphore at launch, so the builder stays cheaply cloneable and a `0` is rejected
+	// offline rather than becoming a service that refuses everything.
+	max_circuits: Option<usize>,
+	// Host-global cap on concurrently-served streams across all circuits. Same shape and
+	// same offline `0` rejection as `max_circuits`.
+	max_streams: Option<usize>,
+	// Ceiling on how long one served stream may run. `None` is today's behaviour.
+	handler_timeout: Option<std::time::Duration>,
 }
 
 impl OnionServiceBuilder {
@@ -335,7 +377,7 @@ impl OnionServiceBuilder {
 	/// on one shared client).
 	///
 	/// Tor bootstrap (fetching the consensus, building circuits) is the slow part of
-	/// coming up; a single [`TorClient`] can host any number of onion services, each
+	/// coming up; a single [`TorClient`](arti_client::TorClient) can host any number of onion services, each
 	/// keyed by its own nickname in the client's keystore. Bootstrap once with
 	/// [`OnionService::shared_client`] (or your own re-exported [`arti_client`] client),
 	/// then hand the same `Arc` to several builders so N services share one bootstrap
@@ -369,8 +411,85 @@ impl OnionServiceBuilder {
 	/// identity `ephemeral` promises — setting both is an error surfaced from
 	/// [`Self::serve`] (offline, before any launch).
 	#[must_use]
-	pub fn tor_client(mut self, client: Arc<TorClient<TokioNativeTlsRuntime>>) -> Self {
+	pub fn tor_client(mut self, client: Arc<OnionTorClient>) -> Self {
 		self.tor_client = Some(client);
+		self
+	}
+
+	/// Cap how many rendezvous circuits the service will serve at once
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits).
+	///
+	/// Unset, a service spawns a task per offered circuit with no ceiling, so a circuit
+	/// flood is bounded only by memory. With a cap, a circuit arriving while `max` are
+	/// already in service is **refused**, not queued — the same stance
+	/// [`ConnectionLimit`](crate::ConnectionLimit) takes on raw ports: queueing converts
+	/// a flood into unbounded memory growth and a latency cliff for the clients already
+	/// being served, and a refused client can retry where one parked in an invisible
+	/// queue cannot tell slow from dead.
+	///
+	/// This is *host-global* and complements — does not replace — the per-circuit caps
+	/// in [`AccountingCircuitPolicy`](onyums_skin::AccountingCircuitPolicy)
+	/// (`max_streams` / `max_request_rate` / `max_bytes`), which bound what a single
+	/// circuit may do. Refusals are counted separately from policy rejections, as
+	/// [`ServiceMetrics::circuits_refused_at_capacity`](crate::ServiceMetrics::circuits_refused_at_capacity):
+	/// being full is a fact about the service, not a verdict about the circuit.
+	///
+	/// The permit is taken after the circuit policy admits the circuit and released when
+	/// the circuit ends, however it ends.
+	///
+	/// A `max` of `0` is rejected by [`Self::serve`] offline, rather than silently
+	/// becoming a service that refuses every circuit.
+	#[must_use]
+	pub const fn max_circuits(mut self, max: usize) -> Self {
+		self.max_circuits = Some(max);
+		self
+	}
+
+	/// Cap how many streams the service will serve at once, across every circuit
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits).
+	///
+	/// Complements [`max_circuits`](Self::max_circuits) rather than duplicating it: the
+	/// circuit cap bounds how many clients are in service, while this bounds the total
+	/// work in flight — one circuit may open many streams, so a circuit cap alone does
+	/// not bound sockets or memory.
+	///
+	/// At capacity the stream is **refused** (with Tor's `RESOURCELIMIT` end reason,
+	/// which says truthfully that the service is full rather than that the request was
+	/// unwelcome), leaving the circuit and its other streams alive — the same shape as a
+	/// policy rejection. Refusals are counted as
+	/// [`ServiceMetrics::streams_refused_at_capacity`](crate::ServiceMetrics::streams_refused_at_capacity),
+	/// separately from policy rejections.
+	///
+	/// A `max` of `0` is rejected by [`Self::serve`] offline.
+	#[must_use]
+	pub const fn max_streams(mut self, max: usize) -> Self {
+		self.max_streams = Some(max);
+		self
+	}
+
+	/// Bound how long a single served stream may run
+	/// (onyums ROADMAP Phase 0 — concurrency/backpressure limits).
+	///
+	/// This is the limit that makes [`max_circuits`](Self::max_circuits) and
+	/// [`max_streams`](Self::max_streams) mean something under an attack that never
+	/// closes connections. Without it a client holds its permit for as long as it likes
+	/// simply by going quiet mid-request, so the two caps bound how many slow clients it
+	/// takes to fill the service rather than bounding the damage. A timeout turns a
+	/// permit into a lease.
+	///
+	/// A stream that exceeds `limit` is dropped and counted as
+	/// [`ServiceMetrics::streams_timed_out`](crate::ServiceMetrics::streams_timed_out) —
+	/// separate from the capacity counters, because a rising timeout count with flat
+	/// refusals means *slow* clients rather than *too many* of them, and the two call for
+	/// different responses.
+	///
+	/// **Off by default, deliberately.** A long-lived stream is a legitimate use of an
+	/// onion service — the README's websocket example is one — so a default here would
+	/// silently sever working applications. Set it when your handlers are
+	/// request/response shaped, and leave it unset (or generous) when they are not.
+	#[must_use]
+	pub const fn handler_timeout(mut self, limit: std::time::Duration) -> Self {
+		self.handler_timeout = Some(limit);
 		self
 	}
 
@@ -436,6 +555,8 @@ impl OnionServiceBuilder {
 		// else the fixed persistent onyums tree. A shared client cannot be ephemeral
 		// (fixed keystore), rejected here before any launch.
 		validate_client_choice(self.ephemeral, self.tor_client.is_some())?;
+		let max_circuits = resolve_circuit_limit(self.max_circuits)?;
+		let max_streams = resolve_stream_limit(self.max_streams)?;
 		let (client, ephemeral) = if let Some(shared) = self.tor_client {
 			(shared, None)
 		} else {
@@ -469,7 +590,18 @@ impl OnionServiceBuilder {
 		// cheaply-cloned context (see [`ServeContext`]). The metrics counters are shared
 		// with the handle so `metrics()` reads what the loop increments.
 		let metrics = Arc::new(CircuitMetrics::default());
-		let ctx = ServeContext { app, tls_acceptor, address: address.clone(), plaintext, port_router, metrics: Arc::clone(&metrics), adaptive: self.adaptive_difficulty };
+		let ctx = ServeContext {
+			app,
+			tls_acceptor,
+			address: address.clone(),
+			plaintext,
+			port_router,
+			metrics: Arc::clone(&metrics),
+			adaptive: self.adaptive_difficulty,
+			max_circuits,
+			max_streams,
+			handler_timeout: self.handler_timeout,
+		};
 
 		let cancel = CancellationToken::new();
 		let loop_cancel = cancel.clone();
@@ -519,7 +651,7 @@ impl OnionService {
 	/// # Errors
 	/// Returns an error if the Tor client fails to build or bootstrap, or if called
 	/// outside a tokio runtime.
-	pub async fn shared_client() -> Result<Arc<TorClient<TokioNativeTlsRuntime>>> {
+	pub async fn shared_client() -> Result<Arc<OnionTorClient>> {
 		let (state_dir, cache_dir) = storage_dirs(false);
 		setup_tor_client(&state_dir, &cache_dir).await
 	}
@@ -611,6 +743,33 @@ mod tests {
 		assert!(validate_client_choice(false, false).is_ok());
 		assert!(validate_client_choice(true, false).is_ok());
 		assert!(validate_client_choice(false, true).is_ok());
+	}
+
+	#[test]
+	fn circuit_limit_of_zero_is_rejected_offline() {
+		// A cap of 0 would refuse every circuit the service is ever offered — a live
+		// onion address that is silently unreachable. That must be a launch error, not
+		// a runtime surprise, and it must be caught before any Tor bootstrap.
+		assert!(resolve_circuit_limit(Some(0)).is_err(), "max_circuits(0) would make the service unreachable");
+
+		// A positive cap yields a semaphore with exactly that many permits.
+		let limit = resolve_circuit_limit(Some(3)).expect("a positive limit is valid").expect("a limit was requested");
+		assert_eq!(limit.available_permits(), 3);
+
+		// Unset stays unbounded — the default must not acquire a ceiling.
+		assert!(resolve_circuit_limit(None).expect("no limit is valid").is_none());
+	}
+
+	#[test]
+	fn stream_limit_of_zero_is_rejected_offline() {
+		// Same trap as max_circuits(0), one layer down: a service that accepts circuits
+		// and then refuses every stream on them answers nothing while looking healthy.
+		assert!(resolve_stream_limit(Some(0)).is_err(), "max_streams(0) would answer nothing");
+
+		let limit = resolve_stream_limit(Some(64)).expect("a positive limit is valid").expect("a limit was requested");
+		assert_eq!(limit.available_permits(), 64);
+
+		assert!(resolve_stream_limit(None).expect("no limit is valid").is_none());
 	}
 
 	#[tokio::test]

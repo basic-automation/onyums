@@ -22,7 +22,7 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Result, bail};
-use rand::RngCore;
+use rand::Rng;
 use safelog::DisplayRedacted;
 use tor_hscrypto::pk::{HsId, HsIdKey};
 use tor_llcrypto::pk::ed25519::{ExpandedKeypair, Keypair};
@@ -232,7 +232,7 @@ pub fn tor_secret_key_file_from_expanded(expanded: [u8; 64]) -> [u8; HS_ED25519_
 }
 
 /// Draw one candidate key and return it iff its address begins with `prefix`.
-fn try_one(rng: &mut impl RngCore, prefix: &str) -> Option<VanityKey> {
+fn try_one(rng: &mut impl Rng, prefix: &str) -> Option<VanityKey> {
 	let mut seed = [0_u8; 32];
 	rng.fill_bytes(&mut seed);
 	let (address, rendered) = address_for_seed(&seed);

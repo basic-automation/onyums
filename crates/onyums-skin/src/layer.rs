@@ -25,7 +25,7 @@ use axum::{
 	body::Body, http::{HeaderValue, StatusCode, header, request::Parts}, response::{IntoResponse, Response}
 };
 use http_body_util::{BodyExt, Limited};
-use rand::RngCore;
+use rand::Rng;
 use tower_layer::Layer;
 use tower_service::Service;
 
@@ -110,14 +110,7 @@ impl Skin {
 		// All three submit to the one Skin-owned route (`DEFAULT_SUBMIT_PATH`); the chain
 		// disambiguates by which challenge's `verify` accepts the submission, and mints that
 		// challenge's own clearance level.
-		Skin::builder()
-			.store(Arc::new(store.clone()))
-			.challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY)))
-			.challenge(Box::new(CaptchaChallenge::new(captcha_secret.to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH)))
-			.challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY)))
-			.rate_limit(rate)
-			.waf(Waf::starter())
-			.build()
+		Skin::builder().store(Arc::new(store.clone())).challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY))).challenge(Box::new(CaptchaChallenge::new(captcha_secret.to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH))).challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY))).rate_limit(rate).waf(Waf::starter()).build()
 	}
 
 	/// Turn this gate into a [`SkinLayer`] for `Router::layer`.
@@ -674,13 +667,7 @@ mod tests {
 		// uncleared no-JS client must be served the CAPTCHA (a no-JS image form), skipping
 		// the JS PoW and stopping before the last-resort tarpit.
 		let store = Arc::new(HmacClearanceStore::new(b"nojs-secret".to_vec()));
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
-			.challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH)))
-			.challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5))))
-			.client_has_js(false)
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH))).challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5)))).client_has_js(false).build();
 		let resp = match skin.decide(&bare_parts("/")) {
 			Decision::Respond(resp) => resp,
 			Decision::Forward { .. } => panic!("an uncleared request must be challenged"),

@@ -32,7 +32,7 @@ use hmac::{Hmac, Mac};
 use rand::RngCore;
 use sha2::Sha256;
 
-use super::{Challenge, Gate, png::GrayImage};
+use super::{Challenge, Gate, NO_VISUAL_HINT, png::GrayImage};
 use crate::clearance::ClearanceLevel;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -390,6 +390,10 @@ pub struct CaptchaChallenge {
 	len: usize,
 	ttl: Duration,
 	submit_path: String,
+	/// Whether to render the "can't see the image? continue without it" accessibility
+	/// escape link. Off by default — only meaningful when a non-visual tier (the patience
+	/// tarpit) sits behind the CAPTCHA in the chain, so the host opts in when it does.
+	no_image_escape: bool,
 	/// Nonces of envelopes already redeemed, with the instant their entry can be pruned.
 	consumed: Mutex<HashMap<[u8; NONCE_LEN], SystemTime>>,
 }
@@ -398,7 +402,7 @@ impl CaptchaChallenge {
 	/// Build a CAPTCHA challenge signing/encrypting puzzles with `secret`, at the default
 	/// length (6) and TTL (5 minutes).
 	pub fn new(secret: impl Into<Vec<u8>>) -> Self {
-		Self { secret: secret.into(), len: DEFAULT_LEN, ttl: DEFAULT_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
+		Self { secret: secret.into(), len: DEFAULT_LEN, ttl: DEFAULT_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), no_image_escape: false, consumed: Mutex::new(HashMap::new()) }
 	}
 
 	/// Override the number of characters in a puzzle (clamped to at least 1).
@@ -419,6 +423,24 @@ impl CaptchaChallenge {
 	#[must_use]
 	pub fn with_submit_path(mut self, path: impl Into<String>) -> Self {
 		self.submit_path = path.into();
+		self
+	}
+
+	/// Render a "can't see the image? continue without it" link on the CAPTCHA page (off by
+	/// default), the [W3C-recommended] accessibility escape for a low-vision no-JS client.
+	///
+	/// The link carries the [`NO_VISUAL_HINT`] marker, which makes the
+	/// [`ChallengeChain`](super::ChallengeChain) skip every vision-requiring tier and serve
+	/// the next non-visual fallback (the patience tarpit) instead. **Enable it only when
+	/// such a fallback actually sits behind the CAPTCHA in the chain** — as
+	/// [`Skin::secure_default`](crate::Skin::secure_default) does (PoW → CAPTCHA → tarpit);
+	/// with no non-visual tier behind it the escape fails closed to a hard reject, which is
+	/// worse than not advertising it.
+	///
+	/// [W3C-recommended]: https://www.w3.org/TR/turingtest/
+	#[must_use]
+	pub fn with_no_image_escape(mut self, enabled: bool) -> Self {
+		self.no_image_escape = enabled;
 		self
 	}
 
@@ -518,8 +540,18 @@ impl CaptchaChallenge {
 	/// server state) and a plain GET form that echoes the envelope and the typed answer.
 	fn page(&self, image_png: &[u8], envelope: &str) -> Response {
 		let data_uri = format!("data:image/png;base64,{}", STANDARD.encode(image_png));
+		// The accessibility escape (opt-in): a link back to the gate carrying the no-visual
+		// marker so a low-vision no-JS client reaches the non-visual tarpit tier instead of
+		// being stuck on an unreadable image. The href is a *relative, query-only* URL, so it
+		// resolves against whatever page the CAPTCHA was served for without ever interpolating
+		// the attacker-controlled request path into the HTML (no reflected-injection surface).
+		let escape = if self.no_image_escape {
+			format!("<p><a href=\"?{NO_VISUAL_HINT}=1\">Can't see the image? Continue without it.</a></p>\n")
+		} else {
+			String::new()
+		};
 		let body = format!(
-			"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Verify you are human</title>\n</head>\n<body>\n<h1>Verify you are human</h1>\n<p>Type the characters shown in the image, then choose Continue. This works without JavaScript; letters are not case-sensitive.</p>\n<img src=\"{data_uri}\" alt=\"CAPTCHA challenge\">\n<form method=\"GET\" action=\"{}\">\n<input type=\"hidden\" name=\"puzzle\" value=\"{envelope}\">\n<input type=\"text\" name=\"answer\" autocomplete=\"off\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" aria-label=\"Characters shown in the image\">\n<button type=\"submit\">Continue</button>\n</form>\n</body>\n</html>\n",
+			"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Verify you are human</title>\n</head>\n<body>\n<h1>Verify you are human</h1>\n<p>Type the characters shown in the image, then choose Continue. This works without JavaScript; letters are not case-sensitive.</p>\n<img src=\"{data_uri}\" alt=\"CAPTCHA challenge\">\n<form method=\"GET\" action=\"{}\">\n<input type=\"hidden\" name=\"puzzle\" value=\"{envelope}\">\n<input type=\"text\" name=\"answer\" autocomplete=\"off\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" aria-label=\"Characters shown in the image\">\n<button type=\"submit\">Continue</button>\n</form>\n{escape}</body>\n</html>\n",
 			self.submit_path
 		);
 		(StatusCode::SERVICE_UNAVAILABLE, Html(body)).into_response()
@@ -556,6 +588,12 @@ impl Challenge for CaptchaChallenge {
 
 	fn needs_js(&self) -> bool {
 		false
+	}
+
+	fn needs_vision(&self) -> bool {
+		// Reading a distorted image is a visual task — this is the tier the no-visual escape
+		// exists to route *around*.
+		true
 	}
 
 	fn granted_level(&self) -> ClearanceLevel {
@@ -765,6 +803,38 @@ mod tests {
 	fn needs_js_is_false() {
 		// The whole point of the CAPTCHA tier: it is the no-JS fallback.
 		assert!(!challenge().needs_js());
+	}
+
+	#[test]
+	fn needs_vision_is_true() {
+		// The CAPTCHA is the one built-in tier that requires sight; the no-visual escape
+		// exists to route around exactly this.
+		assert!(challenge().needs_vision());
+	}
+
+	#[tokio::test]
+	async fn escape_link_is_off_by_default() {
+		use http_body_util::BodyExt;
+		let Gate::Present(resp) = challenge().issue(&parts_with_query("")) else {
+			panic!("the CAPTCHA challenge must present an interstitial");
+		};
+		let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+		assert!(!body.contains(NO_VISUAL_HINT), "the escape link must not appear unless opted in — advertising a dead-end is worse than omitting it");
+	}
+
+	#[tokio::test]
+	async fn escape_link_is_rendered_when_enabled() {
+		use http_body_util::BodyExt;
+		let chal = CaptchaChallenge::new(b"test-secret".to_vec()).with_no_image_escape(true);
+		let Gate::Present(resp) = chal.issue(&parts_with_query("")) else {
+			panic!("the CAPTCHA challenge must present an interstitial");
+		};
+		let body = String::from_utf8(resp.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+		// A relative, query-only href — resolves against the current page, interpolates no
+		// attacker-controlled path into the HTML.
+		assert!(body.contains(&format!("href=\"?{NO_VISUAL_HINT}=1\"")), "the escape link carries the no-visual marker as a relative query href");
+		assert!(body.contains("Continue without it"), "the link is human-labelled for the low-vision reader");
+		assert!(!body.contains("<script"), "the escape must not require a script");
 	}
 
 	#[tokio::test]

@@ -1209,6 +1209,16 @@ pub fn starter_rules() -> Vec<Rule> {
 		// obsolete legitimately, so their appearance in a reflected `style=`/CSS value is an injection.
 		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
 		Rule { id: "xss_css_binding", category: WafCategory::Xss, pattern: r"(?i)(-moz-binding|behavior\s*:\s*url\s*\()" },
+		// CSS `expression()` script execution (OWASP-CRS 941 dynamic-property port): IE's legacy
+		// dynamic-property syntax `width:expression(alert(1))` evaluates JScript from a CSS *value*.
+		// The peer of `xss_css_binding` — like `-moz-binding`/`behavior:url(` it runs script with no
+		// `<script>`/`on*=` handler — and equally obsolete legitimately (removed from IE standards
+		// mode), so its appearance in a reflected `style=`/CSS value is injection. Anchored on the
+		// CSS property-value form `:expression(` (colon, optional whitespace, `expression`, `(`)
+		// rather than the bare word, so ordinary prose like "regular expression (regex)" — a space
+		// before the paren and no CSS `:` — stays clean, the same low-FP shape as `behavior:url(`.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_css_expression", category: WafCategory::Xss, pattern: r"(?i):\s*expression\s*\(" },
 		// HTML5 XSS vectors the small handler set above misses (OWASP-CRS 941 port). Newer event
 		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
 		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
@@ -1352,6 +1362,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "cmdi_fork_bomb", category: WafCategory::CommandInjection, pattern: r":\s*\|\s*:\s*&" },
 		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
 		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
+		// AWS IMDS *IPv6* endpoint `[fd00:ec2::254]` — the dual-stack sibling of the 169.254.169.254
+		// IPv4 metadata IP above, IMDSv2-compatible and serving the same `/latest/meta-data/` on
+		// Nitro instances. An SSRF egress filter that blocks the v4 metadata IP but forgets the v6
+		// endpoint is a live bypass; `fd00:ec2::254` is a near-unique literal, so no context anchor
+		// is needed (matches bracketed `[fd00:ec2::254]` and bare forms alike). (<https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html>)
+		Rule { id: "ssrf_aws_ipv6_imds", category: WafCategory::Ssrf, pattern: r"(?i)fd00:ec2::254" },
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
@@ -1364,6 +1380,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		// Cloud metadata reachable by DNS name rather than the 169.254.169.254 link-local IP —
 		// GCP's `metadata.google.internal`. A value-inspection SSRF target the IP/path rules miss.
 		Rule { id: "ssrf_metadata_hostname", category: WafCategory::Ssrf, pattern: r"(?i)\bmetadata\.google\.internal\b" },
+		// Kubernetes in-cluster API-server SSRF: the stable service DNS name `kubernetes.default.svc`
+		// (optionally `.cluster.local`) that every pod resolves to the API server. A classic
+		// cloud-native SSRF pivot — reaching it with a mounted service-account token is a cluster
+		// takeover — and one the cloud-metadata IP/path rules never see (it is a DNS name, not
+		// 169.254.169.254). Value-inspection, near-zero FP (the FQDN does not occur in ordinary
+		// external traffic). <https://book.hacktricks.xyz/pentesting-web/ssrf-server-side-request-forgery/cloud-ssrf>
+		Rule { id: "ssrf_k8s_api_service", category: WafCategory::Ssrf, pattern: r"(?i)\bkubernetes\.default\.svc\b" },
 		// Non-AWS cloud metadata endpoints the 169.254.169.254 IP + AWS/GCP/Azure path rules miss:
 		// Alibaba Cloud's distinct link-local metadata IP `100.100.100.200` (cloud-agnostic SSRF
 		// tooling routinely forgets it), and Oracle OCI's `/opc/v{1,2}/` metadata path (OCI keeps the
@@ -1534,6 +1557,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
 		Rule { id: "nosqli_json_operator", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(ne|gt|gte|lt|lte|in|nin|regex|exists|where|expr|or|nor|and|not)"\s*:"# },
+		// MongoDB server-side-JavaScript operators past `$where` — `$function` and `$accumulator`
+		// (aggregation-pipeline operators, MongoDB 4.4+) both take a `body:` of JavaScript the
+		// *server* evaluates, the NoSQL analog of SQLi's stacked-query RCE and disabled only when
+		// `security.javascriptEnabled: false`. They are aggregation-only, so they always arrive as a
+		// JSON key (`{"$function": {...}}`); anchored on that `[{,] "$op":` form (same shape as
+		// `nosqli_json_operator`) so a bare `$function` shell/template token stays clean. Disjoint
+		// from the operator list above, so no double-count. <https://www.mongodb.com/docs/manual/reference/operator/aggregation/function/>
+		Rule { id: "nosqli_mongo_server_js", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(function|accumulator)"\s*:"# },
 		// ORM lookup-operator injection (OWASP-CRS 4.28.0) — Django/SQLAlchemy double-underscore
 		// query lookups used for blind data extraction: `?user__password__startswith=a`, and the
 		// `__contains`/`__regex`/`__gt` comparison family. The ORM analog of the Mongo `[$ne]` rule:
@@ -2012,6 +2043,33 @@ mod tests {
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn css_expression_xss_matches() {
+		// OWASP-CRS 941 dynamic-property: IE's `expression()` runs JScript from a CSS value, with
+		// no `<script>`/`on*=` — the distinct vector `xss_css_binding` (`-moz-binding`/`behavior:url(`)
+		// does not cover.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("style=width:expression(alert(1))", "query").unwrap().rule_id, "xss_css_expression");
+		assert_eq!(waf.inspect_str("s=xss:expression(document.cookie)", "query").unwrap().category, WafCategory::Xss);
+		// CSS tolerates whitespace around the colon and before the paren.
+		assert_eq!(waf.inspect_str("p=x : expression ( alert(1) )", "query").unwrap().rule_id, "xss_css_expression");
+	}
+
+	#[test]
+	fn css_expression_xss_keeps_false_positives_low() {
+		// Prose that names "expression" as a word — a space before the paren and no CSS `:` — stays
+		// clean; the anchor is the CSS property-value form `:expression(`, not the bare word.
+		let waf = Waf::starter();
+		for uri in [
+			"/help/regular-expression-guide",  // "expression" word in a path
+			"/blog/evaluate-the-expression",   // "expression" word, no paren
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+		// "regular expression (regex)" — a space between the word and paren, and no CSS colon.
+		assert_eq!(waf.inspect_str("q=a regular expression (regex) here", "query"), None);
 	}
 
 	#[test]
@@ -2849,6 +2907,12 @@ mod tests {
 		// The AWS/GCP/Azure link-local metadata endpoint, by IP and by path.
 		assert_eq!(waf.inspect_str("url=http://169.254.169.254/latest/meta-data/iam", "target").unwrap().category, WafCategory::Ssrf);
 		assert_eq!(waf.inspect_str("target=/computeMetadata/v1/project", "target").unwrap().rule_id, "ssrf_cloud_metadata_path");
+		// The AWS IMDS IPv6 endpoint — the bypass past a filter that only blocks the IPv4 IP.
+		assert_eq!(waf.inspect_str("url=http://[fd00:ec2::254]/latest/meta-data/", "target").unwrap().rule_id, "ssrf_aws_ipv6_imds");
+		assert_eq!(waf.inspect_str("u=http://[FD00:EC2::254]/", "query").unwrap().category, WafCategory::Ssrf, "case-insensitive");
+		// The Kubernetes in-cluster API-server service name — a DNS-name SSRF pivot the IP rules miss.
+		assert_eq!(waf.inspect_str("url=https://kubernetes.default.svc/api/v1/secrets", "target").unwrap().rule_id, "ssrf_k8s_api_service");
+		assert_eq!(waf.inspect_str("u=https://kubernetes.default.svc.cluster.local/", "query").unwrap().category, WafCategory::Ssrf);
 	}
 
 	#[test]
@@ -3227,6 +3291,9 @@ mod tests {
 		assert_eq!(waf.inspect_str(r#"{"$where": "this.a == this.b"}"#, "query").map(|m| m.category), Some(WafCategory::NoSqlInjection));
 		assert_eq!(waf.inspect_str(r#"{"username":{"$ne":null}}"#, "query").unwrap().rule_id, "nosqli_json_operator");
 		assert_eq!(waf.inspect_str("username[$ne]=&password[$ne]=", "query").unwrap().rule_id, "nosqli_param_operator");
+		// MongoDB server-side-JS operators (aggregation `$function`/`$accumulator`) that run JS on the server.
+		assert_eq!(waf.inspect_str(r#"{"$function":{"body":"function(){return 1}","args":[],"lang":"js"}}"#, "query").unwrap().rule_id, "nosqli_mongo_server_js");
+		assert_eq!(waf.inspect_str(r#"[{"$group":{"_id":null,"v":{"$accumulator":{"init":"function(){}"}}}}]"#, "query").unwrap().category, WafCategory::NoSqlInjection);
 		assert_eq!(waf.inspect_str("age[$gt]=0", "query").unwrap().category, WafCategory::NoSqlInjection);
 	}
 
@@ -3257,6 +3324,7 @@ mod tests {
 			"/search?contains=widget",    // "contains" as a plain key, no `__` prefix
 			"/py/__init__=1",             // dunder that is not an ORM lookup keyword
 			"/opt?newsletter_optin=true", // single-underscore opt-in, not `__in=`
+			"/docs/aggregation-function", // "function" as a path word, no `"$function":` JSON key
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

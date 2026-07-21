@@ -1209,6 +1209,16 @@ pub fn starter_rules() -> Vec<Rule> {
 		// obsolete legitimately, so their appearance in a reflected `style=`/CSS value is an injection.
 		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
 		Rule { id: "xss_css_binding", category: WafCategory::Xss, pattern: r"(?i)(-moz-binding|behavior\s*:\s*url\s*\()" },
+		// CSS `expression()` script execution (OWASP-CRS 941 dynamic-property port): IE's legacy
+		// dynamic-property syntax `width:expression(alert(1))` evaluates JScript from a CSS *value*.
+		// The peer of `xss_css_binding` — like `-moz-binding`/`behavior:url(` it runs script with no
+		// `<script>`/`on*=` handler — and equally obsolete legitimately (removed from IE standards
+		// mode), so its appearance in a reflected `style=`/CSS value is injection. Anchored on the
+		// CSS property-value form `:expression(` (colon, optional whitespace, `expression`, `(`)
+		// rather than the bare word, so ordinary prose like "regular expression (regex)" — a space
+		// before the paren and no CSS `:` — stays clean, the same low-FP shape as `behavior:url(`.
+		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-941-APPLICATION-ATTACK-XSS.conf>
+		Rule { id: "xss_css_expression", category: WafCategory::Xss, pattern: r"(?i):\s*expression\s*\(" },
 		// HTML5 XSS vectors the small handler set above misses (OWASP-CRS 941 port). Newer event
 		// handlers are the go-to bypass when the classic `onerror`/`onload` list is filtered:
 		// animation/transition/pointer events and the popover `onbeforetoggle` all auto-fire.
@@ -2012,6 +2022,33 @@ mod tests {
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
+	}
+
+	#[test]
+	fn css_expression_xss_matches() {
+		// OWASP-CRS 941 dynamic-property: IE's `expression()` runs JScript from a CSS value, with
+		// no `<script>`/`on*=` — the distinct vector `xss_css_binding` (`-moz-binding`/`behavior:url(`)
+		// does not cover.
+		let waf = Waf::starter();
+		assert_eq!(waf.inspect_str("style=width:expression(alert(1))", "query").unwrap().rule_id, "xss_css_expression");
+		assert_eq!(waf.inspect_str("s=xss:expression(document.cookie)", "query").unwrap().category, WafCategory::Xss);
+		// CSS tolerates whitespace around the colon and before the paren.
+		assert_eq!(waf.inspect_str("p=x : expression ( alert(1) )", "query").unwrap().rule_id, "xss_css_expression");
+	}
+
+	#[test]
+	fn css_expression_xss_keeps_false_positives_low() {
+		// Prose that names "expression" as a word — a space before the paren and no CSS `:` — stays
+		// clean; the anchor is the CSS property-value form `:expression(`, not the bare word.
+		let waf = Waf::starter();
+		for uri in [
+			"/help/regular-expression-guide",  // "expression" word in a path
+			"/blog/evaluate-the-expression",   // "expression" word, no paren
+		] {
+			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
+		}
+		// "regular expression (regex)" — a space between the word and paren, and no CSS colon.
+		assert_eq!(waf.inspect_str("q=a regular expression (regex) here", "query"), None);
 	}
 
 	#[test]

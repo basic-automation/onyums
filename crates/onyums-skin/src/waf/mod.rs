@@ -1362,6 +1362,12 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "cmdi_fork_bomb", category: WafCategory::CommandInjection, pattern: r":\s*\|\s*:\s*&" },
 		// --- Server-side request forgery (URL-value inspection; no client IP needed) ---
 		Rule { id: "ssrf_cloud_metadata_ip", category: WafCategory::Ssrf, pattern: r"169\.254\.169\.254" },
+		// AWS IMDS *IPv6* endpoint `[fd00:ec2::254]` — the dual-stack sibling of the 169.254.169.254
+		// IPv4 metadata IP above, IMDSv2-compatible and serving the same `/latest/meta-data/` on
+		// Nitro instances. An SSRF egress filter that blocks the v4 metadata IP but forgets the v6
+		// endpoint is a live bypass; `fd00:ec2::254` is a near-unique literal, so no context anchor
+		// is needed (matches bracketed `[fd00:ec2::254]` and bare forms alike). (<https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html>)
+		Rule { id: "ssrf_aws_ipv6_imds", category: WafCategory::Ssrf, pattern: r"(?i)fd00:ec2::254" },
 		Rule { id: "ssrf_cloud_metadata_path", category: WafCategory::Ssrf, pattern: r"(?i)/(latest/meta-data|computeMetadata/v1|metadata/instance)\b" },
 		Rule { id: "ssrf_internal_scheme", category: WafCategory::Ssrf, pattern: r"(?i)\b(gopher|dict|file)://" },
 		Rule { id: "ssrf_loopback_url", category: WafCategory::Ssrf, pattern: r"(?i)\b(https?|ftp)://(localhost|127\.0\.0\.1|0\.0\.0\.0|\[::1\])" },
@@ -2894,6 +2900,9 @@ mod tests {
 		// The AWS/GCP/Azure link-local metadata endpoint, by IP and by path.
 		assert_eq!(waf.inspect_str("url=http://169.254.169.254/latest/meta-data/iam", "target").unwrap().category, WafCategory::Ssrf);
 		assert_eq!(waf.inspect_str("target=/computeMetadata/v1/project", "target").unwrap().rule_id, "ssrf_cloud_metadata_path");
+		// The AWS IMDS IPv6 endpoint — the bypass past a filter that only blocks the IPv4 IP.
+		assert_eq!(waf.inspect_str("url=http://[fd00:ec2::254]/latest/meta-data/", "target").unwrap().rule_id, "ssrf_aws_ipv6_imds");
+		assert_eq!(waf.inspect_str("u=http://[FD00:EC2::254]/", "query").unwrap().category, WafCategory::Ssrf, "case-insensitive");
 	}
 
 	#[test]

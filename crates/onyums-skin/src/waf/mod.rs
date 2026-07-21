@@ -1544,6 +1544,14 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "nosqli_mongo_where", category: WafCategory::NoSqlInjection, pattern: r"(?i)\$where\b" },
 		Rule { id: "nosqli_param_operator", category: WafCategory::NoSqlInjection, pattern: r"(?i)\[\$(ne|eq|gt|gte|lt|lte|in|nin|regex|exists|not|or|nor|and|where)\]" },
 		Rule { id: "nosqli_json_operator", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(ne|gt|gte|lt|lte|in|nin|regex|exists|where|expr|or|nor|and|not)"\s*:"# },
+		// MongoDB server-side-JavaScript operators past `$where` — `$function` and `$accumulator`
+		// (aggregation-pipeline operators, MongoDB 4.4+) both take a `body:` of JavaScript the
+		// *server* evaluates, the NoSQL analog of SQLi's stacked-query RCE and disabled only when
+		// `security.javascriptEnabled: false`. They are aggregation-only, so they always arrive as a
+		// JSON key (`{"$function": {...}}`); anchored on that `[{,] "$op":` form (same shape as
+		// `nosqli_json_operator`) so a bare `$function` shell/template token stays clean. Disjoint
+		// from the operator list above, so no double-count. <https://www.mongodb.com/docs/manual/reference/operator/aggregation/function/>
+		Rule { id: "nosqli_mongo_server_js", category: WafCategory::NoSqlInjection, pattern: r#"(?i)[{,]\s*"\$(function|accumulator)"\s*:"# },
 		// ORM lookup-operator injection (OWASP-CRS 4.28.0) — Django/SQLAlchemy double-underscore
 		// query lookups used for blind data extraction: `?user__password__startswith=a`, and the
 		// `__contains`/`__regex`/`__gt` comparison family. The ORM analog of the Mongo `[$ne]` rule:
@@ -3264,6 +3272,9 @@ mod tests {
 		assert_eq!(waf.inspect_str(r#"{"$where": "this.a == this.b"}"#, "query").map(|m| m.category), Some(WafCategory::NoSqlInjection));
 		assert_eq!(waf.inspect_str(r#"{"username":{"$ne":null}}"#, "query").unwrap().rule_id, "nosqli_json_operator");
 		assert_eq!(waf.inspect_str("username[$ne]=&password[$ne]=", "query").unwrap().rule_id, "nosqli_param_operator");
+		// MongoDB server-side-JS operators (aggregation `$function`/`$accumulator`) that run JS on the server.
+		assert_eq!(waf.inspect_str(r#"{"$function":{"body":"function(){return 1}","args":[],"lang":"js"}}"#, "query").unwrap().rule_id, "nosqli_mongo_server_js");
+		assert_eq!(waf.inspect_str(r#"[{"$group":{"_id":null,"v":{"$accumulator":{"init":"function(){}"}}}}]"#, "query").unwrap().category, WafCategory::NoSqlInjection);
 		assert_eq!(waf.inspect_str("age[$gt]=0", "query").unwrap().category, WafCategory::NoSqlInjection);
 	}
 
@@ -3294,6 +3305,7 @@ mod tests {
 			"/search?contains=widget",    // "contains" as a plain key, no `__` prefix
 			"/py/__init__=1",             // dunder that is not an ORM lookup keyword
 			"/opt?newsletter_optin=true", // single-underscore opt-in, not `__in=`
+			"/docs/aggregation-function", // "function" as a path word, no `"$function":` JSON key
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

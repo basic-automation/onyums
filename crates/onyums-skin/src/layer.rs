@@ -32,7 +32,7 @@ use tower_service::Service;
 use crate::{
 	cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_cacheable_method}, challenge::{
 		Challenge, ChallengeChain, Gate, captcha::CaptchaChallenge, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}
-	}, clearance::{Clearance, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
+	}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
 };
 
 /// Default cookie carrying the minted clearance token.
@@ -68,6 +68,11 @@ pub struct Skin {
 	return_path: String,
 	clearance_ttl: Duration,
 	client_has_js: bool,
+	/// Minimum clearance tier that forwards. A cleared client below this tier is
+	/// re-challenged for a higher one rather than served. Defaults to
+	/// [`ClearanceLevel::Patience`] (the lowest tier), so every clearance forwards —
+	/// today's behaviour — until an operator raises it.
+	min_clearance: ClearanceLevel,
 }
 
 impl Skin {
@@ -196,8 +201,17 @@ impl Skin {
 			None => Vec::new(),
 		};
 
-		// 2. Already cleared? Rate-limit on the token id, then forward.
-		if let Some(clearance) = self.read_clearance(parts) {
+		// 2. Already cleared at a sufficient tier? Rate-limit on the token id, then forward.
+		//    A clearance *below* the required minimum tier (`min_clearance`) does not forward:
+		//    it falls through to be re-challenged for a higher tier, so an operator can demand
+		//    "CAPTCHA-or-better" (or PoW-only) under attack. The tiers are ordered
+		//    Patience < Captcha < Pow; the default minimum is Patience, so every clearance
+		//    forwards until an operator raises it.
+		// A clearance below the required tier — like no clearance at all — falls through to the
+		// challenge/submission path to earn a higher one (it does not forward).
+		if let Some(clearance) = self.read_clearance(parts)
+			&& clearance.level >= self.min_clearance
+		{
 			if let Some(rl) = &self.ratelimit
 				&& !rl.check(&clearance.id)
 			{
@@ -382,6 +396,7 @@ pub struct SkinBuilder {
 	return_path: String,
 	clearance_ttl: Duration,
 	client_has_js: bool,
+	min_clearance: ClearanceLevel,
 }
 
 impl Default for SkinBuilder {
@@ -399,6 +414,8 @@ impl Default for SkinBuilder {
 			return_path: DEFAULT_RETURN_PATH.to_owned(),
 			clearance_ttl: DEFAULT_CLEARANCE_TTL,
 			client_has_js: true,
+			// The lowest tier, so any clearance forwards by default (opt up, never down).
+			min_clearance: ClearanceLevel::Patience,
 		}
 	}
 }
@@ -516,6 +533,25 @@ impl SkinBuilder {
 		self
 	}
 
+	/// Require a minimum [`ClearanceLevel`] to forward a request (default
+	/// [`ClearanceLevel::Patience`], the lowest tier — so every clearance forwards). The tiers
+	/// are ordered `Patience < Captcha < Pow`; a cleared client holding a token *below* the
+	/// minimum is re-challenged for a higher tier instead of being served. This is the "opt up
+	/// under attack" knob the tiered clearance model exists for — e.g.
+	/// `min_clearance_level(ClearanceLevel::Captcha)` demands human verification (a timed tarpit
+	/// ticket no longer suffices), `ClearanceLevel::Pow` demands a JS proof-of-work.
+	///
+	/// **Trade-off, by design:** setting a minimum above what a client can reach locks that
+	/// client out — a no-JS client cannot satisfy `Pow`, so it will be re-challenged
+	/// indefinitely. That is the deliberate cost of shedding load under attack; pair a high
+	/// minimum with a challenge chain that offers the required tier to the clients you intend to
+	/// keep.
+	#[must_use]
+	pub fn min_clearance_level(mut self, level: ClearanceLevel) -> Self {
+		self.min_clearance = level;
+		self
+	}
+
 	/// Finish building the gate.
 	#[must_use]
 	pub fn build(self) -> Skin {
@@ -532,6 +568,7 @@ impl SkinBuilder {
 			return_path: self.return_path,
 			clearance_ttl: self.clearance_ttl,
 			client_has_js: self.client_has_js,
+			min_clearance: self.min_clearance,
 		}
 	}
 }
@@ -590,6 +627,37 @@ mod tests {
 		let token = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
 		let parts = parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"));
 		assert!(matches!(skin.decide(&parts), Decision::Forward { .. }));
+	}
+
+	#[test]
+	fn min_clearance_level_gates_lower_tiers() {
+		// With a minimum of Captcha, a Pow or Captcha clearance forwards, but a Patience
+		// (tarpit-only) clearance is re-challenged rather than served — the "opt up under attack"
+		// knob realizing the tiered clearance model.
+		let store = Arc::new(HmacClearanceStore::new(b"min-tier-secret".to_vec()));
+		let skin = Skin::builder()
+			.store(store.clone())
+			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
+			.min_clearance_level(ClearanceLevel::Captcha)
+			.build();
+		let cookie = |token: &str| parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"));
+
+		let pow = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
+		assert!(matches!(skin.decide(&cookie(&pow)), Decision::Forward { .. }), "Pow (>= Captcha) forwards");
+		let captcha = store.mint(ClearanceLevel::Captcha, Duration::from_secs(300));
+		assert!(matches!(skin.decide(&cookie(&captcha)), Decision::Forward { .. }), "Captcha (== min) forwards");
+		let patience = store.mint(ClearanceLevel::Patience, Duration::from_secs(300));
+		assert!(matches!(skin.decide(&cookie(&patience)), Decision::Respond(_)), "Patience (< Captcha) is re-challenged, not forwarded");
+	}
+
+	#[test]
+	fn default_min_clearance_forwards_every_tier() {
+		// The default minimum is the lowest tier, so a Patience clearance still forwards —
+		// the min-tier gate is opt-in and changes nothing until raised.
+		let store = Arc::new(HmacClearanceStore::new(b"default-min-secret".to_vec()));
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).build();
+		let patience = store.mint(ClearanceLevel::Patience, Duration::from_secs(300));
+		assert!(matches!(skin.decide(&parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={patience}"))), Decision::Forward { .. }));
 	}
 
 	#[test]

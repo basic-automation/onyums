@@ -92,6 +92,10 @@ let skin = Skin::builder()
     .edge_rules(EdgeRules::https_upgrade())
     // Serve hot, Cache-Control-cacheable GET/HEAD paths from a bounded in-process store.
     .response_cache(ResponseCache::new(256))
+    // Require human verification to forward: a timed-tarpit ticket no longer suffices,
+    // a client must clear at least the CAPTCHA tier. The "opt up under attack" knob —
+    // tiers are ordered Patience < Captcha < Pow. Default is Patience (every tier forwards).
+    .min_clearance_level(onyums_skin::ClearanceLevel::Captcha)
     .build();
 ```
 

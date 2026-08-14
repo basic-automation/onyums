@@ -1022,7 +1022,7 @@ mod tests {
 				served.lock().expect("not poisoned").push(StreamOutcome::Served(req.port));
 				// Far longer than the timeout. The clock is paused, so this costs no real
 				// wall time and the assertion is not a race against a real 30 seconds.
-				tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+				tokio::time::sleep(std::time::Duration::from_mins(10)).await;
 				Ok(())
 			}
 		})
@@ -1033,7 +1033,7 @@ mod tests {
 		for _ in 0..16 {
 			tokio::task::yield_now().await;
 		}
-		tokio::time::advance(std::time::Duration::from_secs(60)).await;
+		tokio::time::advance(std::time::Duration::from_mins(1)).await;
 		for _ in 0..16 {
 			tokio::task::yield_now().await;
 		}

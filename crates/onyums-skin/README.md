@@ -27,10 +27,13 @@ let gated: Router = app.layer(Skin::secure_default().into_layer());
 
 Built out: the gate core (PoW → CAPTCHA → patience-tarpit challenge chain, `hmac`-signed clearance,
 `governor` rate limiting), the Tor dimension (`CircuitPolicy` + `AccountingCircuitPolicy`
-with Under-Attack Mode and adaptive difficulty), the pure-Rust WAF (`FilterExpr`
+with Under-Attack Mode and adaptive PoW difficulty driven by any of three signals —
+raw request rate, request-shape deviation from a learned baseline, and bot suspicion —
+combined by max so the strongest attack indicator wins), the pure-Rust WAF (`FilterExpr`
 expression language + a curated OWASP-CRS-derived ruleset — SQLi (incl. error-based
-`EXTRACTVALUE`/`UPDATEXML` and MySQL file/privilege functions) / XSS (incl. dangerous
-HTML tags, CSS `-moz-binding`/`behavior:url()` script-binding, and the full
+`EXTRACTVALUE`/`UPDATEXML` and MySQL file/privilege functions) / NoSQLi (incl. MongoDB
+server-side-JS `$function`/`$accumulator`) / XSS (incl. dangerous
+HTML tags, CSS `-moz-binding`/`behavior:url()`/`expression()` script execution, and the full
 mouse/keyboard/clipboard/drag/media event-handler families) / traversal (incl.
 overlong-UTF-8 dot-slash evasion) / SSRF
 (incl. Alibaba & Oracle-OCI cloud-metadata endpoints, `nip.io`/`sslip.io` wildcard-DNS
@@ -89,6 +92,10 @@ let skin = Skin::builder()
     .edge_rules(EdgeRules::https_upgrade())
     // Serve hot, Cache-Control-cacheable GET/HEAD paths from a bounded in-process store.
     .response_cache(ResponseCache::new(256))
+    // Require human verification to forward: a timed-tarpit ticket no longer suffices,
+    // a client must clear at least the CAPTCHA tier. The "opt up under attack" knob —
+    // tiers are ordered Patience < Captcha < Pow. Default is Patience (every tier forwards).
+    .min_clearance_level(onyums_skin::ClearanceLevel::Captcha)
     .build();
 ```
 
@@ -150,6 +157,13 @@ identity costs a fresh proof-of-work solve.
   if that too is unmet does it reach the timed tarpit as a last resort. The CAPTCHA's
   answer never leaves the server in the clear: it is encrypted-then-MAC'd into the envelope
   the client echoes back, so the gate stays stateless.
+- **Low-vision clients aren't stuck on the image** — [W3C's *Inaccessibility of CAPTCHA*
+  note](https://www.w3.org/TR/turingtest/) calls a distorted-image CAPTCHA the task blind,
+  low-vision, and dyslexic users are least able to accomplish. So the CAPTCHA page carries a
+  "Can't see the image? Continue without it." link (`CaptchaChallenge::with_no_image_escape`,
+  on in `secure_default`) that routes the client *past* the visual tier to the non-visual
+  patience tarpit — the chain honors a `needs_vision()` capability the same way it honors
+  `needs_js()`, so no-JS *and* no-vision both have a working path.
 - **Cost, not prevention** — a fresh synthetic identity costs a fresh proof-of-work solve.
 - **100% Rust — no FFI, ever** (MIT, no copyleft in the default build).
 

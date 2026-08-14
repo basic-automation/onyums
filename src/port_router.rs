@@ -586,6 +586,7 @@ mod tests {
 		fn serve(&self, _stream: OnionStream) -> ServeFuture {
 			Box::pin(async { Ok(()) })
 		}
+
 		fn protection(&self) -> HandlerProtection {
 			self.0
 		}

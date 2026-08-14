@@ -2063,8 +2063,8 @@ mod tests {
 		// clean; the anchor is the CSS property-value form `:expression(`, not the bare word.
 		let waf = Waf::starter();
 		for uri in [
-			"/help/regular-expression-guide",  // "expression" word in a path
-			"/blog/evaluate-the-expression",   // "expression" word, no paren
+			"/help/regular-expression-guide", // "expression" word in a path
+			"/blog/evaluate-the-expression",  // "expression" word, no paren
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}

@@ -15,7 +15,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 
 use super::{Challenge, Gate};
@@ -172,7 +172,17 @@ impl<P: Pow> PowChallenge<P> {
 	/// Build a challenge over `pow` (typically [`Hashcash`]) signing puzzles with
 	/// `secret` at the given leading-zero-bit `difficulty`.
 	pub fn new(pow: P, secret: impl Into<Vec<u8>>, difficulty: u32) -> Self {
-		Self { pow, secret: secret.into(), difficulty, adaptive: None, shape: None, bot: None, ttl: DEFAULT_PUZZLE_TTL, submit_path: DEFAULT_SUBMIT_PATH.to_owned(), consumed: Mutex::new(HashMap::new()) }
+		Self {
+			pow,
+			secret: secret.into(),
+			difficulty,
+			adaptive: None,
+			shape: None,
+			bot: None,
+			ttl: DEFAULT_PUZZLE_TTL,
+			submit_path: DEFAULT_SUBMIT_PATH.to_owned(),
+			consumed: Mutex::new(HashMap::new()),
+		}
 	}
 
 	/// Record `seed` as redeemed, returning `false` if it was already redeemed (a
@@ -706,18 +716,7 @@ mod challenge_tests {
 		let chal = PowChallenge::new(Hashcash, b"sec".to_vec(), 2).with_bot_difficulty(bot);
 
 		// A browser-shaped request scores ~0 → stays at the floor.
-		let browser = Request::builder()
-			.uri("/")
-			.header("host", "x.onion")
-			.header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0")
-			.header("accept", "text/html")
-			.header("accept-language", "en-US,en")
-			.header("accept-encoding", "gzip, deflate, br")
-			.header("connection", "keep-alive")
-			.body(())
-			.unwrap()
-			.into_parts()
-			.0;
+		let browser = Request::builder().uri("/").header("host", "x.onion").header("user-agent", "Mozilla/5.0 (Windows NT 10.0; rv:115.0) Gecko/20100101 Firefox/115.0").header("accept", "text/html").header("accept-language", "en-US,en").header("accept-encoding", "gzip, deflate, br").header("connection", "keep-alive").body(()).unwrap().into_parts().0;
 		assert_eq!(chal.make_puzzle(Some(&browser)).0.difficulty, 2);
 
 		// A curl request (non-browser UA, sparse headers) scores ~1.0 → difficulty jumps to the max.
@@ -732,7 +731,9 @@ mod challenge_tests {
 	fn all_three_difficulty_signals_combine_by_max() {
 		// rate + shape + bot attached at once: the issued difficulty is the max across every
 		// attached signal, so the strongest attack indicator wins (defense in depth).
-		use crate::{difficulty::BotDifficulty, shape::{RequestShape, ShapeBaseline}};
+		use crate::{
+			difficulty::BotDifficulty, shape::{RequestShape, ShapeBaseline}
+		};
 
 		// A shape baseline primed on a browser shape so a curl request reads as both novel *and*
 		// bot-scripted; the rate controller stays dormant (no recorded traffic).

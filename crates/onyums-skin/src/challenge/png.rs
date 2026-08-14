@@ -54,11 +54,7 @@ impl GrayImage {
 
 	/// The pixel at `(x, y)`, or `255` (paper) for out-of-bounds reads.
 	pub(crate) fn get(&self, x: u32, y: u32) -> u8 {
-		if x < self.width && y < self.height {
-			self.pixels[(y as usize) * (self.width as usize) + (x as usize)]
-		} else {
-			255
-		}
+		if x < self.width && y < self.height { self.pixels[(y as usize) * (self.width as usize) + (x as usize)] } else { 255 }
 	}
 
 	/// Encode as an 8-bit grayscale PNG (color type 0), returning the complete file bytes.

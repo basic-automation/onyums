@@ -27,9 +27,11 @@ use std::{
 use axum::{
 	http::{StatusCode, request::Parts}, response::{Html, IntoResponse, Response}
 };
-use base64::{Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}};
+use base64::{
+	Engine as _, engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}
+};
 use hmac::{Hmac, Mac};
-use rand::RngCore;
+use rand::Rng;
 use sha2::Sha256;
 
 use super::{Challenge, Gate, NO_VISUAL_HINT, png::GrayImage};
@@ -275,7 +277,7 @@ fn fill_cell(img: &mut GrayImage, ox: u32, oy: u32) {
 }
 
 /// A random `f64` in `[0, 1)` from the CSPRNG (no `rand` distribution import needed).
-fn unit(rng: &mut impl RngCore) -> f64 {
+fn unit(rng: &mut impl Rng) -> f64 {
 	#[expect(clippy::cast_precision_loss, reason = "53-bit mantissa exactly represents the 53-bit value taken from the u64")]
 	{
 		(rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64
@@ -285,7 +287,7 @@ fn unit(rng: &mut impl RngCore) -> f64 {
 /// Warp `src` by an independent sine shear on each axis: every output column is nudged
 /// vertically and every output row horizontally, both by a smoothly varying amount. The
 /// amplitudes, frequencies, and phases are randomized so the warp differs each render.
-fn warp(src: &GrayImage, rng: &mut impl RngCore) -> GrayImage {
+fn warp(src: &GrayImage, rng: &mut impl Rng) -> GrayImage {
 	let w = src.width();
 	let h = src.height();
 	let amp_y = 1.5 + unit(rng) * f64::from(SCALE) * 0.6; // vertical push, up to ~0.8 cells
@@ -316,7 +318,7 @@ fn warp(src: &GrayImage, rng: &mut impl RngCore) -> GrayImage {
 /// Speckle `img` with random dark noise dots and a couple of thin sine "strike-through"
 /// lines — cheap texture that ruins connected-component OCR without hiding the glyphs from
 /// a human. Returns the same image for call chaining.
-fn add_noise(mut img: GrayImage, rng: &mut impl RngCore) -> GrayImage {
+fn add_noise(mut img: GrayImage, rng: &mut impl Rng) -> GrayImage {
 	let w = img.width();
 	let h = img.height();
 
@@ -545,11 +547,7 @@ impl CaptchaChallenge {
 		// being stuck on an unreadable image. The href is a *relative, query-only* URL, so it
 		// resolves against whatever page the CAPTCHA was served for without ever interpolating
 		// the attacker-controlled request path into the HTML (no reflected-injection surface).
-		let escape = if self.no_image_escape {
-			format!("<p><a href=\"?{NO_VISUAL_HINT}=1\">Can't see the image? Continue without it.</a></p>\n")
-		} else {
-			String::new()
-		};
+		let escape = if self.no_image_escape { format!("<p><a href=\"?{NO_VISUAL_HINT}=1\">Can't see the image? Continue without it.</a></p>\n") } else { String::new() };
 		let body = format!(
 			"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n<title>Verify you are human</title>\n</head>\n<body>\n<h1>Verify you are human</h1>\n<p>Type the characters shown in the image, then choose Continue. This works without JavaScript; letters are not case-sensitive.</p>\n<img src=\"{data_uri}\" alt=\"CAPTCHA challenge\">\n<form method=\"GET\" action=\"{}\">\n<input type=\"hidden\" name=\"puzzle\" value=\"{envelope}\">\n<input type=\"text\" name=\"answer\" autocomplete=\"off\" autocapitalize=\"off\" autocorrect=\"off\" spellcheck=\"false\" aria-label=\"Characters shown in the image\">\n<button type=\"submit\">Continue</button>\n</form>\n{escape}</body>\n</html>\n",
 			self.submit_path

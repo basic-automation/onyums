@@ -21,7 +21,7 @@
 //! Everything here is offline and Tor-free, so the whole module is unit-testable
 //! with no live network.
 
-use rand::RngCore;
+use rand::Rng;
 use tor_llcrypto::pk::curve25519::{PublicKey, StaticSecret};
 use zeroize::{Zeroize, ZeroizeOnDrop};
 

@@ -141,7 +141,15 @@ allow-wildcard-paths = true
 deny = [
 	{ name = "openssl-sys", wrappers = ["openssl", "native-tls"] },
 	{ name = "libsqlite3-sys", wrappers = ["rusqlite"] },
-	{ name = "lzma-sys", wrappers = ["xz2"] },
+	# Renamed upstream, caught 2026-07-20: this entry used to read
+	# `{ name = "lzma-sys", wrappers = ["xz2"] }`, but `xz2`/`lzma-sys` were replaced by
+	# `liblzma`/`liblzma-sys`, and neither old name is in the tree any more. The C library
+	# never left — it is still reached as async-compression -> compression-codecs ->
+	# liblzma -> liblzma-sys — so for some time this ban named a crate that does not exist
+	# and guarded nothing, while the thing it exists to guard sat in the graph unbanned.
+	# cargo-deny says so out loud (`unused-wrapper: unmatched wrapper`), which is the only
+	# reason it surfaced; treat that warning as a finding, not noise.
+	{ name = "liblzma-sys", wrappers = ["liblzma"] },
 	{ name = "libz-sys" },
 	{ name = "cmake" },
 ]

@@ -63,7 +63,14 @@ tower = { version = "0.5.2", features = ["util"] }
 onyums-skin = { path = "crates/onyums-skin", version = "0.1.0" }
 # onyums-skin gate-core deps — pure Rust, no FFI (MIT/Apache).
 sha2 = "0.10.9"
-rand = "0.9.2"
+# 0.10 is not a routine bump: it is what takes `rand` 0.9 *out of the tree*. arti 0.44
+# is on `rand` 0.10, and onyums + onyums-skin were the last two reverse deps on 0.9
+# (governor's edge went with its `jitter` feature — see the `governor` entry below), so
+# moving both crates here aligns the workspace with the arti stack and drops a genuine
+# duplicate. The API delta is one rename at our usage level: `rand_core`'s `RngCore` is
+# now `Rng` (and the old extension trait `Rng` is now `RngExt`, which this workspace
+# does not use — `rand::rng()`, `fill_bytes`, and `rand::random::<u64>()` are unchanged).
+rand = "0.10.2"
 hmac = "0.12.1"
 base64 = "0.22.1"
 # `default-features = false` drops governor's `jitter` feature, which skin does not use
@@ -135,5 +142,9 @@ bytes = { workspace = true }
 safelog = { workspace = true }
 
 [dev-dependencies]
+# `test-util` (not part of tokio's `full`) gives the tests tokio's *paused clock*, so the
+# per-handler-timeout tests assert on a 30s timeout firing without spending 30s of real
+# wall time — and without the flakiness a short real timeout would bring.
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber = { workspace = true }
 tower = { workspace = true }

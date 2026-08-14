@@ -214,9 +214,9 @@ mod tests {
 		// the hint the CAPTCHA (vision) is selected; with it, the vision tier is skipped and
 		// the non-visual tarpit fallback is chosen instead — the accessibility escape.
 		let chain = ChallengeChain::new(vec![
-			Box::new(Stub::new(true, false)),    // PoW: needs JS
+			Box::new(Stub::new(true, false)),     // PoW: needs JS
 			Box::new(Stub::visual(false, false)), // CAPTCHA: needs vision
-			Box::new(Stub::new(false, false)),   // tarpit: needs neither
+			Box::new(Stub::new(false, false)),    // tarpit: needs neither
 		]);
 		assert!(chain.select(false, true).expect("a no-JS client is served the CAPTCHA").needs_vision(), "without the hint the CAPTCHA tier is selected");
 		let escaped = chain.select(false, false).expect("the escape lands on the non-visual tarpit");

@@ -183,17 +183,19 @@ cover every row below.
 | Feature | Status | Notes |
 |---|---|---|
 | `serve()` / builder API, config validation | 🟢 | Nickname, port, TLS, and client-choice validation all fail offline before any bootstrap. |
-| TLS policy (`Upgrade` / `Strict` / `Provided`) | 🟢 | Composition (gate + HSTS + app) is `oneshot`-tested; `ProvidedCert` parses/validates up front. |
-| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 428 unit tests in `onyums-skin`, no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
+| TLS policy (`Upgrade` / `Strict` / `Provided`) | 🟢 | Composition (gate + HSTS + app) is `oneshot`-tested *and* exercised over a real TLS handshake — `Strict`'s HSTS header is asserted on the wire; `ProvidedCert` parses/validates up front. |
+| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 476 unit tests in `onyums-skin`, plus an end-to-end check that an uncleared request over a real TLS connection does not reach the app (with a gate-disabled control), no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
 | Restricted discovery / client-auth keys | 🟢 | Key generation, `.auth` rendering/parsing, and allowlist assembly are offline-tested and byte-checked against Tor's file format. Descriptor encryption itself is arti's. |
 | Identity: persistent + `.ephemeral()` keystore | 🟢 | Directory resolution, uniqueness, and cleanup tested offline. |
 | Keystore permission hardening (0700/0600) | 🟢 | Unix-only; the syscall path runs on CI's Linux runner. A no-op on Windows (see [Deployment](#deployment)). |
 | Vanity mining, address helpers, QR | 🟢 | Pure computation; derives the exact address arti serves. |
 | `ServiceStatus` / `ServiceProblem` projection | 🟢 | Mapping tested against every arti state. The *emission* of transitions is 🟡. |
-| Host-side metrics + Prometheus exposition | 🟢 | Counter mechanics and text format tested offline; the accept loop's increment sites are 🟡. |
-| **Live serve over Tor** (rendezvous → TLS → app) | 🟡 | The core path. Covered by the manual `--ignored` live test, not by CI. |
-| Raw-port serving (`route_port`) | 🟡 | The routing table and the `RawTcpHandler` proxy are offline-tested against a loopback backend; the live path is not. |
-| Circuit-policy gate, Under Attack mode | 🟡 | Decision logic is offline-tested; it is driven from the live rendezvous loop. |
+| Host-side metrics + Prometheus exposition | 🟢 | Counter mechanics and text format tested offline, and the accept loop's circuit/stream increment sites are now covered too (offered-before-verdict, accepted, rejected, served, shut down). |
+| TLS termination + axum handoff | 🟢 | A real rustls client handshakes against the self-signed acceptor over an in-memory stream pair and must get a `200` **and the app body** back through TLS → hyper → axum; the port-80 arm's `301` is checked to preserve path and query. No Tor involved. |
+| **Live serve over Tor** (rendezvous circuit itself) | 🟡 | What remains live-only is arti's own part: descriptor publication, the rendezvous handshake, and the `DataStream` the handlers are handed. The `--ignored` live test is the only cover and CI does not run it — and that test is currently unreliable (observed hanging well past its own internal timeouts), so treat this row as genuinely unverified rather than verified-elsewhere. |
+| Raw-port serving (`route_port`) | 🟢 | The routing table, the `RawTcpHandler` proxy, and now the dispatch itself are offline-tested: bytes travel through `handle_stream_request` into a registered handler and back, an unregistered port is refused without accepting the stream, and under `Tls::Strict` port 80 is refused rather than accepted-and-redirected. |
+| Circuit-policy gate, Under Attack mode | 🟢 | Both the decisions *and* the accept loop's sequencing around them are offline-tested: that a refused circuit is never accepted and yields no streams, that a rejected stream leaves the circuit alive, that a `Shutdown` verdict stops the loop, that a challenge fails closed on a raw port, and that per-circuit accounting is always dropped. What remains live-only is the TLS/serve step itself (next row). |
+| Backpressure (`max_circuits` / `max_streams` / `handler_timeout`) | 🟢 | Refusal-at-capacity, the unbounded defaults, the `0` rejections, and timeout expiry (on a paused clock) are all offline-tested; refusals, timeouts, and policy rejections are counted separately, and a capacity-refused stream is counted once. |
 | Multiple services on one shared client | 🟡 | The offline surface (`shared_client()`, conflict rejection, fleet status) is tested; N-services-actually-reachable is not verified. |
 | `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
 | Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
@@ -363,6 +365,13 @@ async fn main() {
 }
 ```
 
+The shared client's type is `onyums::OnionTorClient` — an alias for arti's
+`TorClient<..>` with the runtime onyums bootstraps on. Name the alias rather than
+spelling the runtime out: which TLS implementation arti uses for its relay connections
+is onyums' choice, not yours, and it is expected to change (see the roadmap's "no FFI"
+item). Code written against the alias keeps compiling when it does.
+
+
 `.ephemeral()` conflicts with `.tor_client(...)` — a shared client has a fixed
 keystore and cannot supply a throwaway per-launch identity — and that pairing is
 rejected offline, before any launch.
@@ -419,6 +428,9 @@ async fn main() {
 		// The secure-default gate is ALREADY ON. Use these only to tune or relax it:
 		// .skin(Skin::secure_default())        // tune via Skin::builder() (difficulty, store, WAF, ...)
 		// .circuit_policy(my_policy)            // per-rendezvous-circuit limits (custom CircuitPolicy)
+		// .max_circuits(256)                    // host-global cap: refuse (never queue) circuits beyond N
+		// .max_streams(1024)                    // host-global cap on concurrent streams across all circuits
+		// .handler_timeout(Duration::from_secs(30)) // drop a stream that runs longer than this
 		// .under_attack(true)                   // force EVERY new circuit through the gate (flood mode)
 		// .circuit_events(my_sink)              // observe circuit rejects/teardowns/challenges
 		// .adaptive_difficulty(controller)      // feed circuit-flood load into Skin's adaptive PoW
@@ -441,6 +453,52 @@ async fn main() {
 The full Skin API (clearance tokens, the challenge chain, the WAF, per-circuit `CircuitPolicy`, adaptive difficulty, and security metrics/events) is re-exported under `onyums::onyums_skin`. The design and roadmap live in [`crates/onyums-skin/ROADMAP.md`](crates/onyums-skin/ROADMAP.md).
 
 ****
+
+## Host-global backpressure
+
+`.circuit_policy(...)` bounds what a *single* circuit may do (streams, request rate, byte
+budget). `.max_circuits(n)` bounds how many circuits exist at once — without it a service
+spawns a task per offered circuit and a flood is bounded only by memory.
+
+At capacity onyums **refuses** the circuit; it never queues it. Queueing would convert a
+flood into unbounded memory growth plus a latency cliff for the clients already being
+served, which is the failure the cap exists to prevent — and a refused client can retry,
+while one parked in an invisible queue cannot tell slow from dead. The permit is taken
+after the circuit policy admits the circuit and released when the circuit ends, however
+it ends.
+
+Refusals are reported separately from policy rejections, as
+`ServiceMetrics::circuits_refused_at_capacity` (`onyums_circuits_refused_at_capacity_total`
+in the Prometheus exposition). That distinction is the useful part: a policy rejection is
+a verdict about the circuit, while a capacity refusal means the service is full. If you
+alarm on the two together, an under-provisioned service looks like one under attack, and
+you will tune the wrong knob.
+
+`.max_streams(n)` is the companion cap, on concurrently-served **streams** across every
+circuit. It is not a duplicate: the circuit cap bounds how many clients are in service,
+this bounds the total work in flight — one circuit may open many streams, so a circuit
+cap alone does not bound sockets or memory. A stream refused for capacity gets Tor's
+`RESOURCELIMIT` end reason (which says the service is full, rather than claiming the
+request was simply done) and leaves the circuit and its other streams alive, exactly as a
+policy rejection does. It is counted as `ServiceMetrics::streams_refused_at_capacity`.
+
+Both `max_circuits(0)` and `max_streams(0)` are rejected by `serve()` before any
+bootstrap, rather than becoming a live onion address that answers nothing.
+
+`.handler_timeout(d)` is what makes both caps mean anything. Without it a client holds
+its permit for as long as it likes just by going quiet mid-request, so the caps bound how
+many slow clients it takes to fill the service rather than bounding the damage — a
+timeout turns a permit into a lease. Exceeding it drops the stream and counts it as
+`ServiceMetrics::streams_timed_out`, separately from the capacity counters: a rising
+timeout count against flat refusals means *slow* clients rather than *too many*, and you
+would respond to those differently.
+
+It is **off by default on purpose**. A long-lived stream is a legitimate use of an onion
+service — the websocket example further down is one — so a default deadline would
+silently sever working applications. Set it when your handlers are request/response
+shaped; leave it unset, or generous, when they are not.
+
+Not implemented yet: a max body size before WAF inspection.
 
 ## Restricted discovery — v3 client authorization
 

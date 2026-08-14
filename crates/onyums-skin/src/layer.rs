@@ -25,7 +25,7 @@ use axum::{
 	body::Body, http::{HeaderValue, StatusCode, header, request::Parts}, response::{IntoResponse, Response}
 };
 use http_body_util::{BodyExt, Limited};
-use rand::RngCore;
+use rand::Rng;
 use tower_layer::Layer;
 use tower_service::Service;
 
@@ -115,16 +115,11 @@ impl Skin {
 		// All three submit to the one Skin-owned route (`DEFAULT_SUBMIT_PATH`); the chain
 		// disambiguates by which challenge's `verify` accepts the submission, and mints that
 		// challenge's own clearance level.
-		Skin::builder()
-			.store(Arc::new(store.clone()))
-			.challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY)))
-			// The CAPTCHA advertises the no-visual escape because a non-visual tarpit tier sits
-			// behind it in this chain — a low-vision no-JS client can fall through to it.
-			.challenge(Box::new(CaptchaChallenge::new(captcha_secret.to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH).with_no_image_escape(true)))
-			.challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY)))
-			.rate_limit(rate)
-			.waf(Waf::starter())
-			.build()
+		//
+		// The CAPTCHA advertises the no-visual escape (`with_no_image_escape`) because a
+		// non-visual tarpit tier sits behind it in this chain — a low-vision no-JS client can
+		// fall through to it rather than having to fail the image first.
+		Skin::builder().store(Arc::new(store.clone())).challenge(Box::new(PowChallenge::new(Hashcash, pow_secret.to_vec(), DEFAULT_DIFFICULTY))).challenge(Box::new(CaptchaChallenge::new(captcha_secret.to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH).with_no_image_escape(true))).challenge(Box::new(PatienceChallenge::new(store, DEFAULT_PATIENCE_DELAY))).rate_limit(rate).waf(Waf::starter()).build()
 	}
 
 	/// Turn this gate into a [`SkinLayer`] for `Router::layer`.
@@ -635,11 +630,7 @@ mod tests {
 		// (tarpit-only) clearance is re-challenged rather than served — the "opt up under attack"
 		// knob realizing the tiered clearance model.
 		let store = Arc::new(HmacClearanceStore::new(b"min-tier-secret".to_vec()));
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
-			.min_clearance_level(ClearanceLevel::Captcha)
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).min_clearance_level(ClearanceLevel::Captcha).build();
 		let cookie = |token: &str| parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={token}"));
 
 		let pow = store.mint(ClearanceLevel::Pow, Duration::from_secs(300));
@@ -744,13 +735,7 @@ mod tests {
 		// uncleared no-JS client must be served the CAPTCHA (a no-JS image form), skipping
 		// the JS PoW and stopping before the last-resort tarpit.
 		let store = Arc::new(HmacClearanceStore::new(b"nojs-secret".to_vec()));
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
-			.challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH)))
-			.challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5))))
-			.client_has_js(false)
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH))).challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5)))).client_has_js(false).build();
 		let resp = match skin.decide(&bare_parts("/")) {
 			Decision::Respond(resp) => resp,
 			Decision::Forward { .. } => panic!("an uncleared request must be challenged"),
@@ -769,13 +754,7 @@ mod tests {
 		use crate::challenge::{NO_VISUAL_HINT, captcha::CaptchaChallenge};
 
 		let store = Arc::new(HmacClearanceStore::new(b"escape-secret".to_vec()));
-		let skin = Skin::builder()
-			.store(store.clone())
-			.challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY)))
-			.challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH).with_no_image_escape(true)))
-			.challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5))))
-			.client_has_js(false)
-			.build();
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).challenge(Box::new(CaptchaChallenge::new(b"c".to_vec()).with_submit_path(DEFAULT_SUBMIT_PATH).with_no_image_escape(true))).challenge(Box::new(PatienceChallenge::new((*store).clone(), Duration::from_secs(5)))).client_has_js(false).build();
 
 		// Without the hint: the CAPTCHA image tier.
 		let plain = match skin.decide(&bare_parts("/")) {

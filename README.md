@@ -123,7 +123,7 @@ Almost nothing — which is much of the point:
   system time is a common cause of a bootstrap that never finishes.
 
 **Toolchain:** Rust **edition 2024**, MSRV **1.91** — declared as `rust-version` in
-the manifest and enforced in CI. The floor comes from the embedded arti 0.44 stack,
+the manifest and enforced in CI. The floor comes from the embedded arti 0.46 stack,
 not the edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate,
 which carries none of arti, is usable on **1.89**.
 
@@ -202,8 +202,8 @@ cover every row below.
 | Intro-layer PoW (Tor's Equi-X) | 🔵 | Needs arti's experimental `hs-pow-full`. Skin's PoW is HTTP-layer only. |
 | Host-global concurrency/backpressure caps | 🔵 | Per-circuit limits exist via `CircuitPolicy`; total circuit/stream semaphores do not. |
 | CLI binary, framework layer (Phase 5) | 🔵 | Library only today. |
-| Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.44. |
-| arti-sourced gauges (intro-point health, …) | 🔵 | Reachable but not taken: `tor-hsservice` 0.44's `metrics` feature is marked `__is_experimental` (non-semver), the same category as the intro-layer PoW feature. A decision, not a flag. |
+| Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.46 (re-checked on the 0.44 → 0.46 bump). |
+| arti-sourced gauges (intro-point health, …) | 🔵 | Reachable but not taken: `tor-hsservice` 0.46's `metrics` feature is still marked `__is_experimental` (non-semver), the same category as the intro-layer PoW feature. A decision, not a flag. |
 
 Full detail, including what each slice covers, lives in [ROADMAP.md](ROADMAP.md).
 

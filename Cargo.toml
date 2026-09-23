@@ -14,17 +14,17 @@ anyhow = "1.0.103"
 hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 futures = "0.3.32"
-arti-client = { version = "0.44.0", features = ["full", "static"] }
-tor-cell = { version = "0.44.0", features = ["full"] }
-tor-hsservice = { version = "0.44.0", features = ["full"] }
-tor-proto = { version = "0.44.0", features = ["full", "stream-ctrl"] }
-tor-rtcompat = { version = "0.44.0", features = ["full"] }
-tor-cert = "0.44.0"
+arti-client = { version = "0.46.0", features = ["full", "static"] }
+tor-cell = { version = "0.46.0", features = ["full"] }
+tor-hsservice = { version = "0.46.0", features = ["full"] }
+tor-proto = { version = "0.46.0", features = ["full", "stream-ctrl"] }
+tor-rtcompat = { version = "0.46.0", features = ["full"] }
+tor-cert = "0.46.0"
 # Low-level arti crypto + onion-service identity types. Used by the Phase 1
 # vanity-address miner to derive the *exact* `.onion` address arti will serve
 # from a candidate ed25519 key (no second, divergent encoding). Pure Rust.
-tor-llcrypto = "0.44.0"
-tor-hscrypto = "0.44.0"
+tor-llcrypto = "0.46.0"
+tor-hscrypto = "0.46.0"
 # Phase 1 identity — pure-Rust QR encoding for the `.onion` address (terminal +
 # SVG renderers). `default-features = false` drops the `image` renderer (and its
 # heavy `image`/`png` tree); only the always-available unicode renderer and the
@@ -63,8 +63,8 @@ tower = { version = "0.5.2", features = ["util"] }
 onyums-skin = { path = "crates/onyums-skin", version = "0.1.0" }
 # onyums-skin gate-core deps — pure Rust, no FFI (MIT/Apache).
 sha2 = "0.10.9"
-# 0.10 is not a routine bump: it is what takes `rand` 0.9 *out of the tree*. arti 0.44
-# is on `rand` 0.10, and onyums + onyums-skin were the last two reverse deps on 0.9
+# 0.10 is not a routine bump: it is what takes `rand` 0.9 *out of the tree*. arti (0.44
+# onward) is on `rand` 0.10, and onyums + onyums-skin were the last two reverse deps on 0.9
 # (governor's edge went with its `jitter` feature — see the `governor` entry below), so
 # moving both crates here aligns the workspace with the arti stack and drops a genuine
 # duplicate. The API delta is one rename at our usage level: `rand_core`'s `RngCore` is
@@ -99,11 +99,12 @@ name = "onyums"
 version = "0.3.1"
 edition = "2024"
 # Minimum supported Rust version. Not a guess: 1.91 is the floor cargo's own
-# resolver enforces — `arti-client@0.44.0`, `caret@0.10.0`, and `fs-mistrust@0.15.0`
-# all declare `rust-version = 1.91`, so 1.90 is refused outright. Verified by
-# building the lib on each toolchain: 1.91 green, 1.90 refused. Edition 2024 alone
-# would only need 1.85 — the arti stack, not the edition, sets this floor, and the
-# 0.43 -> 0.44 bump is what moved it from 1.90. Enforced in CI.
+# resolver enforces — every `tor-*`/`arti-client` 0.46.0 crate declares
+# `rust-version = 1.91` (as 0.44.0 did; the 0.43 -> 0.44 bump is what moved it from
+# 1.90, and 0.44 -> 0.46 left it alone — the highest `rust_version` in the whole
+# resolved graph is still 1.91, checked with `cargo metadata` on the 0.46 lock).
+# Edition 2024 alone would only need 1.85 — the arti stack, not the edition, sets
+# this floor. Enforced in CI.
 rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"

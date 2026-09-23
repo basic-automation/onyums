@@ -89,7 +89,7 @@ jobs:
     strategy:
       fail-fast: false
       # The two crates have different floors on purpose: onyums is pinned by the
-      # embedded arti 0.44 stack, while onyums-skin carries none of arti and stays two
+      # embedded arti 0.46 stack, while onyums-skin carries none of arti and stays two
       # minors lower. Checking them together at one version would silently let skin's
       # floor drift up to the server's. See the `rust-version` comments in each manifest.
       matrix:
@@ -120,10 +120,16 @@ jobs:
       # was a warning. Promoting it to an error means a rename fails CI instead of
       # quietly disarming the no-FFI guard.
       #
-      # Deliberately NOT also `-D advisory-not-detected`: that one fires legitimately
-      # here, because the RUSTSEC-2026-0173 ignore is needed for the all-features graph
-      # and is genuinely not encountered on the default one. Denying it would fail CI
-      # for a correct config.
+      # `-D advisory-not-detected` is the same guard for the advisories side: an
+      # `ignore` entry whose crate has left the tree is a decoration that reads as a
+      # live exception. That happened too — the RUSTSEC-2026-0173 (`proc-macro-error2`)
+      # ignore went dead with the arti 0.44 -> 0.46 bump (2026-09-23) and only a
+      # warning said so. Every remaining ignore is encountered on BOTH graphs (verified
+      # with this exact flag on both runs before it was added), so the flag is safe on
+      # both; if a future bump drops another ignored crate, this fails the job and the
+      # fix is to delete the stale entry. `license-exception-not-encountered` is
+      # deliberately NOT denied: the `equix`/`hashx` exceptions are legitimately unused
+      # on the default graph, which is the whole point of the two-run design.
       #
       # `-D` goes in `command-arguments`, NOT `arguments`: the action splices
       # `arguments` in *before* the subcommand (`cargo-deny <arguments> check
@@ -134,7 +140,7 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
-          command-arguments: -D unused-wrapper
+          command-arguments: -D unused-wrapper -D advisory-not-detected
       # The second run is not redundant with the first. The default graph carries no
       # copyleft (onyums-skin's LGPL `equix` backend is opt-in), which is precisely what
       # `cargo deny check` above enforces. This run turns `equix` on and checks it under
@@ -148,7 +154,7 @@ jobs:
         with:
           command: check
           arguments: --workspace --all-features
-          command-arguments: -D unused-wrapper
+          command-arguments: -D unused-wrapper -D advisory-not-detected
 
   docs:
     name: docs

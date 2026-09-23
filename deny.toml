@@ -70,9 +70,11 @@ ignore = [
 	# executor of its own.
 	{ id = "RUSTSEC-2025-0052", reason = "discontinued `async-std`, transitive only; onyums runs on tokio via TokioNativeTlsRuntime." },
 
-	# `proc-macro-error2` is unmaintained. Build-time-only; cargo separately flags it
-	# as future-incompatible.
-	{ id = "RUSTSEC-2026-0173", reason = "unmaintained `proc-macro-error2`, build-time-only proc-macro helper with no runtime surface." },
+	# Retired 2026-09-23: the RUSTSEC-2026-0173 (`proc-macro-error2`, unmaintained)
+	# entry that used to sit here went dead when the arti 0.44 -> 0.46 bump dropped
+	# that crate from the tree. cargo-deny flagged it (`advisory-not-detected`), which
+	# is the signal this list is kept honest by — CI now denies that warning, so the
+	# next ignore that goes dead fails the job instead of lingering as a decoration.
 ]
 
 [licenses]
@@ -126,7 +128,8 @@ allow-wildcard-paths = true
 #
 #   openssl-sys     <- native-tls   <- async-native-tls <- tor-rtcompat   (arti's TLS)
 #   libsqlite3-sys  <- rusqlite     <- tor-dirmgr                         (directory cache)
-#   lzma-sys        <- xz2          <- async-compression                  (compression)
+#   liblzma-sys     <- liblzma      <- compression-codecs <- async-compression (compression;
+#                                      was `lzma-sys <- xz2` before the upstream rename)
 #
 # Each is banned *except* through the exact path it legitimately arrives on. That is the
 # line the principle actually defends: the embedded Tor client's internals are arti's

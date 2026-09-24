@@ -146,8 +146,8 @@ mod tests {
 
 		// A bring-your-own certificate is orthogonal to plaintext strictness: it
 		// keeps the forgiving upgrade posture.
-		let ck = rcgen::generate_simple_self_signed(vec!["example.onion".to_string()]).expect("rcgen");
-		let provided = crate::ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
+		let (cert_pem, key_pem) = crate::tls_setup::test_self_signed_pem("example.onion");
+		let provided = crate::ProvidedCert::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).expect("valid PEM");
 		assert_eq!(Tls::Provided(provided).plaintext_policy(), PlaintextPolicy::Upgrade);
 	}
 

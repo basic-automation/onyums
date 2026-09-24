@@ -126,26 +126,27 @@ allow-wildcard-paths = true
 # the *tree* does not fully satisfy it, while onyums' and onyums-skin' own dependency
 # choices do. Audited 2026-07-16 with `cargo tree --target all`: three vendored C
 # libraries were in the graph, every one reached through the embedded Tor client, none
-# of them onyums' choice. As of 2026-09-23 arti runs on its `rustls` runtime
-# (Cargo.toml, `[workspace.dependencies]`), so OpenSSL is gone — but the count is still
-# THREE, because the rustls crypto provider is itself C:
+# of them onyums' choice. Two rounds of work have since removed the two that were
+# actually reachable from this workspace, and **the crypto path is now pure Rust end to
+# end**:
 #
-#   openssl-sys     <- native-tls   <- async-native-tls <- tor-rtcompat   GONE — banned outright below
-#   ring            <- rustls / rcgen                                     (TLS + cert crypto: 17 C files,
-#                                      128 perlasm/asm files, `links = "ring_core_0_17_14_"`, built with cc)
-#   libsqlite3-sys  <- rusqlite     <- tor-dirmgr                         (directory cache)
-#   liblzma-sys     <- liblzma      <- compression-codecs <- async-compression (compression;
+#   openssl-sys     <- native-tls <- async-native-tls <- tor-rtcompat   GONE 2026-09-23 (arti on rustls)
+#   ring            <- rustls / rustls-webpki / rcgen                   GONE 2026-09-24 (graviola + p256)
+#   libsqlite3-sys  <- rusqlite   <- tor-dirmgr                         REMAINS (directory cache)
+#   liblzma-sys     <- liblzma    <- compression-codecs <- async-compression  REMAINS (compression;
 #                                      was `lzma-sys <- xz2` before the upstream rename)
 #
-# `ring` is listed and wrapper-pinned like the others rather than left implicit: it was
-# missed in the first draft of the rustls swap, which described the result as a
-# "pure-Rust TLS stack" — it is not, and an inventory that quietly omitted the C library
-# doing every relay handshake would be the same kind of decoration as a ban naming a
-# renamed crate. Pinning its wrappers means a *new* route to it (a second TLS or crypto
-# stack pulling it in) fails CI, which is the only part this file can actually enforce.
+# Both departed libraries are now banned with NO wrapper, which is the strongest form
+# this file supports: there is no legitimate route to either, so any route is a
+# regression. The two that remain are arti's own and not reachable from onyums'
+# manifest — they are banned *except* through the exact path each legitimately arrives
+# on, so a second route or a direct dependency still fails.
 #
-# The three that remain are banned *except* through the exact path each legitimately
-# arrives on. That is the line the principle actually defends: the embedded Tor client's
+# A caution worth keeping, from the run that removed ring: the first write-up of the
+# rustls swap called the result a "pure-Rust TLS stack" while `ring` — 17 C files and
+# 128 perlasm files — was still doing every handshake. Removing one named crate from
+# `cargo tree` is not the same as removing C. Before making that claim again, check the
+# class: `find` for `*.c`/`*.S`, and look for `links =` and a `cc` build-dependency. That is the line the principle actually defends: the embedded Tor client's
 # internals are arti's call, but a *new* C dependency — or any second route to one of
 # these, or a direct onyums/onyums-skin dependency on it — fails CI instead of passing
 # review unnoticed. Naming them here also stops the rule from quietly reading as
@@ -170,20 +171,19 @@ deny = [
 	{ name = "async-native-tls" },
 	{ name = "aws-lc-sys" },
 	{ name = "aws-lc-fips-sys" },
-	# The TLS/cert crypto, and the C library this workspace actually ships. Its three
-	# legitimate direct parents, each enumerated from the graph rather than guessed
-	# (`cargo tree -i ring`, cross-checked against cargo-deny's own `unmatched-wrapper`
-	# report): `rustls` (arti's TLS provider and onyums' acceptor), `rustls-webpki`
-	# (rustls' certificate-path verifier, which reaches ring directly rather than
-	# through rustls), and `rcgen` (the self-signed certificate generator on the launch
-	# path). A fourth route means a new C dependency and fails here.
+	# `ring` was the last C library onyums itself could drop, and as of 2026-09-24 it is
+	# dropped: rustls runs on the pure-Rust `graviola` provider and the self-signed
+	# certificate is minted by a `p256` signer, so nothing reaches ring on any target
+	# (`cargo tree --target all -i ring` reports no reverse dependencies). It is banned
+	# outright, with NO wrapper, so any route back — a crate defaulting to a ring-backed
+	# rustls provider, an rcgen with its `crypto` feature back on — fails CI rather than
+	# quietly restoring a C toolchain requirement.
 	#
-	# Writing this entry is itself the cautionary tale: the first draft listed only
-	# `rustls` and `rcgen`, which made `cargo deny check bans` FAIL outright — the
-	# ban is not decorative, and an incomplete wrapper list is loud rather than silent.
-	# That is the opposite failure mode to the renamed-crate one above, and the better
-	# one to have.
-	{ name = "ring", wrappers = ["rustls", "rustls-webpki", "rcgen"] },
+	# Note it is still *present in Cargo.lock*: `rustls-webpki` declares ring as an
+	# optional dependency, and the lockfile records the union of possible dependencies
+	# rather than the resolved feature graph. Present in the lock is not the same as
+	# compiled, and only the latter is what this ban is about.
+	{ name = "ring" },
 	{ name = "libsqlite3-sys", wrappers = ["rusqlite"] },
 	# Renamed upstream, caught 2026-07-20: this entry used to read
 	# `{ name = "lzma-sys", wrappers = ["xz2"] }`, but `xz2`/`lzma-sys` were replaced by

@@ -71,7 +71,19 @@ axum = { version = "0.8.9", features = ["http2"] }
 tower-service = "0.3.3"
 tower-layer = "0.3.3"
 tracing = "0.1.44"
-rcgen = "0.14.8"
+# `default-features = false` drops rcgen's `crypto` backend — and with it `ring`, the
+# last C library in the tree. rcgen's cert-building machinery does not need it: the
+# `SigningKey`/`PublicKeyData` traits are NOT behind the `crypto` feature, so onyums
+# supplies its own pure-Rust P-256 signer (see `tls_setup::P256SigningKey`). `pem` is
+# kept for `Certificate::pem`.
+rcgen = { version = "0.14.10", default-features = false, features = ["pem"] }
+# The pure-Rust P-256 signer behind that: key generation, PKCS#8 export for rustls, and
+# ASN.1 ECDSA signatures for X.509. RustCrypto, no C and no build script.
+# `default-features = false` drops `precomputed-tables`, a size/speed trade onyums does
+# not need for one keygen per launch. `pem` is kept: it is what lets the crate's test
+# helper emit a PKCS#8 PEM (via the pure-Rust `pem-rfc7468`) instead of hand-rolling
+# base64 armouring around key material.
+p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkcs8", "pem", "std"] }
 # Phase 2 — scrub x25519 client-auth secret key material on drop. Pure Rust, no FFI
 # (MIT/Apache); already in the tree transitively via the dalek/arti crypto stack, so
 # adding it direct introduces no new version.
@@ -82,7 +94,9 @@ zeroize = "1.8"
 # transitively via the dalek/arti crypto stack, so adding it direct introduces no new
 # version.
 subtle = "2.6"
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12", "ring"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
+# Pure-Rust rustls CryptoProvider (graviola, by rustls' own author). Replaces `ring`.
+rustls-graviola = "0.4.0"
 http-body-util = "0.1.3"
 bytes = "1.12.0"
 safelog = "0.9.0"
@@ -131,15 +145,16 @@ equix = { version = "0.6.2", default-features = false }
 
 [package]
 name = "onyums"
-# 0.4.0, not 0.3.2. Two breaking changes since 0.3.1 make this a minor bump under
-# 0.x semver, quite apart from the amount of new surface: the MSRV floor moved
-# 1.85 -> 1.90 -> 1.91 with the arti stack, and `OnionTorClient` — which appears in
-# `OnionServiceHandle::tor_client`, `OnionServiceBuilder::tor_client` and
-# `OnionService::shared_client` — is now `TorClient<TokioRustlsRuntime>` where it was
-# `TorClient<TokioNativeTlsRuntime>`. Code written against the *alias* is unaffected
-# (that is what the alias is for), but anyone who spelled the native-tls runtime out
-# will not compile, so it does not ship as a patch.
-version = "0.4.0"
+# 0.5.0, not 0.4.1: the crypto stack went pure Rust (`rustls-graviola` + `p256`, no C
+# compiled at all), and `graviola` builds on **x86_64 and aarch64 only** — a compile
+# error anywhere else. onyums 0.4.x built wherever `ring` did, so this narrows the
+# supported platforms, which is breaking under 0.x semver however welcome the change is
+# otherwise. Pin 0.4.x for armv7/riscv64/32-bit targets. Nothing in the public API
+# signature changed: `OnionTorClient` is still `TorClient<TokioRustlsRuntime>`.
+#
+# (0.4.0 was the previous bump: MSRV 1.85 -> 1.91 with the arti stack, and
+# `OnionTorClient` moving from `TokioNativeTlsRuntime` to `TokioRustlsRuntime`.)
+version = "0.5.0"
 edition = "2024"
 # Minimum supported Rust version. Not a guess: 1.91 is the floor cargo's own
 # resolver enforces — every `tor-*`/`arti-client` 0.46.0 crate declares
@@ -178,9 +193,11 @@ axum = { workspace = true }
 tower-service = { workspace = true }
 tracing = { workspace = true }
 rcgen = { workspace = true }
+p256 = { workspace = true }
 zeroize = { workspace = true }
 subtle = { workspace = true }
 tokio-rustls = { workspace = true }
+rustls-graviola = { workspace = true }
 http-body-util = { workspace = true }
 bytes = { workspace = true }
 safelog = { workspace = true }

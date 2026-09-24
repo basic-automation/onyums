@@ -83,7 +83,7 @@ mod tests {
 	use arti_client::TorClient;
 	use axum::{Router, routing::get};
 	use tokio_rustls::rustls;
-	use tor_rtcompat::tokio::TokioNativeTlsRuntime;
+	use tor_rtcompat::tokio::TokioRustlsRuntime;
 	use tracing::{Level, event};
 
 	use super::*;
@@ -94,10 +94,13 @@ mod tests {
 		// Compile-time proof that the arti stack is reachable through onyums, so a
 		// downstream needn't add its own version-skew-prone arti dependency. If any
 		// re-export path breaks, this stops compiling.
-		type _Client = crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime>;
+		type _Client = crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioRustlsRuntime>;
 		// The alias is transparent: it must stay *equal* to the spelled-out type, not
-		// merely resemble it, or a caller who mixes the two would stop compiling.
-		const fn _alias_is_the_same_type(c: crate::OnionTorClient) -> crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime> {
+		// merely resemble it, or a caller who mixes the two would stop compiling. The
+		// spelled-out runtime is the rustls one on purpose — this line is also what
+		// pins that arti runs on rustls (no `openssl-sys` in the tree; deny.toml bans it
+		// outright), so a drift back to `TokioNativeTlsRuntime` fails to compile here.
+		const fn _alias_is_the_same_type(c: crate::OnionTorClient) -> crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioRustlsRuntime> {
 			c
 		}
 		type _Key = crate::tor_hscrypto::pk::HsClientDescEncKey;
@@ -350,7 +353,11 @@ mod tests {
 		let mut fetch_cfg = arti_client::config::TorClientConfigBuilder::from_directories(&fetch_state, &fetch_cache);
 		fetch_cfg.address_filter().allow_onion_addrs(true);
 		let fetch_cfg = fetch_cfg.build().expect("fetch-client config should build");
-		let runtime = TokioNativeTlsRuntime::current().expect("current tokio runtime");
+		// The service launch above already installed rustls' provider for arti; this
+		// second client is built directly rather than through `setup_tor_client`, so
+		// say so explicitly instead of depending on the launch having run first.
+		let _ = crate::tor_client::install_crypto_provider();
+		let runtime = TokioRustlsRuntime::current().expect("current tokio runtime");
 		let fetch_client = tokio::time::timeout(std::time::Duration::from_mins(5), TorClient::with_runtime(runtime).config(fetch_cfg).create_bootstrapped()).await.expect("fetch-client bootstrap should finish within 5 minutes").expect("fetch client should bootstrap");
 
 		// The authoritative live signal: the app's body comes back through a real

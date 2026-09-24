@@ -65,11 +65,13 @@ ignore = [
 	# it ships no runtime code into the binary.
 	{ id = "RUSTSEC-2024-0436", reason = "unmaintained `paste`, build-time-only proc-macro with no runtime surface; transitive under the arti stack." },
 
-	# `async-std` is discontinued. Transitive only: onyums runs on tokio and drives
-	# arti with TokioNativeTlsRuntime (src/tor_client.rs); it pulls in no async-std
-	# executor of its own.
-	{ id = "RUSTSEC-2025-0052", reason = "discontinued `async-std`, transitive only; onyums runs on tokio via TokioNativeTlsRuntime." },
-
+	# Retired 2026-09-23 (same run, second commit): the RUSTSEC-2025-0052 ignore for the
+	# discontinued `async-std`. It only ever reached the tree through `tor-rtcompat`'s
+	# `full` umbrella (async_executors/async_std); the rustls feature swap hand-picks
+	# tor-rtcompat's features and `async-std` is gone — `cargo deny` with
+	# `-D advisory-not-detected` is what proves that, since a lingering entry would now
+	# fail the job.
+	#
 	# Retired 2026-09-23: the RUSTSEC-2026-0173 (`proc-macro-error2`, unmaintained)
 	# entry that used to sit here went dead when the arti 0.44 -> 0.46 bump dropped
 	# that crate from the tree. cargo-deny flagged it (`advisory-not-detected`), which
@@ -121,28 +123,43 @@ wildcards = "deny"
 # for; the wildcard ban is aimed at wildcard requirements on *published* crates.
 allow-wildcard-paths = true
 # The "100% Rust, no FFI, ever" rule, made mechanical — and honest about the fact that
-# the *tree* does not satisfy it today, while onyums' and onyums-skin's own dependency
+# the *tree* does not fully satisfy it, while onyums' and onyums-skin' own dependency
 # choices do. Audited 2026-07-16 with `cargo tree --target all`: three vendored C
-# libraries are in the graph, every one of them reached through the embedded Tor client,
-# none of them onyums' choice:
+# libraries were in the graph, every one reached through the embedded Tor client, none
+# of them onyums' choice. Since 2026-09-23 it is two — arti now runs on its `rustls`
+# runtime (Cargo.toml, `[workspace.dependencies]`), so OpenSSL is gone:
 #
-#   openssl-sys     <- native-tls   <- async-native-tls <- tor-rtcompat   (arti's TLS)
+#   openssl-sys     <- native-tls   <- async-native-tls <- tor-rtcompat   GONE — banned outright below
 #   libsqlite3-sys  <- rusqlite     <- tor-dirmgr                         (directory cache)
 #   liblzma-sys     <- liblzma      <- compression-codecs <- async-compression (compression;
 #                                      was `lzma-sys <- xz2` before the upstream rename)
 #
-# Each is banned *except* through the exact path it legitimately arrives on. That is the
-# line the principle actually defends: the embedded Tor client's internals are arti's
-# call, but a *new* C dependency — or any second route to one of these, or a direct
-# onyums/onyums-skin dependency on it — fails CI instead of passing review unnoticed.
-# Naming them here also stops the rule from quietly reading as satisfied when it is not:
-# see the ROADMAP for what it would take to actually drop openssl (arti's rustls runtime)
-# and async-std (both ride on `arti-client`'s `full` feature).
+# The two that remain are banned *except* through the exact path each legitimately
+# arrives on. That is the line the principle actually defends: the embedded Tor client's
+# internals are arti's call, but a *new* C dependency — or any second route to one of
+# these, or a direct onyums/onyums-skin dependency on it — fails CI instead of passing
+# review unnoticed. Naming them here also stops the rule from quietly reading as
+# satisfied when it is not. Both are upstream's to drop (tor-dirmgr's cache; directory
+# compression), not reachable from this workspace.
+#
+# `openssl-sys`, `native-tls`, and `async-native-tls` are denied with NO wrapper now:
+# the only thing that could bring OpenSSL back is a `full`/`native-tls` feature creeping
+# onto an arti crate, and this is what turns that into a CI failure. `aws-lc-sys` /
+# `aws-lc-fips-sys` are rustls' *C* crypto provider — the one way a rustls stack can
+# re-import FFI — and are denied for the same reason; the provider in this graph is
+# `ring` (pure Rust), via onyums' own `tokio-rustls` features, and it must stay the only
+# one: rustls' `ClientConfig::builder()` panics at runtime when two providers are
+# enabled and none is installed as the process default.
 #
 # `libz-sys`/`cmake` have no such excuse and are denied outright — nothing in the tree
 # reaches them today, and that is the state to keep.
 deny = [
-	{ name = "openssl-sys", wrappers = ["openssl", "native-tls"] },
+	{ name = "openssl-sys" },
+	{ name = "openssl" },
+	{ name = "native-tls" },
+	{ name = "async-native-tls" },
+	{ name = "aws-lc-sys" },
+	{ name = "aws-lc-fips-sys" },
 	{ name = "libsqlite3-sys", wrappers = ["rusqlite"] },
 	# Renamed upstream, caught 2026-07-20: this entry used to read
 	# `{ name = "lzma-sys", wrappers = ["xz2"] }`, but `xz2`/`lzma-sys` were replaced by

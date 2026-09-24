@@ -14,11 +14,46 @@ anyhow = "1.0.103"
 hyper = { version = "1.10.1", features = ["full"] }
 hyper-util = { version = "0.1.20", features = ["full"] }
 futures = "0.3.32"
-arti-client = { version = "0.46.0", features = ["full", "static"] }
-tor-cell = { version = "0.46.0", features = ["full"] }
-tor-hsservice = { version = "0.46.0", features = ["full"] }
-tor-proto = { version = "0.46.0", features = ["full", "stream-ctrl"] }
-tor-rtcompat = { version = "0.46.0", features = ["full"] }
+# The embedded Tor client, on arti's `rustls` TLS runtime rather than `native-tls`
+# (ROADMAP Phase 2, "100% Rust" — landed 2026-09-23). This is what removes `openssl-sys`
+# from the tree and retires the discontinued-`async-std` advisory: both rode in on the
+# `full` umbrellas, and cargo features are additive, so `full` cannot be kept and
+# subtracted from — every direct dependency that reached `tor-rtcompat/full` (which is
+# what turns `native-tls` + `async-std` on) is hand-picked instead. The lists below are
+# `full`'s own contents minus `native-tls`, `async-std`, and the sub-crate `full`
+# umbrellas that chain back to them; they were derived by diffing `cargo tree -e features`
+# before and after, not from memory. Notes on the individual entries:
+#   - `rustls` is `__is_nonadditive` but NOT `__is_experimental`, so this takes no
+#     experimental-feature decision (unlike `hs-pow-full` / `metrics`).
+#   - `static-sqlite` replaces the old `static`: arti-client's `static` is
+#     `static-sqlite` + `tor-rtcompat/static`, and tor-rtcompat's `static` is
+#     `native-tls-crate?/vendored` and nothing else — a no-op under rustls that would
+#     have looked right and meant less. The bundled-sqlite half is what onyums wants.
+#   - `flowctl-cc` / `counter-galois-onion` are NOT listed: arti 0.46 (Arti 2.6.0)
+#     removed those features because the code is always-on now.
+#   - tor-rtcompat's `rustls` takes `rustls` with `default-features = false` and picks no
+#     crypto provider; the provider comes from feature unification with onyums' own
+#     `tokio-rustls = { features = ["ring"] }` below — pure Rust, and the only provider
+#     in the graph (deny.toml bans `aws-lc-sys`, the C one, outright).
+#   - `tor-rtcompat`'s `full` also carried `arbitrary` (fuzzing) and `tls-server`
+#     (relay-side TLS via tor-cert-x509); neither is on a client/onion-service path.
+#   - `default-features = false` on arti-client is load-bearing: its `default` is
+#     `["tokio", "native-tls", "compression"]`, so with defaults on, `native-tls` comes
+#     straight back no matter what the explicit list says (found by diffing the enabled
+#     feature sets, exactly the trap the additive model sets). `tokio` and `compression`
+#     are re-listed explicitly.
+arti-client = { version = "0.46.0", default-features = false, features = ["anyhow", "bridge-client", "compression", "keymgr", "memquota", "onion-service-client", "onion-service-service", "pt-client", "rpc", "static-sqlite", "tokio", "vanguards", "rustls"] }
+#   - `tor-cell` is the FIFTH umbrella, which the ROADMAP's four-manifest estimate
+#     missed: `tor-cell/full` -> `tor-memquota/full` -> `tor-async-utils/full` ->
+#     `tor-rtcompat/full`, found with `cargo tree -e features -i tor-rtcompat
+#     --no-dedupe`. onyums itself uses only base relay-cell types (`Begin`/`End`/
+#     `Connected`); the onion-service cell feature (`hs`, which tor-cell tags
+#     `__is_experimental`) is enabled by tor-hsservice/tor-proto on their own
+#     dependency edges, so onyums does not name it — nor `relay`, the relay side.
+tor-cell = "0.46.0"
+tor-hsservice = { version = "0.46.0", features = ["restricted-discovery"] }
+tor-proto = { version = "0.46.0", features = ["tokio", "stream-ctrl", "hs-client", "hs-service", "send-control-msg", "pt-client", "rpc"] }
+tor-rtcompat = { version = "0.46.0", features = ["tokio", "rustls"] }
 tor-cert = "0.46.0"
 # Low-level arti crypto + onion-service identity types. Used by the Phase 1
 # vanity-address miner to derive the *exact* `.onion` address arti will serve

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use anyhow::Result;
 use arti_client::{TorClient, TorClientConfig, config::TorClientConfigBuilder};
 use tokio::task::JoinHandle;
-use tor_rtcompat::tokio::TokioNativeTlsRuntime;
+use tor_rtcompat::tokio::TokioRustlsRuntime;
 use tracing::{Level, event};
 
 use crate::keystore_perms::{Hardening, harden_state_tree};
@@ -21,20 +21,21 @@ use crate::keystore_perms::{Hardening, harden_state_tree};
 /// The arti [`TorClient`] onyums bootstraps and serves on, with its runtime fixed.
 ///
 /// Every public onyums signature that hands back or accepts an arti client names *this*
-/// rather than spelling out `TorClient<TokioNativeTlsRuntime>` — `OnionServiceHandle::tor_client`,
+/// rather than spelling out `TorClient<TokioRustlsRuntime>` — `OnionServiceHandle::tor_client`,
 /// `OnionServiceBuilder::tor_client`, and `OnionService::shared_client`.
 ///
 /// The indirection is deliberate and has a specific job. The runtime parameter is an
 /// implementation choice, not something a caller of onyums picks: it is which TLS
-/// implementation *arti* uses for its relay connections. The ROADMAP's "no FFI" item
-/// wants to move it from `native-tls` to `rustls` (which would drop `openssl-sys` from
-/// the tree and retire an advisory), and with the type spelled out at the API boundary
-/// that swap is a breaking change for everyone holding an `Arc<TorClient<…>>` from
-/// onyums. Behind the alias it is a one-line edit here.
+/// implementation *arti* uses for its relay connections. It was `native-tls` (and so
+/// `openssl-sys`, a C library, in a workspace whose rule is "100% Rust, no FFI") until
+/// 2026-09-23; it is `rustls` now — the same TLS stack onyums already terminates its own
+/// HTTPS with, so the binary carries one TLS implementation instead of two, and no
+/// OpenSSL. The alias is what made that swap a one-line edit here rather than a breaking
+/// change for everyone holding an `Arc<TorClient<…>>` from onyums.
 ///
-/// This is a transparent type alias, so it changes nothing for existing callers today —
-/// it only stops the runtime from being part of the API's spelling.
-pub type OnionTorClient = TorClient<TokioNativeTlsRuntime>;
+/// This is a transparent type alias: `OnionTorClient` *is* `TorClient<TokioRustlsRuntime>`,
+/// not a wrapper, so anything arti's client offers is reachable through it.
+pub type OnionTorClient = TorClient<TokioRustlsRuntime>;
 
 /// The default persistent onyums state directory — home of the Arti keystore that
 /// holds the onion service's v3 identity key, so the `.onion` address is stable
@@ -103,9 +104,40 @@ pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<On
 	event!(Level::INFO, "Creating Tor client...");
 	harden_keystore(std::path::Path::new(state_dir))?;
 	let config = tor_client_config(state_dir, cache_dir)?;
-	let runtime = TokioNativeTlsRuntime::current().map_err(|e| anyhow::anyhow!("Failed to get current tokio runtime: {e}"))?;
+	if install_crypto_provider() {
+		event!(Level::DEBUG, "Installed rustls' `ring` crypto provider as the process default for arti's TLS runtime.");
+	}
+	let runtime = TokioRustlsRuntime::current().map_err(|e| anyhow::anyhow!("Failed to get current tokio runtime: {e}"))?;
 	let client = TorClient::with_runtime(runtime);
 	client.config(config).create_bootstrapped().await.map_err(|e| anyhow::anyhow!("Failed to create bootstrapped Tor client: {e}"))
+}
+
+/// Make sure a rustls [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider)
+/// is installed as the process default, installing the pure-Rust `ring` one if nothing
+/// is there yet. Returns `true` only if *this call* installed it.
+///
+/// arti's rustls runtime does not pick a provider: `tor-rtcompat` depends on `rustls`
+/// with default features off and documents that "the application is responsible for
+/// calling `CryptoProvider::install_default()` before constructing" its TLS provider —
+/// onyums is that application. Left to rustls' own fallback, `ClientConfig::builder()`
+/// resolves the default from the enabled crate features, which works while `ring` is
+/// the only provider in the graph (it is: onyums' `tokio-rustls` enables it, and
+/// deny.toml bans the `aws-lc-*` C provider) but **panics** the moment a downstream
+/// app enables a second one. Installing explicitly removes that trap, and it makes the
+/// choice visible: `ring` is pure Rust, which is the whole reason arti runs on rustls
+/// here at all (ROADMAP Phase 2, "100% Rust").
+///
+/// Idempotent and deferential: if any provider is already installed — by an earlier
+/// bootstrap, or by the application before it called onyums — nothing changes and the
+/// application's choice stands. A concurrent first install from another thread loses
+/// the race harmlessly (`install_default` reports it and the winner's provider is the
+/// one in effect; both are rustls providers, so arti runs either way).
+pub fn install_crypto_provider() -> bool {
+	use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+	if CryptoProvider::get_default().is_some() {
+		return false;
+	}
+	ring::default_provider().install_default().is_ok()
 }
 
 /// Create the state directory hardened, and repair a lax one, before arti opens it
@@ -378,6 +410,17 @@ mod tests {
 		tor_client_config(&state, &cache).expect("persistent client config builds offline");
 		let (state, cache) = storage_dirs(true);
 		tor_client_config(&state, &cache).expect("ephemeral client config builds offline");
+	}
+
+	#[test]
+	fn crypto_provider_install_is_idempotent_and_leaves_a_provider_installed() {
+		// Test order is not deterministic and the provider is process-global, so the
+		// first call may or may not be the one that installs; what must hold afterwards
+		// is that *a* provider is present and that a second call installs nothing —
+		// the deferential half, which is what protects an application's own choice.
+		let _ = install_crypto_provider();
+		assert!(tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_some(), "a rustls CryptoProvider must be installed after install_crypto_provider()");
+		assert!(!install_crypto_provider(), "a second call must find a provider already installed and install nothing");
 	}
 
 	#[test]

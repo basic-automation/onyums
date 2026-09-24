@@ -184,7 +184,7 @@ cover every row below.
 |---|---|---|
 | `serve()` / builder API, config validation | 🟢 | Nickname, port, TLS, and client-choice validation all fail offline before any bootstrap. |
 | TLS policy (`Upgrade` / `Strict` / `Provided`) | 🟢 | Composition (gate + HSTS + app) is `oneshot`-tested *and* exercised over a real TLS handshake — `Strict`'s HSTS header is asserted on the wire; `ProvidedCert` parses/validates up front. |
-| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 476 unit tests in `onyums-skin`, plus an end-to-end check that an uncleared request over a real TLS connection does not reach the app (with a gate-disabled control), no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
+| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 502 unit tests in `onyums-skin`, plus an end-to-end check that an uncleared request over a real TLS connection does not reach the app (with a gate-disabled control), no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
 | Restricted discovery / client-auth keys | 🟢 | Key generation, `.auth` rendering/parsing, and allowlist assembly are offline-tested and byte-checked against Tor's file format. Descriptor encryption itself is arti's. |
 | Identity: persistent + `.ephemeral()` keystore | 🟢 | Directory resolution, uniqueness, and cleanup tested offline. |
 | Keystore permission hardening (0700/0600) | 🟢 | Unix-only; the syscall path runs on CI's Linux runner. A no-op on Windows (see [Deployment](#deployment)). |
@@ -200,7 +200,6 @@ cover every row below.
 | `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
 | Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
 | Intro-layer PoW (Tor's Equi-X) | 🔵 | Needs arti's experimental `hs-pow-full`. Skin's PoW is HTTP-layer only. |
-| Host-global concurrency/backpressure caps | 🔵 | Per-circuit limits exist via `CircuitPolicy`; total circuit/stream semaphores do not. |
 | CLI binary, framework layer (Phase 5) | 🔵 | Library only today. |
 | Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.46 (re-checked on the 0.44 → 0.46 bump). |
 | arti-sourced gauges (intro-point health, …) | 🔵 | Reachable but not taken: `tor-hsservice` 0.46's `metrics` feature is still marked `__is_experimental` (non-semver), the same category as the intro-layer PoW feature. A decision, not a flag. |
@@ -368,8 +367,11 @@ async fn main() {
 The shared client's type is `onyums::OnionTorClient` — an alias for arti's
 `TorClient<..>` with the runtime onyums bootstraps on. Name the alias rather than
 spelling the runtime out: which TLS implementation arti uses for its relay connections
-is onyums' choice, not yours, and it is expected to change (see the roadmap's "no FFI"
-item). Code written against the alias keeps compiling when it does.
+is onyums' choice, not yours, and it has already changed once — from `native-tls`
+(OpenSSL) to `rustls`, so the binary carries one pure-Rust TLS stack and no C library
+for TLS — without touching any caller written against the alias. onyums installs
+rustls' `ring` crypto provider as the process default on bootstrap if nothing is
+installed yet, and defers to whatever your application installed first.
 
 
 `.ephemeral()` conflicts with `.tor_client(...)` — a shared client has a fixed

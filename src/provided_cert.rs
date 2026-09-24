@@ -97,14 +97,11 @@ impl std::fmt::Debug for ProvidedCert {
 
 #[cfg(test)]
 mod tests {
-	use rcgen::generate_simple_self_signed;
-
 	use super::*;
 
 	/// A fresh, valid self-signed cert/key PEM pair for an onion-style SAN.
 	fn sample_pem() -> (String, String) {
-		let ck = generate_simple_self_signed(vec!["example.onion".to_string()]).expect("rcgen self-signed");
-		(ck.cert.pem(), ck.signing_key.serialize_pem())
+		crate::tls_setup::test_self_signed_pem("example.onion")
 	}
 
 	/// `from_pem` must leave a rustls `CryptoProvider` installed, because it builds a

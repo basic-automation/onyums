@@ -129,7 +129,7 @@ mod tests {
 		}
 
 		fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-			rustls::crypto::ring::default_provider().signature_verification_algorithms.supported_schemes()
+			rustls_graviola::default_provider().signature_verification_algorithms.supported_schemes()
 		}
 	}
 

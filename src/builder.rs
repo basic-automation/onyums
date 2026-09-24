@@ -704,8 +704,8 @@ mod tests {
 
 	#[test]
 	fn builder_accepts_a_provided_certificate() {
-		let ck = rcgen::generate_simple_self_signed(vec!["example.onion".to_string()]).expect("rcgen");
-		let provided = ProvidedCert::from_pem(ck.cert.pem().as_bytes(), ck.signing_key.serialize_pem().as_bytes()).expect("valid PEM");
+		let (cert_pem, key_pem) = crate::tls_setup::test_self_signed_pem("example.onion");
+		let provided = ProvidedCert::from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).expect("valid PEM");
 		let builder = OnionServiceBuilder::default().tls(Tls::Provided(provided));
 		// A provided cert keeps the forgiving plaintext posture (BYO is orthogonal).
 		assert!(matches!(builder.tls, Tls::Provided(_)));

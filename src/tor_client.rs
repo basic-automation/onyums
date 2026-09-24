@@ -153,11 +153,11 @@ pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<On
 /// owner decision, not a routine one. See the ROADMAP's "100% Rust, no FFI" item, which
 /// this deliberately does **not** claim to close.
 pub fn install_crypto_provider() -> bool {
-	use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
+	use tokio_rustls::rustls::crypto::CryptoProvider;
 	if CryptoProvider::get_default().is_some() {
 		return false;
 	}
-	ring::default_provider().install_default().is_ok()
+	rustls_graviola::default_provider().install_default().is_ok()
 }
 
 /// Create the state directory hardened, and repair a lax one, before arti opens it

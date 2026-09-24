@@ -122,6 +122,12 @@ Almost nothing — which is much of the point:
 - **A clock that is roughly right.** Tor is sensitive to clock skew; a badly wrong
   system time is a common cause of a bootstrap that never finishes.
 
+**Architecture:** **x86_64 or aarch64.** Since 0.5.0 the crypto is pure Rust
+(`rustls-graviola` + `p256`, no C compiled at all), and `graviola` supports those two
+architectures only — it is a compile error elsewhere. 0.4.x built anywhere `ring` did,
+so that is the release to pin if you need another target. See
+[the note on the crypto stack](#multiple-services-on-one-tor-client).
+
 **Toolchain:** Rust **edition 2024**, MSRV **1.91** — declared as `rust-version` in
 the manifest and enforced in CI. The floor comes from the embedded arti 0.46 stack,
 not the edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate,
@@ -373,13 +379,22 @@ without touching any caller written against the alias. onyums installs rustls' `
 crypto provider as the process default before it builds any TLS config, and defers to
 whatever your application installed first.
 
-> **This is not an FFI-free TLS stack, and the roadmap does not claim it is.** `ring`
-> vendors C and assembly from BoringSSL and compiles them with `cc`, so building onyums
-> still needs a C toolchain and the crypto under TLS is still native code. What the
-> swap bought is narrower and real: OpenSSL (`openssl-sys`) is gone, the discontinued
-> `async-std` advisory is retired, ~50 crates left the tree, and there is one TLS
-> implementation rather than two. The remaining C dependencies are listed in
-> [deny.toml](deny.toml), where each is pinned to the single path it may arrive on.
+> **The crypto is pure Rust, as of 0.5.0 — and here is exactly what that does and does
+> not mean.** TLS runs on [`rustls-graviola`](https://crates.io/crates/rustls-graviola)
+> and the self-signed certificate is minted by a [`p256`](https://crates.io/crates/p256)
+> signer, so **no C crypto is compiled or linked**: no OpenSSL, no `ring`, no
+> `aws-lc-rs`. `cargo tree --target all -i ring` reports no reverse dependencies. (`ring`
+> still *appears* in `Cargo.lock`, because `rustls-webpki` declares it optionally and a
+> lockfile records possible rather than resolved dependencies — being in the lock is not
+> being compiled.) Two C libraries do remain in the tree, both arti's and neither
+> reachable from onyums' manifest: `libsqlite3-sys` (the directory cache) and
+> `liblzma-sys` (directory compression). All of it is enumerated and CI-enforced in
+> [deny.toml](deny.toml).
+>
+> **The cost, which is a real one: x86_64 and aarch64 only.** `graviola` refuses to
+> compile on other architectures. onyums 0.4.x built anywhere `ring` did; 0.5.0 does not.
+> If you need armv7, riscv64 or a 32-bit target, stay on 0.4.x. CI cannot catch this for
+> you — all four checked target triples are x86_64 or aarch64.
 
 
 `.ephemeral()` conflicts with `.tor_client(...)` — a shared client has a fixed

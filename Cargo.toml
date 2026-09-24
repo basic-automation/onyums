@@ -131,7 +131,15 @@ equix = { version = "0.6.2", default-features = false }
 
 [package]
 name = "onyums"
-version = "0.3.1"
+# 0.4.0, not 0.3.2. Two breaking changes since 0.3.1 make this a minor bump under
+# 0.x semver, quite apart from the amount of new surface: the MSRV floor moved
+# 1.85 -> 1.90 -> 1.91 with the arti stack, and `OnionTorClient` — which appears in
+# `OnionServiceHandle::tor_client`, `OnionServiceBuilder::tor_client` and
+# `OnionService::shared_client` — is now `TorClient<TokioRustlsRuntime>` where it was
+# `TorClient<TokioNativeTlsRuntime>`. Code written against the *alias* is unaffected
+# (that is what the alias is for), but anyone who spelled the native-tls runtime out
+# will not compile, so it does not ship as a patch.
+version = "0.4.0"
 edition = "2024"
 # Minimum supported Rust version. Not a guess: 1.91 is the floor cargo's own
 # resolver enforces — every `tor-*`/`arti-client` 0.46.0 crate declares

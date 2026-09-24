@@ -368,10 +368,18 @@ The shared client's type is `onyums::OnionTorClient` — an alias for arti's
 `TorClient<..>` with the runtime onyums bootstraps on. Name the alias rather than
 spelling the runtime out: which TLS implementation arti uses for its relay connections
 is onyums' choice, not yours, and it has already changed once — from `native-tls`
-(OpenSSL) to `rustls`, so the binary carries one pure-Rust TLS stack and no C library
-for TLS — without touching any caller written against the alias. onyums installs
-rustls' `ring` crypto provider as the process default on bootstrap if nothing is
-installed yet, and defers to whatever your application installed first.
+(OpenSSL) to `rustls`, so the binary carries one TLS implementation instead of two —
+without touching any caller written against the alias. onyums installs rustls' `ring`
+crypto provider as the process default before it builds any TLS config, and defers to
+whatever your application installed first.
+
+> **This is not an FFI-free TLS stack, and the roadmap does not claim it is.** `ring`
+> vendors C and assembly from BoringSSL and compiles them with `cc`, so building onyums
+> still needs a C toolchain and the crypto under TLS is still native code. What the
+> swap bought is narrower and real: OpenSSL (`openssl-sys`) is gone, the discontinued
+> `async-std` advisory is retired, ~50 crates left the tree, and there is one TLS
+> implementation rather than two. The remaining C dependencies are listed in
+> [deny.toml](deny.toml), where each is pinned to the single path it may arrive on.
 
 
 `.ephemeral()` conflicts with `.tor_client(...)` — a shared client has a fixed

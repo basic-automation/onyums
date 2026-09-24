@@ -2,7 +2,7 @@
 name = "onyums-skin"
 version = "0.1.0"
 edition = "2024"
-# Minimum supported Rust version — one minor lower than the host server's 1.90,
+# Minimum supported Rust version — two minors lower than the host server's 1.91,
 # because skin carries none of the arti stack. The floor is 1.88 in principle
 # (the crate uses if-let chains, stable since 1.88) but 1.89 in practice: the
 # optional `equix`/`hashx` backend declares 1.89. Verified by building the lib on
@@ -30,6 +30,16 @@ tower-layer = { workspace = true }
 # Phase 5 optional PoW backend (Tor's Equi-X). Pure Rust, but LGPL-3.0, so it is
 # gated behind the `equix` feature below to keep the default build copyleft-free.
 equix = { workspace = true, optional = true }
+
+# docs.rs builds with default features unless told otherwise, and this crate's EquiX
+# proof-of-work backend is opt-in — so without this the whole `challenge::equix` surface
+# would be missing from the published documentation, silently, while the crate looks
+# fully documented. `features` rather than `all-features` deliberately: it reaches the
+# `equix` backend without also pulling `equix-compiler`'s runtime JIT, which the docs do
+# not need. Packaged metadata is frozen per version, so this has to be right before the
+# upload rather than after it.
+[package.metadata.docs.rs]
+features = ["equix"]
 
 [features]
 # Opt-in EquiX proof-of-work backend ([`challenge::equix::EquiX`]). Off by default:

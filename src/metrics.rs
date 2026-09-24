@@ -88,26 +88,47 @@ impl ServiceMetrics {
 		}
 	}
 
-	/// Circuits that were offered but neither accepted nor rejected by the policy gate —
-	/// `circuits_offered − (circuits_accepted + circuits_rejected)`, saturating at `0`.
+	/// Circuits that were offered but reached no host-side outcome at all —
+	/// `circuits_offered − (circuits_accepted + circuits_rejected + circuits_refused_at_capacity)`,
+	/// saturating at `0`.
 	///
 	/// These are the circuits arti failed to accept for transport reasons (the offer
-	/// arrived but `RendRequest::accept` errored) rather than any policy decision — a
-	/// distinct health signal from a policy rejection. Saturating so a torn read across
-	/// the independent `Relaxed` counter loads can never underflow-panic; over a settled
-	/// snapshot the identity holds exactly.
+	/// arrived but `RendRequest::accept` errored) rather than any decision onyums made —
+	/// a distinct health signal from a policy rejection or a capacity refusal. Saturating
+	/// so a torn read across the independent `Relaxed` counter loads can never
+	/// underflow-panic; over a settled snapshot the identity holds exactly.
+	///
+	/// *Capacity refusals are subtracted too, and that correction matters:* they were
+	/// added as their own counter after this helper was written, and until 2026-09-23
+	/// this function did not know about them — so every circuit refused at the
+	/// host-global limit was reported here as an arti transport failure. That is
+	/// precisely inverted for the operator it exists to inform: under a circuit flood
+	/// against a capped service, the number that should say "you are full" instead said
+	/// "your Tor transport is failing".
 	#[must_use]
 	pub const fn circuits_failed_transport(&self) -> u64 {
-		self.circuits_offered.saturating_sub(self.circuits_accepted.saturating_add(self.circuits_rejected))
+		self.circuits_offered.saturating_sub(self.circuits_accepted.saturating_add(self.circuits_rejected).saturating_add(self.circuits_refused_at_capacity))
 	}
 
-	/// All streams the per-stream gate saw, whatever the disposition —
-	/// `streams_served + streams_rejected + streams_shutdown`, saturating at `u64::MAX`.
+	/// All streams the per-stream gate saw, whatever the outcome —
+	/// `streams_served + streams_rejected + streams_shutdown + streams_refused_at_capacity`,
+	/// saturating at `u64::MAX`.
 	///
 	/// The denominator for a served-fraction or reject-rate over the stream gate.
+	///
+	/// The membership rules are not symmetric, because the recording sites are not:
+	/// - [`streams_refused_at_capacity`](Self::streams_refused_at_capacity) **is**
+	///   included. A capacity refusal happens *before* the disposition is recorded
+	///   (deliberately, so a refused stream is not also counted as served), so it
+	///   appears in no other counter — leaving it out understated the denominator by
+	///   exactly the streams shed under load, which is when the ratio is read.
+	/// - [`streams_timed_out`](Self::streams_timed_out) is **not** included, and must
+	///   not be: a timed-out stream was admitted and *is* already counted in
+	///   `streams_served`. Adding it would double-count and push the total above the
+	///   number of streams that actually existed.
 	#[must_use]
 	pub const fn total_streams(&self) -> u64 {
-		self.streams_served.saturating_add(self.streams_rejected).saturating_add(self.streams_shutdown)
+		self.streams_served.saturating_add(self.streams_rejected).saturating_add(self.streams_shutdown).saturating_add(self.streams_refused_at_capacity)
 	}
 
 	/// The six counters as `(prometheus_metric_name, HELP_text, value)` triples, in a
@@ -452,11 +473,43 @@ mod tests {
 		assert_eq!(torn.circuits_failed_transport(), 0);
 	}
 
+	/// The capacity-refusal counter landed after `circuits_failed_transport` was written,
+	/// and the helper was not taught about it — so a capacity refusal, which is a decision
+	/// onyums made, was reported as an arti transport failure. This is the regression
+	/// guard: it fails against the old `offered − (accepted + rejected)` formula.
+	#[test]
+	fn circuits_refused_at_capacity_are_not_transport_failures() {
+		// A service at its limit: every offer is accounted for by a host-side outcome,
+		// so arti failed on none of them.
+		let full = ServiceMetrics { circuits_offered: 20, circuits_accepted: 12, circuits_rejected: 3, circuits_refused_at_capacity: 5, ..Default::default() };
+		assert_eq!(full.circuits_failed_transport(), 0, "a circuit refused at the host-global limit is a capacity decision, not a transport failure");
+
+		// And the genuine transport failures still show through alongside refusals.
+		let mixed = ServiceMetrics { circuits_offered: 20, circuits_accepted: 10, circuits_rejected: 2, circuits_refused_at_capacity: 6, ..Default::default() };
+		assert_eq!(mixed.circuits_failed_transport(), 2);
+	}
+
 	#[test]
 	fn total_streams_sums_every_disposition() {
 		let m = ServiceMetrics { streams_served: 26, streams_rejected: 4, streams_shutdown: 2, ..Default::default() };
 		assert_eq!(m.total_streams(), 32);
 		assert_eq!(ServiceMetrics::default().total_streams(), 0);
+	}
+
+	/// The two asymmetric membership rules, pinned because they are easy to "fix" the
+	/// wrong way: a capacity-refused stream reaches no disposition counter and so must be
+	/// added, while a timed-out stream is *already* in `streams_served` and must not be.
+	#[test]
+	fn total_streams_counts_capacity_refusals_once_and_never_double_counts_timeouts() {
+		// 26 served (3 of which later timed out), 4 rejected, 2 shutdown, 5 refused for
+		// capacity → 37 streams actually existed at the gate.
+		let m = ServiceMetrics { streams_served: 26, streams_rejected: 4, streams_shutdown: 2, streams_refused_at_capacity: 5, streams_timed_out: 3, ..Default::default() };
+		assert_eq!(m.total_streams(), 37, "capacity refusals belong in the denominator; timeouts are a subset of served and must not be added again");
+
+		// Shedding under load must move the denominator, or a served-fraction computed
+		// from it reads 100% exactly when the service is refusing traffic.
+		let shedding = ServiceMetrics { streams_served: 1, streams_refused_at_capacity: 99, ..Default::default() };
+		assert_eq!(shedding.total_streams(), 100);
 	}
 
 	#[test]

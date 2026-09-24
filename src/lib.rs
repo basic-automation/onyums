@@ -83,7 +83,7 @@ mod tests {
 	use arti_client::TorClient;
 	use axum::{Router, routing::get};
 	use tokio_rustls::rustls;
-	use tor_rtcompat::tokio::TokioNativeTlsRuntime;
+	use tor_rtcompat::tokio::TokioRustlsRuntime;
 	use tracing::{Level, event};
 
 	use super::*;
@@ -94,10 +94,13 @@ mod tests {
 		// Compile-time proof that the arti stack is reachable through onyums, so a
 		// downstream needn't add its own version-skew-prone arti dependency. If any
 		// re-export path breaks, this stops compiling.
-		type _Client = crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime>;
+		type _Client = crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioRustlsRuntime>;
 		// The alias is transparent: it must stay *equal* to the spelled-out type, not
-		// merely resemble it, or a caller who mixes the two would stop compiling.
-		const fn _alias_is_the_same_type(c: crate::OnionTorClient) -> crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioNativeTlsRuntime> {
+		// merely resemble it, or a caller who mixes the two would stop compiling. The
+		// spelled-out runtime is the rustls one on purpose — this line is also what
+		// pins that arti runs on rustls (no `openssl-sys` in the tree; deny.toml bans it
+		// outright), so a drift back to `TokioNativeTlsRuntime` fails to compile here.
+		const fn _alias_is_the_same_type(c: crate::OnionTorClient) -> crate::arti_client::TorClient<crate::tor_rtcompat::tokio::TokioRustlsRuntime> {
 			c
 		}
 		type _Key = crate::tor_hscrypto::pk::HsClientDescEncKey;
@@ -155,6 +158,92 @@ mod tests {
 		Ok(String::from_utf8_lossy(&response).into_owned())
 	}
 
+	/// Which phase the live test is in, readable from outside the runtime. The
+	/// watchdog thread prints it on a wall-clock breach, so a wedged run names
+	/// *where* it wedged instead of dying silently — the diagnostic the 2026-07-20
+	/// hang never produced.
+	#[derive(Clone)]
+	struct PhaseTracker(std::sync::Arc<std::sync::Mutex<&'static str>>);
+
+	impl PhaseTracker {
+		fn new(initial: &'static str) -> Self {
+			Self(std::sync::Arc::new(std::sync::Mutex::new(initial)))
+		}
+
+		fn set(&self, phase: &'static str) {
+			*self.0.lock().expect("phase mutex poisoned") = phase;
+		}
+
+		fn get(&self) -> &'static str {
+			*self.0.lock().expect("phase mutex poisoned")
+		}
+	}
+
+	/// A hard wall-clock deadline enforced from a plain `std` thread — deliberately
+	/// outside tokio, because the two hang mechanisms it exists to catch both defeat
+	/// in-runtime timers: a future that blocks inside `poll` never yields to
+	/// `tokio::time::timeout`, and a panic already thrown by such a timeout can wedge
+	/// in runtime teardown *after* the async world is gone. Disarms when dropped;
+	/// fires `on_breach` with the current phase otherwise.
+	struct Watchdog {
+		disarm: Option<std::sync::mpsc::Sender<()>>,
+		thread: Option<std::thread::JoinHandle<()>>,
+	}
+
+	impl Watchdog {
+		fn arm(budget: std::time::Duration, phase: PhaseTracker, on_breach: impl FnOnce(&'static str) + Send + 'static) -> Self {
+			let (disarm, watch) = std::sync::mpsc::channel::<()>();
+			let thread = std::thread::spawn(move || match watch.recv_timeout(budget) {
+				// A send *or* a dropped sender both mean the guarded work finished.
+				Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+				Err(std::sync::mpsc::RecvTimeoutError::Timeout) => on_breach(phase.get()),
+			});
+			Self { disarm: Some(disarm), thread: Some(thread) }
+		}
+	}
+
+	impl Drop for Watchdog {
+		fn drop(&mut self) {
+			// Dropping the sender disconnects the channel, which wakes the watchdog
+			// thread immediately; the join is then prompt and keeps the thread from
+			// outliving the test that armed it.
+			drop(self.disarm.take());
+			if let Some(thread) = self.thread.take() {
+				let _ = thread.join();
+			}
+		}
+	}
+
+	#[test]
+	fn watchdog_disarmed_before_deadline_never_fires() {
+		let fired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+		let phase = PhaseTracker::new("armed");
+		let watchdog = Watchdog::arm(std::time::Duration::from_millis(40), phase, {
+			let fired = std::sync::Arc::clone(&fired);
+			move |_| fired.store(true, std::sync::atomic::Ordering::SeqCst)
+		});
+		drop(watchdog);
+		// Wait well past the deadline: a disarm that merely delayed the breach
+		// instead of cancelling it would still trip this.
+		std::thread::sleep(std::time::Duration::from_millis(120));
+		assert!(!fired.load(std::sync::atomic::Ordering::SeqCst), "a disarmed watchdog must never fire");
+	}
+
+	#[test]
+	fn watchdog_breach_fires_and_names_the_current_phase() {
+		let (report, reported) = std::sync::mpsc::channel::<&'static str>();
+		let phase = PhaseTracker::new("initial");
+		let watchdog = Watchdog::arm(std::time::Duration::from_millis(40), phase.clone(), move |stuck| {
+			let _ = report.send(stuck);
+		});
+		// The phase set *after* arming must be the one reported — the watchdog reads
+		// the tracker at breach time, not a snapshot from when it was armed.
+		phase.set("Tor bootstrap");
+		let stuck = reported.recv_timeout(std::time::Duration::from_secs(5)).expect("watchdog should fire once its budget elapses");
+		assert_eq!(stuck, "Tor bootstrap");
+		drop(watchdog);
+	}
+
 	/// The live-Tor test tier (onyums ROADMAP: "Add live Tor integration tests …
 	/// an `--ignored` or CI-gated live test tier"). Ignored by default because it
 	/// bootstraps real Tor clients and publishes a real descriptor — minutes of
@@ -179,9 +268,55 @@ mod tests {
 	/// nothing ever stopped it, so a successful launch hung the default suite
 	/// indefinitely), and it swallowed every launch error into a DEBUG log, so a
 	/// broken launch still passed.
-	#[tokio::test(flavor = "multi_thread")]
+	///
+	/// # Why this is a `#[test]` with an explicit runtime, not a `#[tokio::test]`
+	///
+	/// On 2026-07-20 this test wedged for 70 minutes despite every phase carrying a
+	/// `tokio::time::timeout` summing to ~21 — and the launch timeout's panic never
+	/// surfaced. Two mechanisms produce exactly that symptom, and this shape closes
+	/// both rather than betting on a diagnosis:
+	///
+	/// 1. **Unbounded runtime teardown.** `#[tokio::test]` drops its runtime when the
+	///    body finishes *or panics*, and `Runtime::drop` waits forever for in-flight
+	///    `spawn_blocking` tasks — which arti uses. A fired timeout's panic is then
+	///    held captured by libtest while the drop never returns, so the run hangs
+	///    *with its failure message already thrown*. Here the runtime is explicit:
+	///    the body's panic is caught, [`tokio::runtime::Runtime::shutdown_timeout`]
+	///    bounds teardown and abandons wedged blocking tasks, and the panic is
+	///    re-raised *after* — so a fired timeout reports as the failure it is.
+	/// 2. **A future that blocks inside `poll`.** `Timeout` only acts at yield
+	///    points; a poll that never returns starves it. No in-runtime construct can
+	///    catch that, so a [`Watchdog`] on a plain `std` thread enforces the
+	///    whole-test wall-clock ceiling and aborts the process, naming the stuck
+	///    phase. An abort is deliberate: this tier runs alone (`--exact --ignored`),
+	///    and a loud bounded death beats a silent infinite hang.
+	#[test]
 	#[ignore = "bootstraps against the live Tor network; run explicitly with --ignored"]
-	async fn live_service_serves_over_the_tor_network_and_shuts_down() {
+	fn live_service_serves_over_the_tor_network_and_shuts_down() {
+		let phase = PhaseTracker::new("building the tokio runtime");
+		// Ceiling = the sum of the body's own phase timeouts (5 launch + 1 ready +
+		// 5 fetch bootstrap + 8 × ~1.25 fetch ≈ 21) plus shutdown + teardown slack.
+		// If this fires, some phase overran its own bound — the 2026-07-20 defect.
+		let _watchdog = Watchdog::arm(std::time::Duration::from_mins(25), phase.clone(), |stuck| {
+			eprintln!("live tier watchdog: the 25-minute wall-clock ceiling elapsed while in phase \"{stuck}\" — a per-phase timeout failed to fire or teardown wedged; aborting so the run dies loudly instead of hanging");
+			std::process::abort();
+		});
+
+		let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("multi-thread tokio runtime should build");
+		let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| runtime.block_on(live_test_body(&phase))));
+
+		// Bounded teardown — the half a `#[tokio::test]` cannot do. A minute is
+		// generous for arti's background tasks; whatever is still wedged after that
+		// is abandoned rather than waited on forever.
+		phase.set("runtime teardown");
+		runtime.shutdown_timeout(std::time::Duration::from_mins(1));
+
+		if let Err(panic) = body {
+			std::panic::resume_unwind(panic);
+		}
+	}
+
+	async fn live_test_body(phase: &PhaseTracker) {
 		// Best-effort logging for interactive debugging: `try_init` cannot panic on a
 		// subscriber some other test already installed.
 		let _ = tracing_subscriber::fmt().with_max_level(tracing::Level::INFO).try_init();
@@ -197,6 +332,7 @@ mod tests {
 
 		// Bound the launch — bootstrap is unbounded on a blocked network — so this
 		// tier fails in minutes rather than hanging the way its predecessor did.
+		phase.set("Tor bootstrap + service launch");
 		let handle = tokio::time::timeout(std::time::Duration::from_mins(5), launch).await.expect("Tor bootstrap + service launch should finish within 5 minutes").expect("live launch should yield a service handle");
 
 		// The minted address must be a valid v3 onion address, not just non-empty.
@@ -205,21 +341,28 @@ mod tests {
 		// Soft signal only (see the doc comment): give full reachability a short
 		// window and record the outcome, but do not fail on arti's conservative
 		// both-rings readiness.
+		phase.set("readiness observation");
 		let ready = handle.ready_timeout(std::time::Duration::from_mins(1)).await;
 		event!(Level::INFO, "live tier: ready_timeout(60s) = {ready}, status = {:?}", handle.status());
 
 		// A second client that is allowed to dial `.onion` addresses. It shares the
 		// disposable network cache (no second consensus download) but gets its own
 		// throwaway state dir, cleaned up below.
+		phase.set("fetch-client bootstrap");
 		let (fetch_state, fetch_cache) = storage_dirs(true);
 		let mut fetch_cfg = arti_client::config::TorClientConfigBuilder::from_directories(&fetch_state, &fetch_cache);
 		fetch_cfg.address_filter().allow_onion_addrs(true);
 		let fetch_cfg = fetch_cfg.build().expect("fetch-client config should build");
-		let runtime = TokioNativeTlsRuntime::current().expect("current tokio runtime");
+		// The service launch above already installed rustls' provider for arti; this
+		// second client is built directly rather than through `setup_tor_client`, so
+		// say so explicitly instead of depending on the launch having run first.
+		let _ = crate::tor_client::install_crypto_provider();
+		let runtime = TokioRustlsRuntime::current().expect("current tokio runtime");
 		let fetch_client = tokio::time::timeout(std::time::Duration::from_mins(5), TorClient::with_runtime(runtime).config(fetch_cfg).create_bootstrapped()).await.expect("fetch-client bootstrap should finish within 5 minutes").expect("fetch client should bootstrap");
 
 		// The authoritative live signal: the app's body comes back through a real
 		// rendezvous. Retry across HsDir propagation lag right after first publish.
+		phase.set("live fetch attempts");
 		let mut served_body = None;
 		for attempt in 1..=8 {
 			match tokio::time::timeout(std::time::Duration::from_mins(1), live_fetch_once(&fetch_client, handle.onion_address())).await {
@@ -243,6 +386,7 @@ mod tests {
 		// Graceful teardown must return — the missing half of the old test. Bounded
 		// like every other phase, so a wedged accept loop fails the run instead of
 		// hanging it.
+		phase.set("graceful shutdown");
 		tokio::time::timeout(std::time::Duration::from_mins(1), handle.shutdown()).await.expect("graceful shutdown should complete within 60 seconds");
 	}
 }

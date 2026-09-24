@@ -308,6 +308,16 @@ where
 			Ok(streams) => streams,
 			Err(err) => {
 				event!(Level::INFO, "Failed to accept circuit {}: {err}", id.0);
+				// The policy already saw this circuit at the offer, so its accounting
+				// entry exists and nothing else will ever close it: this arm neither
+				// spawns the task that forgets on drain nor takes the rejection path that
+				// forgets inline. Without this the per-circuit map grows by one entry for
+				// every failed accept, for the lifetime of the service — and a failed
+				// accept is not a rare internal event but something a peer can provoke by
+				// abandoning the rendezvous handshake. `forget`'s own contract is that the
+				// host calls it "once a circuit is torn down ... so a stateful policy's
+				// per-circuit map does not grow without bound"; this is such a teardown.
+				policy.forget(&id);
 				continue;
 			}
 		};
@@ -687,7 +697,15 @@ mod tests {
 		let (outcomes, forgotten, drives, metrics) = run(CircuitAction::Accept, 2, true).await;
 		assert!(outcomes.is_empty(), "the fake records neither outcome when accept fails");
 		assert_eq!(drives, 0, "no streams are driven for a circuit that never opened");
-		assert!(forgotten.is_empty(), "nothing was ever driven, so nothing reaches the drained-circuit forget");
+		// This assertion used to read `forgotten.is_empty()`, justified as "nothing was
+		// ever driven, so nothing reaches the drained-circuit forget". That described the
+		// code's behaviour rather than the invariant the code owes, and so pinned a leak:
+		// the policy is told about every circuit at the offer, so *every* circuit must be
+		// forgotten on exactly one path out. A failed accept takes neither the rejection
+		// path nor the spawned drain, so before 2026-09-23 its accounting entry stayed in
+		// the policy's map for the service's lifetime — one entry per failed accept, and
+		// a peer can provoke those at will by abandoning the handshake.
+		assert_eq!(forgotten.len(), 2, "a circuit whose accept fails must still be forgotten — otherwise the policy's per-circuit map grows without bound");
 		assert_eq!(metrics.circuits_offered, 2, "the offer happened regardless");
 		assert_eq!(metrics.circuits_accepted, 0, "the counter tracks accepts that succeeded, not accepts attempted");
 		assert_eq!(metrics.circuits_rejected, 0, "an arti-side accept failure is not a policy rejection");

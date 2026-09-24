@@ -123,7 +123,7 @@ Almost nothing — which is much of the point:
   system time is a common cause of a bootstrap that never finishes.
 
 **Toolchain:** Rust **edition 2024**, MSRV **1.91** — declared as `rust-version` in
-the manifest and enforced in CI. The floor comes from the embedded arti 0.44 stack,
+the manifest and enforced in CI. The floor comes from the embedded arti 0.46 stack,
 not the edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate,
 which carries none of arti, is usable on **1.89**.
 
@@ -184,7 +184,7 @@ cover every row below.
 |---|---|---|
 | `serve()` / builder API, config validation | 🟢 | Nickname, port, TLS, and client-choice validation all fail offline before any bootstrap. |
 | TLS policy (`Upgrade` / `Strict` / `Provided`) | 🟢 | Composition (gate + HSTS + app) is `oneshot`-tested *and* exercised over a real TLS handshake — `Strict`'s HSTS header is asserted on the wire; `ProvidedCert` parses/validates up front. |
-| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 476 unit tests in `onyums-skin`, plus an end-to-end check that an uncleared request over a real TLS connection does not reach the app (with a gate-disabled control), no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
+| Skin gate, WAF, rate limiting, clearance tokens | 🟢 | 502 unit tests in `onyums-skin`, plus an end-to-end check that an uncleared request over a real TLS connection does not reach the app (with a gate-disabled control), no Tor needed. Bounded by the WAF's best-effort nature — see [What the gate does *not* do](#what-the-gate-does-not-do). |
 | Restricted discovery / client-auth keys | 🟢 | Key generation, `.auth` rendering/parsing, and allowlist assembly are offline-tested and byte-checked against Tor's file format. Descriptor encryption itself is arti's. |
 | Identity: persistent + `.ephemeral()` keystore | 🟢 | Directory resolution, uniqueness, and cleanup tested offline. |
 | Keystore permission hardening (0700/0600) | 🟢 | Unix-only; the syscall path runs on CI's Linux runner. A no-op on Windows (see [Deployment](#deployment)). |
@@ -192,7 +192,7 @@ cover every row below.
 | `ServiceStatus` / `ServiceProblem` projection | 🟢 | Mapping tested against every arti state. The *emission* of transitions is 🟡. |
 | Host-side metrics + Prometheus exposition | 🟢 | Counter mechanics and text format tested offline, and the accept loop's circuit/stream increment sites are now covered too (offered-before-verdict, accepted, rejected, served, shut down). |
 | TLS termination + axum handoff | 🟢 | A real rustls client handshakes against the self-signed acceptor over an in-memory stream pair and must get a `200` **and the app body** back through TLS → hyper → axum; the port-80 arm's `301` is checked to preserve path and query. No Tor involved. |
-| **Live serve over Tor** (rendezvous circuit itself) | 🟡 | What remains live-only is arti's own part: descriptor publication, the rendezvous handshake, and the `DataStream` the handlers are handed. The `--ignored` live test is the only cover and CI does not run it — and that test is currently unreliable (observed hanging well past its own internal timeouts), so treat this row as genuinely unverified rather than verified-elsewhere. |
+| **Live serve over Tor** (rendezvous circuit itself) | 🟡 | What remains live-only is arti's own part: descriptor publication, the rendezvous handshake, and the `DataStream` the handlers are handed. The `--ignored` live test is the only cover and **CI does not run it** — which is why this is 🟡 and not 🟢. It *was* run by hand on 2026-09-24 against the real network and **passed**: the service published, a second Tor client dialled the `.onion` through a real rendezvous circuit, and the app's body came back on the first fetch attempt (257s, warm directory cache). Treat the row as "verified once, by hand, on one host" — not as continuously verified. |
 | Raw-port serving (`route_port`) | 🟢 | The routing table, the `RawTcpHandler` proxy, and now the dispatch itself are offline-tested: bytes travel through `handle_stream_request` into a registered handler and back, an unregistered port is refused without accepting the stream, and under `Tls::Strict` port 80 is refused rather than accepted-and-redirected. |
 | Circuit-policy gate, Under Attack mode | 🟢 | Both the decisions *and* the accept loop's sequencing around them are offline-tested: that a refused circuit is never accepted and yields no streams, that a rejected stream leaves the circuit alive, that a `Shutdown` verdict stops the loop, that a challenge fails closed on a raw port, and that per-circuit accounting is always dropped. What remains live-only is the TLS/serve step itself (next row). |
 | Backpressure (`max_circuits` / `max_streams` / `handler_timeout`) | 🟢 | Refusal-at-capacity, the unbounded defaults, the `0` rejections, and timeout expiry (on a paused clock) are all offline-tested; refusals, timeouts, and policy rejections are counted separately, and a capacity-refused stream is counted once. |
@@ -200,10 +200,9 @@ cover every row below.
 | `status_events()` stream emission | 🟡 | Projection tested; live emission not. `ready()` lags real reachability — see [First launch](#first-launch--troubleshooting). |
 | Launching from a **bring-your-own** key | 🔵 | Offline inspection only; you cannot serve an existing `.onion` address yet. |
 | Intro-layer PoW (Tor's Equi-X) | 🔵 | Needs arti's experimental `hs-pow-full`. Skin's PoW is HTTP-layer only. |
-| Host-global concurrency/backpressure caps | 🔵 | Per-circuit limits exist via `CircuitPolicy`; total circuit/stream semaphores do not. |
 | CLI binary, framework layer (Phase 5) | 🔵 | Library only today. |
-| Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.44. |
-| arti-sourced gauges (intro-point health, …) | 🔵 | Reachable but not taken: `tor-hsservice` 0.44's `metrics` feature is marked `__is_experimental` (non-semver), the same category as the intro-layer PoW feature. A decision, not a flag. |
+| Single-onion-service mode | 🔴 | The `anonymity` field is still commented out in tor-hsservice 0.46 (re-checked on the 0.44 → 0.46 bump). |
+| arti-sourced gauges (intro-point health, …) | 🔵 | Reachable but not taken: `tor-hsservice` 0.46's `metrics` feature is still marked `__is_experimental` (non-semver), the same category as the intro-layer PoW feature. A decision, not a flag. |
 
 Full detail, including what each slice covers, lives in [ROADMAP.md](ROADMAP.md).
 
@@ -368,8 +367,19 @@ async fn main() {
 The shared client's type is `onyums::OnionTorClient` — an alias for arti's
 `TorClient<..>` with the runtime onyums bootstraps on. Name the alias rather than
 spelling the runtime out: which TLS implementation arti uses for its relay connections
-is onyums' choice, not yours, and it is expected to change (see the roadmap's "no FFI"
-item). Code written against the alias keeps compiling when it does.
+is onyums' choice, not yours, and it has already changed once — from `native-tls`
+(OpenSSL) to `rustls`, so the binary carries one TLS implementation instead of two —
+without touching any caller written against the alias. onyums installs rustls' `ring`
+crypto provider as the process default before it builds any TLS config, and defers to
+whatever your application installed first.
+
+> **This is not an FFI-free TLS stack, and the roadmap does not claim it is.** `ring`
+> vendors C and assembly from BoringSSL and compiles them with `cc`, so building onyums
+> still needs a C toolchain and the crypto under TLS is still native code. What the
+> swap bought is narrower and real: OpenSSL (`openssl-sys`) is gone, the discontinued
+> `async-std` advisory is retired, ~50 crates left the tree, and there is one TLS
+> implementation rather than two. The remaining C dependencies are listed in
+> [deny.toml](deny.toml), where each is pinned to the single path it may arrive on.
 
 
 `.ephemeral()` conflicts with `.tor_client(...)` — a shared client has a fixed
@@ -929,6 +939,7 @@ warning for public users.
 | A raw `route_port(...)` backend is unreachable | The local TCP backend isn't listening on the address you forwarded to. |
 | `serve()` returns a port error | Ports 80/443 are reserved for the built-in HTTP handler, and a port can't be registered twice or as `0` — this is a clean startup error, not a runtime surprise. |
 | Address changed after a restart | You used `.ephemeral()` (throwaway identity by design); drop it to keep the persistent keystore's stable address. |
+| Startup fails: `problem with filesystem permissions: Error setting up the directory manager` | Not onyums' own keystore check — this is **arti's `fs-mistrust`**, which walks the *whole ancestor chain* of `./tor/onyums/{state,cache}` and refuses if any parent directory is group- or world-writable, because another local user could swap a directory out from under it. Note the difference from the row below: onyums hardens the paths it creates, but it cannot fix a lax `/mnt/...` or home directory above them. Find the culprit with `namei -l ./tor/onyums/cache` and `chmod go-w` it. If the loose ancestor is deliberate (a shared data volume, say), move the service's working directory somewhere owner-only rather than relaxing the check — and only as a last resort, on a single-user box, set `FS_MISTRUST_DISABLE_PERMISSIONS_CHECKS=1`, which disables the check process-wide. |
 | Startup fails: "could not be tightened" / "refusing to launch with a locally-readable onion-service identity" | A path in `./tor/onyums/state` is group/other-accessible and this process can't `chmod` it — almost always because the directory is owned by *another* user (ran as root once, now as a service account?). `chown` the tree to the service user. Fail-closed is deliberate: the alternative is serving an identity your other local users can read. See [Keystore permissions](#deployment). |
 | Startup fails: "refusing to harden the symlink …" | Something in the state tree is a symlink. Identity material must be a real file — replace the link, or point the working directory at the real location instead. |
 | `WARN … Hardened N of M path(s) … to owner-only` | Not an error: onyums repaired a keystore that was readable by other local users (a restore that dropped modes, or a pre-hardening onyums). Worth asking who could read the key before it was fixed. |

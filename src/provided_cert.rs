@@ -50,6 +50,13 @@ impl ProvidedCert {
 			bail!("certificate PEM contained no certificates");
 		}
 		let key = PrivateKeyDer::from_pem_slice(key_pem).map_err(|e| anyhow::anyhow!("failed to parse private-key PEM: {e}"))?;
+		// Before `ServerConfig::builder()`, never after: with no process-default provider
+		// installed and two provider features unified onto the shared rustls copy (a
+		// downstream app adding plain `rustls`/`tokio-rustls` is enough), that builder
+		// *panics* rather than erroring. This constructor is public and reachable long
+		// before any Tor client is bootstrapped, so it cannot rely on `setup_tor_client`
+		// having installed one. Idempotent and deferential — see `install_crypto_provider`.
+		crate::tor_client::install_crypto_provider();
 		let config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(cert_chain, key).map_err(|e| anyhow::anyhow!("provided certificate and key are not usable: {e}"))?;
 		Ok(Self { config: Arc::new(config) })
 	}
@@ -98,6 +105,25 @@ mod tests {
 	fn sample_pem() -> (String, String) {
 		let ck = generate_simple_self_signed(vec!["example.onion".to_string()]).expect("rcgen self-signed");
 		(ck.cert.pem(), ck.signing_key.serialize_pem())
+	}
+
+	/// `from_pem` must leave a rustls `CryptoProvider` installed, because it builds a
+	/// `ServerConfig` and that builder *panics* (rather than erroring) when no process
+	/// default exists and the graph's crate features name two providers — the shape a
+	/// downstream app creates just by depending on plain `rustls`/`tokio-rustls`
+	/// alongside onyums. This constructor is public and runs before any Tor client
+	/// exists, so it must install the provider itself rather than inherit one.
+	///
+	/// What this test can and cannot show: a provider is process-global and cannot be
+	/// uninstalled, so this asserts the postcondition (one is installed after the call)
+	/// rather than reproducing the panic. It still fails if the `install_crypto_provider`
+	/// call is deleted *and* no other test installed one first — and, more importantly,
+	/// it documents the invariant at the site that has to hold it.
+	#[test]
+	fn from_pem_leaves_a_crypto_provider_installed() {
+		let (cert, key) = sample_pem();
+		ProvidedCert::from_pem(cert.as_bytes(), key.as_bytes()).expect("valid PEM pair");
+		assert!(tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_some(), "ProvidedCert::from_pem must guarantee a process-default CryptoProvider before building a ServerConfig");
 	}
 
 	#[test]

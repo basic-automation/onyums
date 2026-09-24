@@ -73,6 +73,12 @@ pub fn self_signed_server_config(address: &OnionAddress) -> Result<rustls::Serve
 	let cert = generate_simple_self_signed(subject_alt_names(address)).with_context(|| format!("failed to generate a self-signed certificate for {address}"))?;
 
 	let key_der = PrivatePkcs8KeyDer::from_pem_slice(cert.signing_key.serialize_pem().as_bytes()).map_err(|e| anyhow::anyhow!("failed to convert the generated signing key to DER: {e:?}"))?;
+	// See `ProvidedCert::from_pem` for why this precedes the builder rather than trusting
+	// the launch path: `ServerConfig::builder()` panics, not errors, when no process
+	// default is installed and the crate features name two providers. This one is
+	// reachable from `serve()` on the shared-client branch, which never calls
+	// `setup_tor_client`.
+	crate::tor_client::install_crypto_provider();
 	let server_config = rustls::ServerConfig::builder().with_no_client_auth().with_single_cert(vec![cert.cert.der().clone()], PrivateKeyDer::Pkcs8(key_der)).map_err(|e| anyhow::anyhow!("failed to build the rustls server config for {address}: {e:?}"))?;
 	Ok(server_config)
 }
@@ -133,6 +139,19 @@ mod tests {
 		// base32 name still gets a certificate a browser will match.
 		let bare = OnionAddress::normalized("examplereturnsavalidacceptorpaddingxxxxxxxxxxxxxxxxxxxxx");
 		assert_eq!(subject_alt_names(&bare), vec!["examplereturnsavalidacceptorpaddingxxxxxxxxxxxxxxxxxxxxx.onion".to_string()]);
+	}
+
+	/// The default acceptor path has the same obligation as `ProvidedCert::from_pem`:
+	/// it builds a rustls `ServerConfig`, and that builder panics when no process
+	/// default provider is installed and two provider features are unified in the graph.
+	/// It is reachable from `serve()` on the shared-client branch, which never calls
+	/// `setup_tor_client` — so it installs the provider itself. (Postcondition only; a
+	/// provider cannot be uninstalled to reproduce the panic — see the twin test in
+	/// `provided_cert`.)
+	#[test]
+	fn self_signed_config_leaves_a_crypto_provider_installed() {
+		self_signed_server_config(&address()).expect("self-signed config");
+		assert!(tokio_rustls::rustls::crypto::CryptoProvider::get_default().is_some(), "self_signed_server_config must guarantee a process-default CryptoProvider before building a ServerConfig");
 	}
 
 	#[test]

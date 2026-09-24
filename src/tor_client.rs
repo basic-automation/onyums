@@ -113,25 +113,45 @@ pub async fn setup_tor_client(state_dir: &str, cache_dir: &str) -> Result<Arc<On
 }
 
 /// Make sure a rustls [`CryptoProvider`](tokio_rustls::rustls::crypto::CryptoProvider)
-/// is installed as the process default, installing the pure-Rust `ring` one if nothing
-/// is there yet. Returns `true` only if *this call* installed it.
+/// is installed as the process default, installing the `ring` one if nothing is there
+/// yet. Returns `true` only if *this call* installed it.
 ///
-/// arti's rustls runtime does not pick a provider: `tor-rtcompat` depends on `rustls`
-/// with default features off and documents that "the application is responsible for
-/// calling `CryptoProvider::install_default()` before constructing" its TLS provider —
-/// onyums is that application. Left to rustls' own fallback, `ClientConfig::builder()`
-/// resolves the default from the enabled crate features, which works while `ring` is
-/// the only provider in the graph (it is: onyums' `tokio-rustls` enables it, and
-/// deny.toml bans the `aws-lc-*` C provider) but **panics** the moment a downstream
-/// app enables a second one. Installing explicitly removes that trap, and it makes the
-/// choice visible: `ring` is pure Rust, which is the whole reason arti runs on rustls
-/// here at all (ROADMAP Phase 2, "100% Rust").
+/// **Every onyums code path that builds a rustls config calls this first**, because the
+/// failure it prevents is a panic, not an error: `ClientConfig::builder()` and
+/// `ServerConfig::builder()` both go through
+/// `CryptoProvider::get_default_or_install_from_crate_features()`, which `expect`s —
+/// "Could not automatically determine the process-level `CryptoProvider`" — when no
+/// provider is installed *and* the enabled crate features do not name exactly one.
+/// rustls resolves a provider from features only when exactly one of `ring` /
+/// `aws_lc_rs` is on; with both on it returns `None` and the builder panics. onyums
+/// alone enables only `ring`, but feature unification is a *graph*-wide property: a
+/// downstream app that adds plain `rustls`/`tokio-rustls` (whose defaults are
+/// `aws_lc_rs`) anywhere in its tree turns both on for the single shared rustls copy
+/// and takes onyums' builders down with it. Calling this first is what makes that a
+/// non-event rather than a panic inside a library the app cannot patch.
+///
+/// The call sites are therefore all three rustls entry points, not just the Tor client:
+/// [`setup_tor_client`] (arti's client config), `tls_setup::self_signed_server_config`
+/// (the default acceptor), and [`ProvidedCert::from_pem`](crate::ProvidedCert::from_pem)
+/// (bring-your-own certificate) — the last two are reachable from a caller who never
+/// bootstraps a Tor client at all.
+///
+/// Also required by arti specifically: `tor-rtcompat` takes `rustls` with default
+/// features off and documents that the application must install a provider or "arti
+/// will not run" — onyums is that application.
 ///
 /// Idempotent and deferential: if any provider is already installed — by an earlier
-/// bootstrap, or by the application before it called onyums — nothing changes and the
+/// call, or by the application before it reached onyums — nothing changes and the
 /// application's choice stands. A concurrent first install from another thread loses
 /// the race harmlessly (`install_default` reports it and the winner's provider is the
-/// one in effect; both are rustls providers, so arti runs either way).
+/// one in effect; both are rustls providers, so TLS works either way).
+///
+/// *On `ring` and the "no FFI" rule:* `ring` is **not** pure Rust — it vendors C and
+/// perlasm from `BoringSSL` and builds them with `cc`. It is the default here because it
+/// is what rustls offers alongside `aws-lc-rs` (also C) and what arti's own stack
+/// expects; the pure-Rust alternative is an unaudited `RustCrypto` provider, which is an
+/// owner decision, not a routine one. See the ROADMAP's "100% Rust, no FFI" item, which
+/// this deliberately does **not** claim to close.
 pub fn install_crypto_provider() -> bool {
 	use tokio_rustls::rustls::crypto::{CryptoProvider, ring};
 	if CryptoProvider::get_default().is_some() {

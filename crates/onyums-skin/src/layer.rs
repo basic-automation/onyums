@@ -22,7 +22,7 @@ use std::{
 };
 
 use axum::{
-	body::Body, http::{HeaderValue, StatusCode, header, request::Parts}, response::{IntoResponse, Response}
+	body::Body, http::{HeaderValue, StatusCode, Uri, header, request::Parts}, response::{IntoResponse, Response}
 };
 use http_body_util::{BodyExt, Limited};
 use rand::Rng;
@@ -39,6 +39,12 @@ use crate::{
 const DEFAULT_COOKIE: &str = "skin_clearance";
 /// Default Skin-owned route the interstitial submits solutions to. Must match the
 /// submit path configured on the JS [`PowChallenge`](crate::challenge::pow::PowChallenge).
+/// Query parameters the bundled challenges submit on [`DEFAULT_SUBMIT_PATH`], and
+/// which carry this gate's own opaque envelopes: `puzzle`/`nonce` from
+/// [`PowChallenge`], `puzzle`/`answer` from [`CaptchaChallenge`]. Exempted from WAF
+/// inspection by name — see `Skin::without_own_tokens`.
+const CHALLENGE_PARAMS: &[&str] = &["puzzle", "nonce", "answer"];
+
 const DEFAULT_SUBMIT_PATH: &str = "/.skin/pow";
 /// Default page a freshly-cleared client is redirected to.
 const DEFAULT_RETURN_PATH: &str = "/";
@@ -128,6 +134,92 @@ impl Skin {
 		SkinLayer { skin: Arc::new(self) }
 	}
 
+	/// A view of the request with this gate's own tokens removed, or `None` when
+	/// there were none to remove.
+	///
+	/// # Why
+	///
+	/// The clearance cookie and the challenge envelopes are base64url of random
+	/// bytes. Random strings occasionally spell things, and the ruleset is looking
+	/// for short literals: `-enc` (`cmdi_powershell`), `.sql` (`traversal_backup_files`),
+	/// `rO0AB` (`code_java_serialized`). Simulating 2,000,000 visitors against the
+	/// starter ruleset trips one of those about **1 in 77,000** times.
+	///
+	/// That rate would be tolerable if the consequence were one refused request. It
+	/// is not. The clearance cookie rides every request for its whole TTL — an hour,
+	/// by default — so a visitor unlucky at mint time is refused *everything* for an
+	/// hour, with a SQL-injection page as the explanation. It clears by itself and
+	/// is unreproducible, which is the worst shape a bug can have.
+	///
+	/// Inspecting them buys nothing either way: the gate verifies both by MAC, so a
+	/// tampered token fails on its own terms, and a token that survives the MAC is
+	/// one this gate minted.
+	///
+	/// Only this gate's own fields are removed, by exact name. Everything else in
+	/// the cookie header and the query is still inspected, so a payload parked in
+	/// `?evil=…` on the submit path is caught as before.
+	fn without_own_tokens(&self, parts: &Parts) -> Option<Parts> {
+		let cookie = self.redacted_cookie(parts);
+		let query = self.redacted_query(parts);
+		if cookie.is_none() && query.is_none() {
+			return None;
+		}
+
+		let mut out = parts.clone();
+		match cookie {
+			Some(Some(value)) => {
+				out.headers.insert(header::COOKIE, value);
+			}
+			Some(None) => {
+				out.headers.remove(header::COOKIE);
+			}
+			None => {}
+		}
+		if let Some(uri) = query {
+			out.uri = uri;
+		}
+		Some(out)
+	}
+
+	/// `Some(Some(v))` to replace the cookie header, `Some(None)` to drop it
+	/// entirely, `None` when this gate's cookie was not present.
+	fn redacted_cookie(&self, parts: &Parts) -> Option<Option<HeaderValue>> {
+		let raw = parts.headers.get(header::COOKIE)?.to_str().ok()?;
+		let prefix = format!("{}=", self.cookie_name);
+		if !raw.split(';').any(|c| c.trim().starts_with(&prefix)) {
+			return None;
+		}
+		let kept: Vec<&str> = raw.split(';').map(str::trim).filter(|c| !c.starts_with(&prefix)).collect();
+		if kept.is_empty() {
+			return Some(None);
+		}
+		Some(HeaderValue::from_str(&kept.join("; ")).ok())
+	}
+
+	/// The request URI with the challenge parameters dropped, or `None` when this is
+	/// not a submission or carries none of them.
+	fn redacted_query(&self, parts: &Parts) -> Option<Uri> {
+		if parts.uri.path() != self.submit_path {
+			return None;
+		}
+		let query = parts.uri.query()?;
+		let kept: Vec<&str> = query.split('&').filter(|pair| !Self::is_challenge_param(pair)).collect();
+		if kept.len() == query.split('&').count() {
+			return None;
+		}
+
+		let path = parts.uri.path();
+		let rebuilt = if kept.is_empty() { path.to_owned() } else { format!("{path}?{}", kept.join("&")) };
+		let mut uri = parts.uri.clone().into_parts();
+		uri.path_and_query = rebuilt.parse().ok();
+		Uri::from_parts(uri).ok()
+	}
+
+	fn is_challenge_param(pair: &str) -> bool {
+		let name = pair.split('=').next().unwrap_or_default();
+		CHALLENGE_PARAMS.contains(&name)
+	}
+
 	/// Read and verify the clearance cookie, if any.
 	fn read_clearance(&self, parts: &Parts) -> Option<Clearance> {
 		let cookies = parts.headers.get(header::COOKIE)?.to_str().ok()?;
@@ -176,11 +268,17 @@ impl Skin {
 		//    request *body*, when body inspection is enabled, is scanned later in `call`,
 		//    after the gate clears the request — only forwarded traffic carries a body to
 		//    the app, so gated traffic never pays the buffering cost.)
-		if let Some(waf) = &self.waf
-			&& let Verdict::Block(m) = waf.inspect(parts)
-		{
-			self.sink.record(&waf_block_event(&m));
-			return Decision::Respond(waf_block_response(&m));
+		if let Some(waf) = &self.waf {
+			// Inspect a view of the request with this gate's OWN tokens taken out.
+			// They are high-entropy base64url that this gate minted and will verify
+			// by MAC; running injection signatures over them finds nothing but
+			// coincidences, and a coincidence here is a visitor locked out of a site
+			// for no reason they could ever discover. See `without_own_tokens`.
+			let redacted = self.without_own_tokens(parts);
+			if let Verdict::Block(m) = waf.inspect(redacted.as_ref().unwrap_or(parts)) {
+				self.sink.record(&waf_block_event(&m));
+				return Decision::Respond(waf_block_response(&m));
+			}
 		}
 
 		// 1. Edge rules run ahead of the gate: a matching redirect or block short-circuits
@@ -594,6 +692,48 @@ mod tests {
 
 	fn bare_parts(path: &str) -> Parts {
 		Request::builder().uri(path).body(()).unwrap().into_parts().0
+	}
+
+	/// A clearance cookie whose random base64url happens to spell `.sql` must not
+	/// be read as a path-traversal attempt against the gate that minted it.
+	///
+	/// Random strings occasionally spell things; across the starter ruleset the
+	/// coincidence rate is about 1 in 77,000 visitors. The consequence is what
+	/// makes it worth a test: the cookie rides every request for its whole TTL, so
+	/// an unlucky visitor is refused everything for an hour.
+	#[test]
+	fn the_gates_own_clearance_cookie_is_not_inspected() {
+		let store = Arc::new(HmacClearanceStore::generate());
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).waf(Waf::starter()).build();
+
+		for value in ["aaaa.SqL-bbbb", "cccc-eNc-dddd", "rO0ABQdddddd"] {
+			let parts = parts_with_cookie("/", &format!("{DEFAULT_COOKIE}={value}"));
+			assert!(!matches!(skin.decide(&parts), Decision::Respond(r) if r.status() == StatusCode::FORBIDDEN), "the gate refused its own cookie value {value:?}",);
+		}
+	}
+
+	/// Same for the challenge envelopes, which are the other thing this gate mints
+	/// and then reads back.
+	#[test]
+	fn the_gates_own_challenge_params_are_not_inspected() {
+		let store = Arc::new(HmacClearanceStore::generate());
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).waf(Waf::starter()).build();
+
+		for query in ["puzzle=aaa.SqL-bbb&nonce=ccc", "puzzle=aaa-eNc-bbb&answer=ACEF"] {
+			let parts = Request::builder().uri(format!("{DEFAULT_SUBMIT_PATH}?{query}")).body(()).unwrap().into_parts().0;
+			assert!(!matches!(skin.decide(&parts), Decision::Respond(r) if r.status() == StatusCode::FORBIDDEN), "the gate refused its own submission {query:?}",);
+		}
+	}
+
+	/// The exemption is by exact parameter name, so it is not a hole: anything else
+	/// parked on the submit path is inspected exactly as before.
+	#[test]
+	fn a_payload_beside_the_challenge_params_is_still_inspected() {
+		let store = Arc::new(HmacClearanceStore::generate());
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).waf(Waf::starter()).build();
+
+		let parts = Request::builder().uri(format!("{DEFAULT_SUBMIT_PATH}?puzzle=aaa&evil=%27%3B%20DROP%20TABLE%20users--")).body(()).unwrap().into_parts().0;
+		assert!(matches!(skin.decide(&parts), Decision::Respond(r) if r.status() == StatusCode::FORBIDDEN), "a payload in a non-exempt parameter must still be refused",);
 	}
 
 	fn parts_with_cookie(path: &str, cookie: &str) -> Parts {

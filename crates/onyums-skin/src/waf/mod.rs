@@ -1137,7 +1137,6 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule { id: "sqli_union_select", category: WafCategory::Sqli, pattern: r"(?i)\bunion\b[\s\S]{0,40}\bselect\b" },
 		Rule { id: "sqli_or_tautology", category: WafCategory::Sqli, pattern: r#"(?i)\bor\b\s+['"]?\s*\d+\s*=\s*\d+"# },
 		Rule { id: "sqli_stacked_query", category: WafCategory::Sqli, pattern: r"(?i);\s*(drop|delete|update|insert|truncate)\b" },
-		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r"(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)" },
 		Rule { id: "sqli_time_based", category: WafCategory::Sqli, pattern: r"(?i)\b(sleep|benchmark|pg_sleep|waitfor\s+delay)\s*\(" },
 		Rule { id: "sqli_information_schema", category: WafCategory::Sqli, pattern: r"(?i)\binformation_schema\b" },
 		// MySQL system-variable info-leak probes (OWASP-CRS 942xxx): `@@version`, `@@datadir`,
@@ -1187,6 +1186,37 @@ pub fn starter_rules() -> Vec<Rule> {
 		// quoted equality) stays clean.
 		// <https://www.linuxcompatible.org/story/owasp-crs-v4280-drops-with-critical-security-fixes-and-first-lts-track>
 		Rule { id: "sqli_string_tautology", category: WafCategory::Sqli, pattern: r#"(?i)['"]\s*\b(or|and)\b\s*['"][^'"]{0,64}['"]\s*=\s*['"]"# },
+		// Placed AFTER the specific SQLi signatures on purpose. In first-match mode the
+		// lowest rule index wins, and a truncating comment rides along with payloads that
+		// a more specific rule describes better — `';EXEC xp_cmdshell('dir')--` is
+		// `sqli_oob_exec`, not "a comment". Sitting here, this rule reports only the
+		// payloads nothing else recognises.
+		// A SQL comment is an attack signal in two shapes, and the pattern this
+		// replaced caught neither of them while blocking every web browser.
+		//
+		// It was `(--\s|#|/\*)[\s\S]*?(\bor\b|\band\b|=)`: any comment opener,
+		// then anything, then `or`/`and`/`=` anywhere later. Run against a whole
+		// raw header value that matches `Accept: …,*/*;q=0.8` — the media range
+		// supplies `/*` and `;q=` supplies the `=`. Every browser sends that, for
+		// documents, stylesheets, images and fonts alike. It also missed the
+		// textbook payloads: `admin'--` has no trailing `or`/`and`/`=` at all.
+		//
+		// The shapes that do indicate an attack:
+		//
+		//   1. TRUNCATION — a string or paren terminator followed by a comment that
+		//      swallows the rest of the statement: `admin'--`, `1') --`, `1) or (1=1--`.
+		//      The comment must end the value; a comment with prose after it is prose
+		//      (`"quoted text" -- Attribution`).
+		//   2. The MySQL version-gated executable comment `/*!50000…*/`, which runs
+		//      as SQL on MySQL and is a comment everywhere else. Requiring the
+		//      version digits matters: a bare `/*!` is the standard minifier-preserved
+		//      bang comment that heads jQuery, Bootstrap and normalize.css.
+		//
+		// Comment PADDING between keywords (`UNION/**/SELECT`) is deliberately not
+		// here: `strip_sql_comments_collapse_ws` already rewrites it away and the
+		// other SQLi rules match the normalised form, so pattern-matching it here
+		// would be a second, worse implementation of a solved problem.
+		Rule { id: "sqli_comment", category: WafCategory::Sqli, pattern: r##"(?i)(['"`)]\s*(--(&|$)|#(&|$))|\d\s*=\s*\d\s*(--|#)(&|$)|/\*![\s\S]{0,8}\d{5})"## },
 		// --- Cross-site scripting ---
 		Rule { id: "xss_script_tag", category: WafCategory::Xss, pattern: r"(?i)<\s*script\b" },
 		Rule { id: "xss_js_uri", category: WafCategory::Xss, pattern: r"(?i)javascript:" },
@@ -1667,9 +1697,76 @@ pub fn starter_rules() -> Vec<Rule> {
 
 #[cfg(test)]
 mod tests {
-	use axum::http::Request;
+	use axum::http::{HeaderValue, Request, header};
 
 	use super::*;
+
+	/// The `Accept` header a browser sends for an HTML document, for every engine
+	/// that matters. None of these may be blocked.
+	///
+	/// No test in this module had ever put a browser `Accept` header through the
+	/// ruleset, which is exactly how a rule that refused every browser shipped:
+	/// `fn parts` sets no headers, and the 26 `keeps_false_positives_low` tests all
+	/// build on it. The one client that *did* get through was curl, whose bare
+	/// `*/*` has no `=` after the `/*` for `sqli_comment` to reach.
+	const BROWSER_ACCEPT: &[(&str, &str)] = &[
+		("Firefox / Tor Browser, document", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"),
+		("Chrome, document", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7"),
+		("Safari, document", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"),
+		("any engine, stylesheet", "text/css,*/*;q=0.1"),
+		("Firefox, image", "image/avif,image/webp,image/png,image/svg+xml,*/*;q=0.8"),
+		("Safari, image", "image/webp,image/avif,video/*;q=0.8,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5"),
+		("Firefox, webfont", "application/font-woff2;q=1.0,application/font-woff;q=0.9,*/*;q=0.8"),
+		("curl", "*/*"),
+		("jQuery XHR", "*/*;q=0.01"),
+		("feed reader", "application/atom+xml,application/xml;q=0.9,*/*;q=0.8"),
+	];
+
+	#[test]
+	fn no_browser_is_blocked_by_its_own_accept_header() {
+		let waf = Waf::starter();
+		for (who, accept) in BROWSER_ACCEPT {
+			let mut parts = parts("GET", "/");
+			parts.headers.insert(header::ACCEPT, HeaderValue::from_static(accept));
+			assert!(matches!(waf.inspect(&parts), Verdict::Allow), "{who} was blocked by `Accept: {accept}`");
+		}
+	}
+
+	#[test]
+	fn sql_comment_truncation_is_caught() {
+		// The shapes the previous pattern missed entirely: a terminator followed by
+		// a comment that ends the value.
+		let waf = Waf::starter();
+		// Written percent-encoded, as a browser or a tool would actually put them on
+		// the wire — spaces and `;` are not legal raw URI characters, and an
+		// unencoded `#` starts a fragment and never reaches the server at all. The
+		// decode pass is part of what is under test.
+		let payloads = [("admin'--", "admin'--"), ("admin'#", "admin'%23"), ("1') --", "1')%20--"), ("1' ) --", "1'%20)%20--"), ("1) or (1=1--", "1)%20or%20(1=1--"), ("'; DROP TABLE users--", "'%3B%20DROP%20TABLE%20users--"), ("';EXEC xp_cmdshell('dir')--", "'%3BEXEC%20xp_cmdshell('dir')--")];
+		for (plain, encoded) in payloads {
+			assert!(matches!(waf.inspect(&parts("GET", &format!("/?u={encoded}"))), Verdict::Block(_)), "{plain:?} must be blocked");
+		}
+	}
+
+	#[test]
+	fn a_comment_in_ordinary_prose_is_not_an_attack() {
+		let waf = Waf::starter();
+		for text in ["\"quoted text\" -- Attribution", "see the note -- and more", "2 = 2 -- obviously"] {
+			let mut parts = parts("GET", "/");
+			parts.headers.insert("x-note", HeaderValue::from_str(text).unwrap());
+			assert!(matches!(waf.inspect(&parts), Verdict::Allow), "{text:?} is prose, not SQL");
+		}
+	}
+
+	#[test]
+	fn only_the_version_gated_bang_comment_is_an_attack() {
+		// `/*!` alone heads jQuery, Bootstrap and normalize.css — every minifier
+		// preserves it. `/*!50000…*/` executes as SQL on MySQL and nowhere else.
+		let waf = Waf::starter();
+		let mut benign = parts("GET", "/");
+		benign.headers.insert("x-note", HeaderValue::from_static("/*! jQuery v3.7.1 | (c) OpenJS Foundation */"));
+		assert!(matches!(waf.inspect(&benign), Verdict::Allow), "a minifier bang comment is not an attack");
+		assert!(matches!(waf.inspect(&parts("GET", "/?q=/*!50000SELECT*/1")), Verdict::Block(_)), "the version-gated form is");
+	}
 
 	fn parts(method: &str, uri: &str) -> Parts {
 		Request::builder().method(method).uri(uri).body(()).unwrap().into_parts().0
@@ -3480,21 +3577,24 @@ mod tests {
 	}
 
 	#[test]
-	fn xpath_wildcard_node_set_attributes_to_the_sql_comment_rule_first() {
+	fn xpath_wildcard_node_set_attributes_to_the_xpath_rule() {
 		// Found while adding the predicate rules, and worth pinning rather than hiding: the XPath
 		// wildcard step `//*` *contains* `/*`, the SQL comment opener, so a `//*[…]` payload trips a
 		// Sqli rule before the XPath rules are ever reached (first-match order runs Sqli first).
 		//
-		// It is not a miss — the request is blocked either way, which is what protects the app — but
-		// the *attribution* an operator sees on their event stream says `sqli`, not `xpath_injection`.
-		// Left as-is deliberately: re-ordering the rule table to fix a label would change which rule
-		// reports every overlapping payload in the whole set, and blocking is the load-bearing part.
-		// Both facts are asserted so neither can drift silently.
+		// It used to be reported as `sqli`: the old `sqli_comment` pattern treated the `/*` in
+		// the `//*` wildcard step as a SQL block comment, and won first-match. The comment here
+		// used to say that was unfixable without re-ordering the whole table.
+		//
+		// Narrowing `sqli_comment` fixed it without re-ordering anything: `//*[name()=…]` has no
+		// truncating comment and no version-gated bang comment, so it no longer matches at all and
+		// the XPath rule reports the payload it actually describes. Kept as a test because the
+		// attribution an operator reads off their event stream is the thing that regressed.
 		let waf = Waf::starter();
 		let Verdict::Block(m) = waf.inspect(&parts("GET", "/x?q=//*[name()='password']")) else {
 			panic!("a wildcard-step XPath payload must still block");
 		};
-		assert_eq!(m.category, WafCategory::Sqli, "the `/*` comment token wins first-match");
+		assert_eq!(m.category, WafCategory::XPathInjection, "an XPath payload must be reported as XPath");
 
 		// Scoring inspects every rule, so the XPath signal is still visible there — an operator who
 		// scores rather than first-matches does see the XPath attribution.

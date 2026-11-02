@@ -10,10 +10,10 @@ members = ["crates/onyums-skin"]
 # borrow rules and is undefined behaviour. onyums threads `anyhow::Error` through
 # every fallible path (`setup_tor_client`, `launch_onion_service`, the builder), so
 # this is squarely in the tree. Enforced by `cargo deny check advisories` in CI.
-anyhow = "1.0.103"
-hyper = { version = "1.10.1", features = ["full"] }
-hyper-util = { version = "0.1.20", features = ["full"] }
-futures = "0.3.32"
+anyhow = "1.0.104"
+hyper = { version = "1.12.0", features = ["full"] }
+hyper-util = { version = "0.1.21", features = ["full"] }
+futures = "0.3.34"
 # The embedded Tor client, on arti's `rustls` TLS runtime rather than `native-tls`
 # (ROADMAP Phase 2, "100% Rust" — landed 2026-09-23). This is what removes `openssl-sys`
 # from the tree and retires the discontinued-`async-std` advisory: both rode in on the
@@ -42,7 +42,7 @@ futures = "0.3.32"
 #     straight back no matter what the explicit list says (found by diffing the enabled
 #     feature sets, exactly the trap the additive model sets). `tokio` and `compression`
 #     are re-listed explicitly.
-arti-client = { version = "0.46.0", default-features = false, features = ["anyhow", "bridge-client", "compression", "keymgr", "memquota", "onion-service-client", "onion-service-service", "pt-client", "rpc", "static-sqlite", "tokio", "vanguards", "rustls"] }
+arti-client = { version = "0.47.0", default-features = false, features = ["anyhow", "bridge-client", "compression", "keymgr", "memquota", "onion-service-client", "onion-service-service", "pt-client", "rpc", "static-sqlite", "tokio", "vanguards", "rustls"] }
 #   - `tor-cell` is the FIFTH umbrella, which the ROADMAP's four-manifest estimate
 #     missed: `tor-cell/full` -> `tor-memquota/full` -> `tor-async-utils/full` ->
 #     `tor-rtcompat/full`, found with `cargo tree -e features -i tor-rtcompat
@@ -50,23 +50,23 @@ arti-client = { version = "0.46.0", default-features = false, features = ["anyho
 #     `Connected`); the onion-service cell feature (`hs`, which tor-cell tags
 #     `__is_experimental`) is enabled by tor-hsservice/tor-proto on their own
 #     dependency edges, so onyums does not name it — nor `relay`, the relay side.
-tor-cell = "0.46.0"
-tor-hsservice = { version = "0.46.0", features = ["restricted-discovery"] }
-tor-proto = { version = "0.46.0", features = ["tokio", "stream-ctrl", "hs-client", "hs-service", "send-control-msg", "pt-client", "rpc"] }
-tor-rtcompat = { version = "0.46.0", features = ["tokio", "rustls"] }
-tor-cert = "0.46.0"
+tor-cell = "0.47.0"
+tor-hsservice = { version = "0.47.0", features = ["restricted-discovery"] }
+tor-proto = { version = "0.47.0", features = ["tokio", "stream-ctrl", "hs-client", "hs-service", "send-control-msg", "pt-client", "rpc"] }
+tor-rtcompat = { version = "0.47.0", features = ["tokio", "rustls"] }
+tor-cert = "0.47.0"
 # Low-level arti crypto + onion-service identity types. Used by the Phase 1
 # vanity-address miner to derive the *exact* `.onion` address arti will serve
 # from a candidate ed25519 key (no second, divergent encoding). Pure Rust.
-tor-llcrypto = "0.46.0"
-tor-hscrypto = "0.46.0"
+tor-llcrypto = "0.47.0"
+tor-hscrypto = "0.47.0"
 # Phase 1 identity — pure-Rust QR encoding for the `.onion` address (terminal +
 # SVG renderers). `default-features = false` drops the `image` renderer (and its
 # heavy `image`/`png` tree); only the always-available unicode renderer and the
 # pure-string `svg` renderer are kept. No FFI.
 qrcode = { version = "0.14.1", default-features = false, features = ["svg"] }
-tokio = { version = "1.52.3", features = ["full"] }
-tokio-util = { version = "0.7.13", default-features = false }
+tokio = { version = "1.54.1", features = ["full"] }
+tokio-util = { version = "0.7.20", default-features = false }
 axum = { version = "0.8.9", features = ["http2"] }
 tower-service = "0.3.3"
 tower-layer = "0.3.3"
@@ -87,31 +87,31 @@ p256 = { version = "0.14.0", default-features = false, features = ["ecdsa", "pkc
 # Phase 2 — scrub x25519 client-auth secret key material on drop. Pure Rust, no FFI
 # (MIT/Apache); already in the tree transitively via the dalek/arti crypto stack, so
 # adding it direct introduces no new version.
-zeroize = "1.8"
+zeroize = "1.9"
 # Phase 2 raw-port controls — constant-time byte comparison for the pre-shared-key
 # preamble authorizer (`SharedSecretAuth`), so a wrong token cannot be recovered from
 # how far the compare got. Pure Rust, no FFI (BSD-3-Clause); already in the tree
 # transitively via the dalek/arti crypto stack, so adding it direct introduces no new
 # version.
 subtle = "2.6"
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["logging", "tls12"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["logging", "tls12"] }
 # Pure-Rust rustls CryptoProvider (graviola, by rustls' own author). Replaces `ring`.
 rustls-graviola = "0.4.0"
-http-body-util = "0.1.3"
-bytes = "1.12.0"
-safelog = "0.9.0"
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+safelog = "0.10.0"
 tracing-subscriber = "0.3.23"
 # Dev-only: request-level tests of the served Router without a live Tor network.
-tower = { version = "0.5.2", features = ["util"] }
+tower = { version = "0.5.3", features = ["util"] }
 # onyums-skin: the abuse-defense layer, consumed by the server for Skin integration.
 # The `version` is not redundant with `path`: crates.io rejects a path-only dependency,
 # so a path-only entry here would make `cargo publish` of onyums fail (ROADMAP
 # cross-cutting — "Sync crates.io with GitHub"). With both, local builds resolve
 # through the path and a published onyums depends on onyums-skin 0.1.x from the
 # registry. Enforced by `cargo deny check bans` (wildcard dependency).
-onyums-skin = { path = "crates/onyums-skin", version = "0.1.0" }
+onyums-skin = { path = "crates/onyums-skin", version = "0.2.0" }
 # onyums-skin gate-core deps — pure Rust, no FFI (MIT/Apache).
-sha2 = "0.10.9"
+sha2 = "0.11.1"
 # 0.10 is not a routine bump: it is what takes `rand` 0.9 *out of the tree*. arti (0.44
 # onward) is on `rand` 0.10, and onyums + onyums-skin were the last two reverse deps on 0.9
 # (governor's edge went with its `jitter` feature — see the `governor` entry below), so
@@ -119,9 +119,9 @@ sha2 = "0.10.9"
 # duplicate. The API delta is one rename at our usage level: `rand_core`'s `RngCore` is
 # now `Rng` (and the old extension trait `Rng` is now `RngExt`, which this workspace
 # does not use — `rand::rng()`, `fill_bytes`, and `rand::random::<u64>()` are unchanged).
-rand = "0.10.2"
-hmac = "0.12.1"
-base64 = "0.22.1"
+rand = "0.10.3"
+hmac = "0.13.0"
+base64 = "0.23.1"
 # `default-features = false` drops governor's `jitter` feature, which skin does not use
 # (`ratelimit.rs` takes `DefaultKeyedRateLimiter` + `Quota` and no `Jitter`). Jitter is the
 # *only* thing pulling `rand`/`getrandom` into governor's subtree — its `rand` dep is
@@ -132,38 +132,42 @@ base64 = "0.22.1"
 # `DefaultKeyedRateLimiter`'s state store is a `DashMap`, and `std` for the rest.
 # This does not by itself remove `rand` 0.9 from the tree — onyums and onyums-skin still
 # depend on it directly; see the ROADMAP's dependency-tree item.
-governor = { version = "0.10.1", default-features = false, features = ["std", "dashmap", "quanta"] }
+governor = { version = "0.10.4", default-features = false, features = ["std", "dashmap", "quanta"] }
 # onyums-skin WAF (Phase 3) — pure Rust signature matching. `regex` pulls in
 # `aho-corasick` internally for literal prefiltering (both MIT/Apache, no FFI).
-regex = "1.11.1"
+regex = "1.13.1"
 # onyums-skin Phase 5 optional PoW backend — Tor's own Equi-X puzzle, pure Rust.
 # LGPL-3.0, so it is gated behind onyums-skin's opt-in `equix` cargo feature to keep
 # the default build copyleft-free. `default-features = false` selects HashX's portable
 # interpreter (no runtime code generation / executable pages); the optional pure-Rust
 # JIT is reachable via the `equix/compiler` feature. No FFI in any configuration.
-equix = { version = "0.6.2", default-features = false }
+equix = { version = "0.7.1", default-features = false }
 
 [package]
 name = "onyums"
-# 0.5.0, not 0.4.1: the crypto stack went pure Rust (`rustls-graviola` + `p256`, no C
+# 0.6.0: the embedded arti stack moved 0.46 -> 0.47 (Arti 2.7.0). arti types are in the
+# public API (`OnionTorClient` is a `TorClient<TokioRustlsRuntime>`), so a breaking arti
+# minor is a breaking onyums minor; the MSRV also rises 1.91 -> 1.92 with it.
+#
+# (0.5.0 was the previous bump, not 0.4.1: the crypto stack went pure Rust (`rustls-graviola` + `p256`, no C
 # compiled at all), and `graviola` builds on **x86_64 and aarch64 only** — a compile
 # error anywhere else. onyums 0.4.x built wherever `ring` did, so this narrows the
 # supported platforms, which is breaking under 0.x semver however welcome the change is
 # otherwise. Pin 0.4.x for armv7/riscv64/32-bit targets. Nothing in the public API
-# signature changed: `OnionTorClient` is still `TorClient<TokioRustlsRuntime>`.
+# signature changed: `OnionTorClient` is still `TorClient<TokioRustlsRuntime>`.)
 #
 # (0.4.0 was the previous bump: MSRV 1.85 -> 1.91 with the arti stack, and
 # `OnionTorClient` moving from `TokioNativeTlsRuntime` to `TokioRustlsRuntime`.)
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
-# Minimum supported Rust version. Not a guess: 1.91 is the floor cargo's own
-# resolver enforces — every `tor-*`/`arti-client` 0.46.0 crate declares
-# `rust-version = 1.91` (as 0.44.0 did; the 0.43 -> 0.44 bump is what moved it from
-# 1.90, and 0.44 -> 0.46 left it alone — the highest `rust_version` in the whole
-# resolved graph is still 1.91, checked with `cargo metadata` on the 0.46 lock).
+# Minimum supported Rust version. Not a guess: 1.92 is the floor cargo's own
+# resolver enforces — the 0.46 -> 0.47 arti bump moved it from 1.91 (`tor-units`,
+# `tor-socksproto` and `web-time-compat` declare `rust-version = 1.92`, the highest
+# `rust_version` in the whole resolved graph, checked with `cargo metadata` on the 0.47
+# lock). Earlier: 0.43 -> 0.44 moved it 1.90 -> 1.91, and 0.44 -> 0.46 left it alone.
 # Edition 2024 alone would only need 1.85 — the arti stack, not the edition, sets
 # this floor. Enforced in CI.
-rust-version = "1.91"
+rust-version = "1.92"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
 readme = "README.md"

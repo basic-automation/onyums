@@ -416,7 +416,7 @@ mod tests {
 		let all = [Runtime("boom".into()), DescriptorUpload("upload failed".into()), IntroductionPoint("no ipts".into()), Other("mystery".into())];
 		// `detail()` round-trips the diagnostic; `Display` is exactly `"<label>: <detail>"`.
 		for p in &all {
-			assert!(!p.label().is_empty());
+			assert_ne!(p.label(), "");
 			assert_eq!(p.to_string(), format!("{}: {}", p.label(), p.detail()));
 			// The category label is the kind's label.
 			assert_eq!(p.label(), p.kind().label());
@@ -514,7 +514,7 @@ mod tests {
 		// `Display` writes the stable `label`.
 		for s in all {
 			assert_eq!(s.to_string(), s.label());
-			assert!(!s.label().is_empty());
+			assert_ne!(s.label(), "");
 		}
 		// Labels are pinned (a downstream health check may match on them) and distinct.
 		assert_eq!(Reachable.label(), "reachable");

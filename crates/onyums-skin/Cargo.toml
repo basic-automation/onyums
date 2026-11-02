@@ -1,13 +1,13 @@
 [package]
 name = "onyums-skin"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-# Minimum supported Rust version — two minors lower than the host server's 1.91,
+# Minimum supported Rust version — one minor lower than the host server's 1.92,
 # because skin carries none of the arti stack. The floor is 1.88 in principle
-# (the crate uses if-let chains, stable since 1.88) but 1.89 in practice: the
-# optional `equix`/`hashx` backend declares 1.89. Verified by building the lib on
-# each toolchain: 1.89 green with and without `--all-features`, 1.85 rejected.
-rust-version = "1.89"
+# (the crate uses if-let chains, stable since 1.88) but 1.91 in practice: the
+# optional `equix`/`hashx` backend declares it (equix 0.7.1 / hashx 0.9.1; the 0.6
+# line declared 1.89). Enforced by CI's MSRV job, which checks `--all-features`.
+rust-version = "1.91"
 license = "MIT"
 repository = "https://github.com/basic-automation/onyums"
 readme = "README.md"

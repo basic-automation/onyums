@@ -131,7 +131,7 @@ so that is the release to pin if you need another target. See
 **Toolchain:** Rust **edition 2024**, MSRV **1.92** — declared as `rust-version` in
 the manifest and enforced in CI. The floor comes from the embedded arti 0.47 stack,
 not the edition (edition 2024 alone would need only 1.85). The `onyums-skin` crate,
-which carries none of arti, is usable on **1.89**.
+which carries none of arti, is usable on **1.91**.
 
 ## Features
 

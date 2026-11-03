@@ -25,8 +25,9 @@ use axum::{
 use super::{Challenge, Gate};
 use crate::clearance::{ClearanceLevel, ClearanceStore};
 
-/// Cookie carrying the signed patience ticket.
-const TICKET_COOKIE: &str = "skin_patience";
+/// Cookie carrying the signed patience ticket. Like the clearance cookie, the gate
+/// keeps it out of WAF inspection (`Skin::without_own_tokens`).
+pub(crate) const TICKET_COOKIE: &str = "skin_patience";
 
 /// Extra lifetime granted to the ticket beyond `delay`, so a client that reloads a
 /// little late still finds its ticket valid.

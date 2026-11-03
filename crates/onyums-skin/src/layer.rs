@@ -31,7 +31,7 @@ use tower_service::Service;
 
 use crate::{
 	cache::{CacheKey, CachedResponse, ResponseCache, cache_control_ttl, is_cacheable_method}, challenge::{
-		Challenge, ChallengeChain, Gate, captcha::CaptchaChallenge, patience::PatienceChallenge, pow::{Hashcash, PowChallenge}
+		Challenge, ChallengeChain, Gate, captcha::CaptchaChallenge, patience::{PatienceChallenge, TICKET_COOKIE}, pow::{Hashcash, PowChallenge}
 	}, clearance::{Clearance, ClearanceLevel, ClearanceStore, HmacClearanceStore}, edge::{EdgeDecision, EdgeRules, HeaderMutation, apply_response_headers}, observe::{SecurityEvent, SecurityEventSink, TracingSink}, ratelimit::SkinRateLimit, waf::{Verdict, Waf, WafMatch}
 };
 
@@ -182,14 +182,16 @@ impl Skin {
 	}
 
 	/// `Some(Some(v))` to replace the cookie header, `Some(None)` to drop it
-	/// entirely, `None` when this gate's cookie was not present.
+	/// entirely, `None` when none of this gate's cookies were present. The gate's
+	/// cookies are the clearance cookie and the patience ticket.
 	fn redacted_cookie(&self, parts: &Parts) -> Option<Option<HeaderValue>> {
 		let raw = parts.headers.get(header::COOKIE)?.to_str().ok()?;
-		let prefix = format!("{}=", self.cookie_name);
-		if !raw.split(';').any(|c| c.trim().starts_with(&prefix)) {
+		let own = [format!("{}=", self.cookie_name), format!("{TICKET_COOKIE}=")];
+		let is_own = |c: &str| own.iter().any(|prefix| c.starts_with(prefix.as_str()));
+		if !raw.split(';').any(|c| is_own(c.trim())) {
 			return None;
 		}
-		let kept: Vec<&str> = raw.split(';').map(str::trim).filter(|c| !c.starts_with(&prefix)).collect();
+		let kept: Vec<&str> = raw.split(';').map(str::trim).filter(|c| !is_own(c)).collect();
 		if kept.is_empty() {
 			return Some(None);
 		}
@@ -734,6 +736,21 @@ mod tests {
 
 		let parts = Request::builder().uri(format!("{DEFAULT_SUBMIT_PATH}?puzzle=aaa&evil=%27%3B%20DROP%20TABLE%20users--")).body(()).unwrap().into_parts().0;
 		assert!(matches!(skin.decide(&parts), Decision::Respond(r) if r.status() == StatusCode::FORBIDDEN), "a payload in a non-exempt parameter must still be refused",);
+	}
+
+	/// The tarpit's patience ticket is the gate's other cookie, and it is minted the
+	/// same way, so it is exempt for the same reason. Other cookies are still inspected.
+	#[test]
+	fn the_gates_own_patience_ticket_is_not_inspected() {
+		let store = Arc::new(HmacClearanceStore::generate());
+		let skin = Skin::builder().store(store.clone()).challenge(Box::new(PowChallenge::new(Hashcash, b"p".to_vec(), TEST_DIFFICULTY))).waf(Waf::starter()).build();
+		let refused = |cookie: &str| matches!(skin.decide(&parts_with_cookie("/", cookie)), Decision::Respond(r) if r.status() == StatusCode::FORBIDDEN);
+
+		for value in ["aaaa.SqL-bbbb", "cccc-eNc-dddd", "rO0ABQdddddd"] {
+			assert!(!refused(&format!("{TICKET_COOKIE}={value}")), "the gate refused its own patience ticket {value:?}");
+			assert!(!refused(&format!("theme=dark; {TICKET_COOKIE}={value}; {DEFAULT_COOKIE}={value}")), "the gate refused its own cookies {value:?}");
+		}
+		assert!(refused(&format!("{TICKET_COOKIE}=aaaa; q=1|cat /etc/passwd")), "a payload in another cookie must still be refused");
 	}
 
 	fn parts_with_cookie(path: &str, cookie: &str) -> Parts {

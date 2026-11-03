@@ -109,7 +109,7 @@ tower = { version = "0.5.3", features = ["util"] }
 # cross-cutting — "Sync crates.io with GitHub"). With both, local builds resolve
 # through the path and a published onyums depends on onyums-skin 0.1.x from the
 # registry. Enforced by `cargo deny check bans` (wildcard dependency).
-onyums-skin = { path = "crates/onyums-skin", version = "0.2.0" }
+onyums-skin = { path = "crates/onyums-skin", version = "0.2.1" }
 # onyums-skin gate-core deps — pure Rust, no FFI (MIT/Apache).
 sha2 = "0.11.1"
 # 0.10 is not a routine bump: it is what takes `rand` 0.9 *out of the tree*. arti (0.44
@@ -145,6 +145,9 @@ equix = { version = "0.7.1", default-features = false }
 
 [package]
 name = "onyums"
+# 0.6.1: requires onyums-skin 0.2.1, whose starter WAF no longer blocks ordinary requests
+# on their own `&` / `;` / CRLF grammar (#51). No API change.
+#
 # 0.6.0: the embedded arti stack moved 0.46 -> 0.47 (Arti 2.7.0). arti types are in the
 # public API (`OnionTorClient` is a `TorClient<TokioRustlsRuntime>`), so a breaking arti
 # minor is a breaking onyums minor; the MSRV also rises 1.91 -> 1.92 with it.
@@ -158,7 +161,7 @@ name = "onyums"
 #
 # (0.4.0 was the previous bump: MSRV 1.85 -> 1.91 with the arti stack, and
 # `OnionTorClient` moving from `TokioNativeTlsRuntime` to `TokioRustlsRuntime`.)
-version = "0.6.0"
+version = "0.6.1"
 edition = "2024"
 # Minimum supported Rust version. Not a guess: 1.92 is the floor cargo's own
 # resolver enforces — the 0.46 -> 0.47 arti bump moved it from 1.91 (`tor-units`,

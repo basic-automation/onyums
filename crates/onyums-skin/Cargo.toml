@@ -1,6 +1,6 @@
 [package]
 name = "onyums-skin"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 # Minimum supported Rust version — one minor lower than the host server's 1.92,
 # because skin carries none of the arti stack. The floor is 1.88 in principle

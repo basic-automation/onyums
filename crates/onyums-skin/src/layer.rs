@@ -418,7 +418,7 @@ where
 							Ok(collected) => {
 								let bytes = collected.to_bytes();
 								if let Some(waf) = &skin.waf
-									&& let Verdict::Block(m) = waf.inspect_body(&bytes)
+									&& let Verdict::Block(m) = waf.inspect_body_as(parts.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()), &bytes)
 								{
 									skin.sink.record(&waf_block_event(&m));
 									return Ok(waf_block_response(&m));

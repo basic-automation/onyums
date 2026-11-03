@@ -2780,7 +2780,7 @@ dependencies = [
 
 [[package]]
 name = "onyums"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "arti-client",
@@ -2817,7 +2817,7 @@ dependencies = [
 
 [[package]]
 name = "onyums-skin"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "axum",
  "base64",

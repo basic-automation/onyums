@@ -33,7 +33,7 @@
 //! configured, and [`Skin::secure_default`](crate::layer::Skin::secure_default) turns
 //! on the [`starter`](Waf::starter) ruleset.
 
-use axum::http::request::Parts;
+use axum::http::{header, request::Parts};
 use regex::RegexSet;
 
 /// Maximum number of percent-decode passes the WAF's internal `normalize` performs before giving up.
@@ -53,6 +53,34 @@ pub const MULTI_ENCODING_RULE_ID: &str = "anomaly_multiple_encoding";
 /// method, path, and query reach the WAF as already-validated `&str` (hyper rejects a
 /// malformed request line upstream), so they can never be malformed here.
 pub const INVALID_UTF8_RULE_ID: &str = "anomaly_invalid_utf8";
+
+/// Rules that flag a field's own grammar being broken, so they do not apply to a request body,
+/// where that grammar is legal: CRLF is mandatory in every `multipart/form-data` body.
+const NOT_IN_BODY: &[&str] = &["anomaly_crlf"];
+
+/// Split a structured field into the units its own grammar defines — query `key=value` pairs on
+/// `&`, cookie crumbs on `;` — so a field's separator is never part of a haystack. Every server
+/// decodes these units independently, so a signature spanning the boundary describes nothing real
+/// (`?page=2&id=7` is not `& id`). An encoded separator (`%26`) stays inside its unit and is still
+/// seen once that unit is percent-decoded.
+fn units(raw: &str, sep: char) -> impl Iterator<Item = &str> {
+	raw.split(sep).map(str::trim_start).filter(|u| !u.is_empty())
+}
+
+/// Whether a `Content-Type` value names an `application/x-www-form-urlencoded` body.
+fn is_form_urlencoded(content_type: &str) -> bool {
+	content_type.split(';').next().is_some_and(|mime| mime.trim().eq_ignore_ascii_case("application/x-www-form-urlencoded"))
+}
+
+/// Keep the first match of each rule id from `start` on, so a field inspected unit by unit
+/// reports a rule once — the same as when the field was inspected whole.
+fn dedup_field(out: &mut Vec<WafMatch>, start: usize) {
+	for m in out.split_off(start) {
+		if !out[start..].iter().any(|seen| seen.rule_id == m.rule_id) {
+			out.push(m);
+		}
+	}
+}
 
 /// The signature class a rule belongs to.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -478,10 +506,20 @@ impl Waf {
 	/// [`body_cap`](Self::body_cap); this scans exactly the slice it is given.
 	#[must_use]
 	pub fn inspect_body(&self, body: &[u8]) -> Verdict {
+		self.inspect_body_as(None, body)
+	}
+
+	/// [`inspect_body`](Self::inspect_body), told the body's `Content-Type`. An
+	/// `application/x-www-form-urlencoded` body is inspected pair by pair with `+`→space
+	/// decoding, the same as a query string, so `a=1&id=7` is not read as `& id`. Any other
+	/// (or no) content type is inspected whole.
+	#[must_use]
+	pub fn inspect_body_as(&self, content_type: Option<&str>, body: &[u8]) -> Verdict {
 		let text = String::from_utf8_lossy(body);
 		// A concrete signature keeps precedence over the encoding anomaly: if the lossy form
 		// carries a real payload, name the specific rule that fired.
-		if let Some(m) = self.inspect_str(&text, "body") {
+		let hit = if content_type.is_some_and(is_form_urlencoded) { units(&text, '&').find_map(|pair| self.inspect_field(pair, "body", true)) } else { self.inspect_str(&text, "body") };
+		if let Some(m) = hit {
 			return Verdict::Block(m);
 		}
 		// Otherwise a body that isn't valid UTF-8 is itself the signal (CRS UTF-8 validation):
@@ -505,11 +543,16 @@ impl Waf {
 		self.meta.len()
 	}
 
+	/// Whether rule `idx` is enabled and applies to a field at `location` (see [`NOT_IN_BODY`]).
+	fn applies(&self, idx: usize, location: &str) -> bool {
+		self.enabled[idx] && !(location == "body" && NOT_IN_BODY.contains(&self.meta[idx].0))
+	}
+
 	/// Match the ruleset against one literal string in a single pass; take the lowest
 	/// rule index for a stable, deterministic result. `location` labels where the string
 	/// came from for the returned [`WafMatch`].
 	fn match_raw(&self, haystack: &str, location: &str) -> Option<WafMatch> {
-		self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]).min().map(|idx| {
+		self.set.matches(haystack).iter().filter(|&idx| self.applies(idx, location)).min().map(|idx| {
 			let (rule_id, category) = self.meta[idx];
 			WafMatch { rule_id, category, location: location.to_owned(), score: None }
 		})
@@ -520,7 +563,7 @@ impl Waf {
 	/// pass uses this so an aggressive quote/backslash strip can only ever surface a
 	/// command-injection signature — never accidentally trip an unrelated rule on the mangled form.
 	fn match_raw_in_category(&self, haystack: &str, location: &str, category: WafCategory) -> Option<WafMatch> {
-		self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx] && self.meta[idx].1 == category).min().map(|idx| {
+		self.set.matches(haystack).iter().filter(|&idx| self.applies(idx, location) && self.meta[idx].1 == category).min().map(|idx| {
 			let (rule_id, category) = self.meta[idx];
 			WafMatch { rule_id, category, location: location.to_owned(), score: None }
 		})
@@ -616,7 +659,7 @@ impl Waf {
 			return Verdict::Block(m);
 		}
 		if let Some(query) = parts.uri.query()
-			&& let Some(m) = self.inspect_field(query, "query", true)
+			&& let Some(m) = units(query, '&').find_map(|pair| self.inspect_field(pair, "query", true))
 		{
 			return Verdict::Block(m);
 		}
@@ -627,7 +670,9 @@ impl Waf {
 			// (`str::from_utf8` fails) fall through to the encoding anomaly.
 			match std::str::from_utf8(value.as_bytes()) {
 				Ok(s) => {
-					if let Some(m) = self.inspect_field(s, &format!("header:{name}"), false) {
+					let location = format!("header:{name}");
+					let hit = if name == header::COOKIE { units(s, ';').find_map(|crumb| self.inspect_field(crumb, &location, false)) } else { self.inspect_field(s, &location, false) };
+					if let Some(m) = hit {
 						return Verdict::Block(m);
 					}
 				}
@@ -679,7 +724,7 @@ impl Waf {
 	/// (not just the lowest index), in ascending rule order. The collect-all counterpart of
 	/// [`match_raw`](Self::match_raw).
 	fn match_all_raw(&self, haystack: &str, location: &str, out: &mut Vec<WafMatch>) {
-		for idx in self.set.matches(haystack).iter().filter(|&idx| self.enabled[idx]) {
+		for idx in self.set.matches(haystack).iter().filter(|&idx| self.applies(idx, location)) {
 			let (rule_id, category) = self.meta[idx];
 			out.push(WafMatch { rule_id, category, location: location.to_owned(), score: None });
 		}
@@ -771,11 +816,22 @@ impl Waf {
 		self.inspect_field_all(parts.method.as_str(), "method", false, &mut out);
 		self.inspect_field_all(parts.uri.path(), "target", false, &mut out);
 		if let Some(query) = parts.uri.query() {
-			self.inspect_field_all(query, "query", true, &mut out);
+			let start = out.len();
+			for pair in units(query, '&') {
+				self.inspect_field_all(pair, "query", true, &mut out);
+			}
+			dedup_field(&mut out, start);
 		}
 		for (name, value) in &parts.headers {
 			// Full UTF-8, not `to_str` — see the matching note in `inspect`.
 			match std::str::from_utf8(value.as_bytes()) {
+				Ok(s) if name == header::COOKIE => {
+					let (location, start) = (format!("header:{name}"), out.len());
+					for crumb in units(s, ';') {
+						self.inspect_field_all(crumb, &location, false, &mut out);
+					}
+					dedup_field(&mut out, start);
+				}
 				Ok(s) => self.inspect_field_all(s, &format!("header:{name}"), false, &mut out),
 				Err(_) if self.flag_invalid_utf8 => out.push(WafMatch { rule_id: INVALID_UTF8_RULE_ID, category: WafCategory::ProtocolAnomaly, location: format!("header:{name}"), score: None }),
 				Err(_) => {}
@@ -1297,9 +1353,15 @@ pub fn starter_rules() -> Vec<Rule> {
 			pattern: r"(?i)(/\.git/|/\.svn/|/\.hg/|/\.bzr/|/\.env\b|/\.htaccess\b|/\.htpasswd\b|/\.gitignore\b|/web\.config\b)",
 		},
 		// Editor/database backup & swap artifacts left in the webroot — a `config.php.bak`, a
-		// SQL dump, a vim `.swp`. High-signal source/secret disclosure; an operator serving such
-		// files deliberately can `disable_rule("traversal_backup_files")`.
-		Rule { id: "traversal_backup_files", category: WafCategory::PathTraversal, pattern: r"(?i)\.(bak|swp|swo|sql|dump)\b" },
+		// vim `.swp`, a SQL dump. High-signal source/secret disclosure; an operator serving such
+		// files deliberately can `disable_rule("traversal_backup_files")`. `.bak`/`.swp`/`.swo`
+		// are never served on purpose, but `.sql`/`.dump` are ordinary downloads
+		// (`/downloads/schema.sql`), so those match only under the file names scanners probe.
+		Rule {
+			id: "traversal_backup_files",
+			category: WafCategory::PathTraversal,
+			pattern: r"(?i)(\.(bak|swp|swo)\b|/(backups?|db|database|dump|data|site|www|mysql|wordpress|wp|localhost|users)\.(sql|dump)\b)",
+		},
 		// AI coding-assistant artifact directories probed over HTTP (OWASP-CRS rule 930140, added
 		// 4.24.1 via issue #4474 — the `ai-critical-artifacts.data` `@pmFromFile` set). These
 		// per-tool dotdirs hold MCP server definitions, project rules, hooks, and — the real prize
@@ -1331,7 +1393,13 @@ pub fn starter_rules() -> Vec<Rule> {
 		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-930-APPLICATION-ATTACK-LFI.conf>
 		Rule { id: "traversal_overlong_utf8", category: WafCategory::PathTraversal, pattern: r"(?i)(%c0%a[ef]|%c1%9c|%e0%80%a[ef])" },
 		// --- OS command injection ---
-		Rule { id: "cmdi_shell_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b" },
+		// The separator-anchored command rules below end in `\s*([^\s=]|$)`: a command word
+		// followed by `=` is a parameter name (`Accept: …;type=feed`, `; id=2`), not a command.
+		Rule {
+			id: "cmdi_shell_command",
+			category: WafCategory::CommandInjection,
+			pattern: r"(?i)[;&|`$]\s*(cat|ls|id|whoami|uname|wget|curl|ncat|nc|bash|sh|python|perl|powershell|cmd)\b\s*([^\s=]|$)",
+		},
 		Rule { id: "cmdi_path_bin", category: WafCategory::CommandInjection, pattern: r"(?i)/bin/(sh|bash|dash|zsh|busybox|nc)\b" },
 		Rule { id: "cmdi_command_substitution", category: WafCategory::CommandInjection, pattern: r"(?i)\$\(\s*(cat|ls|id|whoami|uname|wget|curl|nc|bash|sh|env|echo|printf)\b" },
 		// Network-recon / exfil clients and dangerous file/privilege utilities past the core
@@ -1344,9 +1412,9 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule {
 			id: "cmdi_recon_and_utility",
 			category: WafCategory::CommandInjection,
-			pattern: r"(?i)[;&|`$]\s*(nslookup|dig|telnet|tftp|socat|scp|ssh|ftp|lynx|fetch|chmod|chown|crontab|mkfifo|mknod|base64|xxd|msfvenom|busybox)\b",
+			pattern: r"(?i)[;&|`$]\s*(nslookup|dig|telnet|tftp|socat|scp|ssh|ftp|lynx|fetch|chmod|chown|crontab|mkfifo|mknod|base64|xxd|msfvenom|busybox)\b\s*([^\s=]|$)",
 		},
-		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b" },
+		Rule { id: "cmdi_windows_command", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(dir|type|net\s+user|ping\s+-n|certutil|bitsadmin|tasklist|systeminfo)\b\s*([^\s=]|$)" },
 		// Windows living-off-the-land binaries (LOLBins) for fileless download/exec past the basic
 		// `cmd.exe` verbs above (OWASP-CRS 932xxx Windows command list): the script hosts and proxy-exec
 		// binaries attackers reach for — `mshta`, `regsvr32` (scrobj), `rundll32`, `wmic process call
@@ -1355,7 +1423,11 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `cmdi_windows_command` so a hit never double-counts. The short `reg`/`sc` verbs are pinned to
 		// their sub-command (`reg add`/`sc create`) so they don't fire on ordinary words.
 		// <https://github.com/coreruleset/coreruleset/blob/main/rules/REQUEST-932-APPLICATION-ATTACK-RCE.conf>
-		Rule { id: "cmdi_windows_lolbin", category: WafCategory::CommandInjection, pattern: r"(?i)[;&|]\s*(mshta|regsvr32|rundll32|wmic|cscript|wscript|schtasks|reg\s+add|sc\s+create)\b" },
+		Rule {
+			id: "cmdi_windows_lolbin",
+			category: WafCategory::CommandInjection,
+			pattern: r"(?i)[;&|]\s*(mshta|regsvr32|rundll32|wmic|cscript|wscript|schtasks|reg\s+add|sc\s+create)\b\s*([^\s=]|$)",
+		},
 		// PowerShell download-cradle / encoded-command RCE (OWASP-CRS rules 932120/932125): the vectors
 		// the `cmd.exe`-flavored `cmdi_windows_command` misses — the `Invoke-*` cmdlets and their
 		// aliased call form (`iex(`), the `Net.WebClient().DownloadString` / `Invoke-WebRequest`
@@ -1601,8 +1673,11 @@ pub fn starter_rules() -> Vec<Rule> {
 		// a `__`-prefixed lookup keyword immediately before the `=` marks a query key exploiting the
 		// ORM's filter DSL rather than an ordinary field. The `__` prefix plus the anchored `=` is
 		// the false-positive guard — a benign `field=value` never carries a `__lookup=` suffix.
+		// Range and null lookups (`created__gte=2024-01-01`) are how ordinary filtered APIs are
+		// spelled, so those match only across a relation (`user__password__gt=`), which is where
+		// they extract a field the API never meant to expose.
 		// <https://www.linuxcompatible.org/story/owasp-crs-v4280-drops-with-critical-security-fixes-and-first-lts-track>
-		Rule { id: "nosqli_orm_lookup", category: WafCategory::NoSqlInjection, pattern: r"(?i)__(i?startswith|i?endswith|i?contains|iexact|i?regex|isnull|gte?|lte?)\s*=" },
+		Rule { id: "nosqli_orm_lookup", category: WafCategory::NoSqlInjection, pattern: r"(?i)(__(i?startswith|i?endswith|i?contains|iexact|i?regex)|__\w+__(isnull|gte?|lte?))\s*=" },
 		// --- LDAP injection (search-filter break-out; value inspection, no client IP) ---
 		Rule { id: "ldapi_filter_break", category: WafCategory::LdapInjection, pattern: r"\)\s*\(\s*[|&!]" },
 		Rule { id: "ldapi_wildcard_break", category: WafCategory::LdapInjection, pattern: r"[*]\s*\)\s*\(" },
@@ -1668,17 +1743,21 @@ pub fn starter_rules() -> Vec<Rule> {
 		// `include($_GET['p'] . '/footer.php')`, so the attacker appends `?` to push the server's
 		// concatenated suffix into the query string of *their* URL, where it is ignored. A legitimate URL
 		// parameter does not end at a bare `?` — the character has no meaning there — so requiring the
-		// value boundary (`&` or end of field) right after it is what keeps this clean.
-		Rule { id: "rfi_url_trailing_question", category: WafCategory::Rfi, pattern: r"(?i)(https?|ftps?)://[^\s&\x22'<>]+\?(&|$)" },
+		// value boundary (`&` or end of field) right after it is what keeps this clean. The URL must
+		// be a parameter's value (`p=`): a `Referer` is a bare URL, and a browser sends one ending in
+		// `?` after a search form is submitted empty.
+		Rule { id: "rfi_url_trailing_question", category: WafCategory::Rfi, pattern: r"(?i)=\s*(https?|ftps?)://[^\s&\x22'<>]+\?(&|$)" },
 		// --- Protocol anomalies ---
 		Rule { id: "anomaly_null_byte", category: WafCategory::ProtocolAnomaly, pattern: r"(\x00|%00)" },
 		Rule { id: "anomaly_crlf", category: WafCategory::ProtocolAnomaly, pattern: r"(\r\n|%0d%0a|%0a|%0d)" },
-		Rule { id: "anomaly_shellshock", category: WafCategory::ProtocolAnomaly, pattern: r"\(\)\s*\{" },
+		// Bash's `() {` function-definition head. Not preceded by an identifier, so a JavaScript
+		// `function(){…}` in a JSON body stays clean while `() { :; };` and a fork bomb's `:(){` match.
+		Rule { id: "anomaly_shellshock", category: WafCategory::ProtocolAnomaly, pattern: r"(^|[^\w$])\(\)\s*\{" },
 		// --- Security-scanner / attack-tool fingerprints (OWASP-CRS 913xxx port) ---
 		// A self-identifying offensive tool, keyed on its `name/version` token (the form a tool's
-		// `User-Agent` carries). Requiring the trailing `/` is the false-positive guard: prose that
-		// merely *mentions* a tool (`/docs/sqlmap-guide`, `?q=how+to+use+wpscan`) lacks the version
-		// slash, so it stays clean, while a real `sqlmap/1.7`, `Nikto/2.1.6`, `ghauri/1.x`,
+		// `User-Agent` carries). Requiring the `/` and a version digit is the false-positive guard:
+		// prose that merely *mentions* a tool (`/docs/sqlmap-guide`, `?q=how+to+use+wpscan`,
+		// `/cell-biology/nuclei/mitosis`) lacks the version, so it stays clean, while a real `sqlmap/1.7`, `Nikto/2.1.6`, `ghauri/1.x`,
 		// `WhatWAF/…` UA trips. ghauri + WhatWAF are the CRS 4.26.0 additions; ffuf / dalfox /
 		// dirsearch / feroxbuster / katana / subfinder / wafw00f / whatweb / joomscan / droopescan /
 		// cmsmap / sqlninja / havij / dirb round out the current offensive-tooling landscape.
@@ -1687,7 +1766,7 @@ pub fn starter_rules() -> Vec<Rule> {
 		Rule {
 			id: "scanner_security_tool",
 			category: WafCategory::ScannerDetection,
-			pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|dirsearch|dirb|gobuster|feroxbuster|ffuf|dalfox|sqlninja|havij|wafw00f|whatweb|joomscan|droopescan|cmsmap|katana|subfinder|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/",
+			pattern: r"(?i)\b(sqlmap|nikto|ghauri|whatwaf|nuclei|wpscan|dirbuster|dirsearch|dirb|gobuster|feroxbuster|ffuf|dalfox|sqlninja|havij|wafw00f|whatweb|joomscan|droopescan|cmsmap|katana|subfinder|acunetix|netsparker|nessus|arachni|w3af|masscan|zgrab|zmap|jaeles|commix|xsser|wfuzz)/v?\d",
 		},
 		// Nmap's HTTP probe (NSE) carries a distinctive multi-word phrase rather than a `name/`
 		// version token, so it gets its own signature.
@@ -3399,7 +3478,7 @@ mod tests {
 		// Django/SQLAlchemy ORM double-underscore lookups (OWASP-CRS 4.28.0) used for blind
 		// extraction all attribute to the NoSqlInjection class via the `nosqli_orm_lookup` rule.
 		let waf = Waf::starter();
-		for (q, why) in [("user__password__startswith=a", "blind prefix extraction"), ("email__icontains=@evil", "case-insensitive substring probe"), ("name__regex=^admin", "regex lookup"), ("age__gte=18", "comparison lookup"), ("token__isnull=false", "isnull lookup"), ("slug__iendswith=.php", "case-insensitive suffix probe")] {
+		for (q, why) in [("user__password__startswith=a", "blind prefix extraction"), ("email__icontains=@evil", "case-insensitive substring probe"), ("name__regex=^admin", "regex lookup"), ("user__age__gte=18", "comparison lookup across a relation"), ("user__token__isnull=false", "isnull lookup across a relation"), ("slug__iendswith=.php", "case-insensitive suffix probe")] {
 			let m = waf.inspect_str(q, "query").unwrap_or_else(|| panic!("{q} ({why}) should trip the ORM lookup rule"));
 			assert_eq!(m.rule_id, "nosqli_orm_lookup", "{q} ({why})");
 			assert_eq!(m.category, WafCategory::NoSqlInjection);
@@ -3418,10 +3497,11 @@ mod tests {
 			"/api/users?sort=name",
 			"/blog/mongodb-vs-postgres",
 			"/cart?items[0]=42",
-			"/search?contains=widget",    // "contains" as a plain key, no `__` prefix
-			"/py/__init__=1",             // dunder that is not an ORM lookup keyword
-			"/opt?newsletter_optin=true", // single-underscore opt-in, not `__in=`
-			"/docs/aggregation-function", // "function" as a path word, no `"$function":` JSON key
+			"/search?contains=widget",                          // "contains" as a plain key, no `__` prefix
+			"/py/__init__=1",                                   // dunder that is not an ORM lookup keyword
+			"/opt?newsletter_optin=true",                       // single-underscore opt-in, not `__in=`
+			"/api/orders?created__gte=2024-01-01&total__lt=50", // a range filter on the model's own field
+			"/docs/aggregation-function",                       // "function" as a path word, no `"$function":` JSON key
 		] {
 			assert_eq!(waf.inspect(&parts("GET", uri)), Verdict::Allow, "{uri} should not false-positive");
 		}
@@ -3996,5 +4076,46 @@ mod tests {
 		let waf = Waf::starter();
 		// The wider scan must not false-positive on an ordinary UTF-8 header value.
 		assert_eq!(waf.inspect(&parts_with_raw_header("x-name", "Björk Guðmundsdóttir".as_bytes())), Verdict::Allow);
+	}
+
+	/// A request carrying one header, for the field-grammar tests.
+	fn with_header(uri: &str, name: &'static str, value: &'static str) -> Parts {
+		let mut p = parts("GET", uri);
+		p.headers.insert(name, axum::http::HeaderValue::from_static(value));
+		p
+	}
+
+	#[test]
+	fn a_fields_own_separators_are_not_an_attack() {
+		// #51: each field was matched whole, so its own `&` / `;` / CRLF read as payload.
+		let waf = Waf::starter();
+		for p in [parts("GET", "/products?page=2&id=7"), parts("GET", "/api/orders?created__gte=2024-01-01"), parts("GET", "/downloads/schema.sql"), parts("GET", "/exports/2024-06-01.dump"), parts("GET", "/cell-biology/nuclei/mitosis"), parts("GET", "/feed?fetch=1&base64=0&ls=2"), with_header("/", "cookie", "theme=dark; cat=1"), with_header("/", "cookie", "a=1; id=2; ls=3"), with_header("/", "referer", "https://example.com/search?"), with_header("/", "accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"), with_header("/", "accept", "application/atom+xml;type=feed,application/xml;q=0.9")] {
+			assert_eq!(waf.inspect(&p), Verdict::Allow, "{} {:?} should not be blocked", p.uri, p.headers);
+			assert!(waf.inspect_all(&p).is_empty(), "{} {:?} should report nothing", p.uri, p.headers);
+		}
+		assert_eq!(waf.inspect_body(br#"{"code":"function(){return 1}"}"#), Verdict::Allow);
+		assert_eq!(waf.inspect_body(b"--x\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\n1\r\n--x--\r\n"), Verdict::Allow);
+		assert_eq!(waf.inspect_body_as(Some("application/x-www-form-urlencoded; charset=utf-8"), b"page=2&id=7"), Verdict::Allow);
+	}
+
+	#[test]
+	fn splitting_a_field_keeps_the_attacks_inside_a_unit() {
+		let waf = Waf::starter();
+		// The separator inside a value (`;`, an encoded `%26`) is still the attacker's.
+		for uri in ["/ping?host=1.1.1.1;whoami", "/ping?page=2&host=1.1.1.1%26uname%20-a", "/ping?host=x%7Cid", "/h?type=a;tasklist"] {
+			assert_eq!(blocked(&waf.inspect(&parts("GET", uri))).category, WafCategory::CommandInjection, "{uri}");
+		}
+		assert_eq!(blocked(&waf.inspect(&with_header("/", "cookie", "theme=dark; q=1|cat /etc/passwd"))).location, "header:cookie");
+		assert_eq!(blocked(&waf.inspect(&parts("GET", "/a?x=1&p=https://evil.example/shell.txt?"))).rule_id, "rfi_url_trailing_question");
+		assert_eq!(blocked(&waf.inspect(&parts("GET", "/backup.sql"))).rule_id, "traversal_backup_files");
+		assert_eq!(blocked(&waf.inspect(&parts("GET", "/old/dump.sql"))).rule_id, "traversal_backup_files");
+		assert_eq!(blocked(&waf.inspect(&parts("GET", "/s?a=1&user__password__startswith=a"))).rule_id, "nosqli_orm_lookup");
+		assert_eq!(blocked(&waf.inspect(&with_header("/", "user-agent", "nuclei/3.1.0"))).rule_id, "scanner_security_tool");
+		assert_eq!(blocked(&waf.inspect_body_as(Some("application/x-www-form-urlencoded"), b"a=1&q=x%27%20UNION%20SELECT%20pw%20FROM%20users")).category, WafCategory::Sqli);
+		// CRLF is still an anomaly where it is not grammar.
+		assert_eq!(blocked(&waf.inspect(&parts("GET", "/r?next=/a%0d%0aSet-Cookie:x"))).rule_id, "anomaly_crlf");
+		// A rule that fires in two pairs of one query is still one signal for scoring.
+		let all = waf.inspect_all(&parts("GET", "/s?a=x%27%20UNION%20SELECT%201&b=x%27%20UNION%20SELECT%202"));
+		assert_eq!(all.iter().filter(|m| m.rule_id == all[0].rule_id).count(), 1, "{all:?}");
 	}
 }
